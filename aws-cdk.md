@@ -26,6 +26,7 @@
 22. [Best practices checklist](#best-practices-checklist)
 23. [Glossary](#glossary)
 24. [Where to go next](#where-to-go-next)
+25. [Appendix: Windows-native setup runbook](#appendix-windows-native-setup-runbook)
 
 ---
 
@@ -52,14 +53,14 @@ CDK turns that into a CloudFormation template and deploys it for you.
 
 ## Why use CDK instead of raw CloudFormation?
 
-| Problem with raw templates | How CDK solves it |
-| --- | --- |
-| YAML has no loops, functions, or types | Use `for` loops, functions, classes, and generics |
-| Copy-pasting the same 200 lines for every microservice | Write a reusable construct class once, instantiate it many times |
-| Easy to typo a property name and find out at deploy time | Compiler and IDE autocomplete catch it before you deploy |
-| Wiring IAM policies by hand is verbose and error-prone | `bucket.grantRead(myLambda)` writes the least-privilege policy for you |
-| No unit tests for infrastructure | Use Jest/pytest against the synthesized template |
-| Hard to share logic across teams | Publish constructs to npm / PyPI / Maven / NuGet |
+| Problem with raw templates                               | How CDK solves it                                                        |
+| -------------------------------------------------------- | ------------------------------------------------------------------------ |
+| YAML has no loops, functions, or types                   | Use`for` loops, functions, classes, and generics                       |
+| Copy-pasting the same 200 lines for every microservice   | Write a reusable construct class once, instantiate it many times         |
+| Easy to typo a property name and find out at deploy time | Compiler and IDE autocomplete catch it before you deploy                 |
+| Wiring IAM policies by hand is verbose and error-prone   | `bucket.grantRead(myLambda)` writes the least-privilege policy for you |
+| No unit tests for infrastructure                         | Use Jest/pytest against the synthesized template                         |
+| Hard to share logic across teams                         | Publish constructs to npm / PyPI / Maven / NuGet                         |
 
 **Concrete comparison.** A Lambda function that can read from an S3 bucket.
 
@@ -214,6 +215,7 @@ new MyStack(app, 'Prod', { env: { account: '123456789012', region: 'us-east-1' }
 ### 1. Prerequisites
 
 - **Node.js 18 or later** — required even if you write CDK in Python, Java, or Go, because the CDK CLI is a Node program.
+- **Python 3.9 or later** — if you plan to write your CDK code in Python. Check with `python --version`.
 - **AWS CLI** configured with credentials: `aws configure`
 - Verify with `aws sts get-caller-identity` — it should print your account ID.
 
@@ -226,7 +228,602 @@ cdk --version
 
 > Instead of a global install you can use `npx aws-cdk@latest ...` to pin a version per project. Mismatched CLI and library versions are a common source of confusing errors.
 
-### 3. Bootstrap your account
+### 3. Set up a Python virtual environment
+
+Skip this step if you are using TypeScript. If you are using Python, **do this before anything else** — it is the step beginners most often skip, and skipping it causes the majority of "it works on my machine" problems.
+
+#### Why a virtual environment matters
+
+A **virtual environment** (venv) is a private, self-contained folder holding its own copy of the Python interpreter and its own `site-packages` directory. When it is active, `python` and `pip` resolve to that folder instead of the system-wide Python.
+
+Without one, every `pip install` writes into a single global `site-packages` shared by every project on your machine. That causes four concrete problems:
+
+| Problem                                   | What actually happens                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Version conflicts**               | Project A needs`aws-cdk-lib==2.100.0`, Project B needs `2.170.0`. Only one can be installed globally. Installing B's version silently breaks A, and you find out when `cdk synth` throws an import error.                                                                                                                                                                            |
+| **Unreproducible builds**           | Your`requirements.txt` says `aws-cdk-lib>=2.0`, but you happen to have `2.170.0` installed locally while the CI server (the machine that runs your automated build — GitHub Actions, CodeBuild, Jenkins) installs `2.180.0`. The two machines synthesize different CloudFormation templates from the same source. A deploy that passed on your laptop then fails in the pipeline. |
+| **Polluted / broken system Python** | On macOS and many Linux distros, the OS itself depends on the system Python.`pip install` into it can break system tooling. Modern Python even blocks this with an `externally-managed-environment` error.                                                                                                                                                                             |
+| **No clean uninstall**              | Deleting a project leaves dozens of its dependencies behind globally, forever. With a venv you just delete the`.venv` folder.                                                                                                                                                                                                                                                            |
+
+There is a CDK-specific reason too: **your CDK code runs on your machine during `cdk synth`**. The exact version of `aws-cdk-lib` installed determines what CloudFormation template gets generated. Two developers with different library versions can produce different templates from identical source code — and therefore deploy different infrastructure. A venv plus a pinned `requirements.txt` is what makes synthesis deterministic.
+
+#### Do you need Python installed first?
+
+**Yes.** A virtual environment is not a separate download and it does not include Python — it is created *by* an existing Python installation. `venv` is a module built into the Python standard library (3.3+), which is why the command is `python -m venv` ("run the `venv` module using this Python").
+
+Mechanically, `python -m venv .venv` copies or symlinks the interpreter you invoked it with into `.venv/`, then gives it a fresh, empty `site-packages`. So the venv inherits its Python version from whatever created it: run it with Python 3.12 and you get a 3.12 environment. You cannot create a 3.12 venv using a 3.9 installation.
+
+**Check whether you already have it:**
+
+```powershell
+python --version
+```
+
+If that prints `Python 3.9.x` or newer, you are ready. Some systems need `python3` instead:
+
+```bash
+python3 --version
+```
+
+Common results and what they mean:
+
+| Output                                      | Meaning                                                                                                                                |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `Python 3.12.4`                           | Good — proceed to create the venv.                                                                                                    |
+| `Python 2.7.18`                           | Too old. Python 2 is end-of-life; install Python 3 and use the`python3` command.                                                     |
+| `'python' is not recognized...` (Windows) | Not installed, or not on`PATH`.                                                                                                      |
+| Opens the Microsoft Store (Windows)         | The Store stub is intercepting the command. Install real Python, or disable the alias under Settings → Apps → App execution aliases. |
+| `command not found` (macOS/Linux)         | Not installed, or only`python3` exists.                                                                                              |
+
+**Installing Python if you do not have it:**
+
+| Platform                        | How                                                                                                                                                                                                                                                                                     |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Windows**               | Download the installer from[python.org/downloads](https://www.python.org/downloads/). **Tick "Add python.exe to PATH"** on the first screen — forgetting this is the #1 cause of `'python' is not recognized`. Or use a package manager: `winget install Python.Python.3.12`. |
+| **macOS**                 | `brew install python@3.12`. Do not rely on the Apple-supplied system Python; it is there for the OS, and newer macOS versions removed it from the command line entirely.                                                                                                              |
+| **Linux (Debian/Ubuntu)** | `sudo apt install python3 python3-venv python3-pip`. The `python3-venv` package is separate on Debian/Ubuntu — without it, `python -m venv` fails with `ensurepip is not available`.                                                                                           |
+| **Linux (Fedora/RHEL)**   | `sudo dnf install python3 python3-pip`                                                                                                                                                                                                                                                |
+
+After installing on Windows, **close and reopen your terminal** so it picks up the updated `PATH`.
+
+> **Version note:** CDK's Python support requires **Python 3.9 or later**. If you need several versions side by side (one project on 3.9, another on 3.12), use a version manager — `pyenv` on macOS/Linux, or the bundled `py` launcher on Windows, which lets you pick explicitly:
+>
+> ```powershell
+> py -3.12 -m venv .venv
+> ```
+
+You do **not** need to install anything extra for `venv` itself on Windows or macOS — it ships with Python. Debian/Ubuntu is the exception noted in the table above.
+
+#### Creating and activating a venv
+
+```bash
+# 1. Create it (the trailing ".venv" is the folder name, by convention)
+python -m venv .venv
+```
+
+Activate it. The command differs by shell:
+
+```powershell
+# Windows — PowerShell
+.venv\Scripts\Activate.ps1
+```
+
+```bat
+:: Windows — cmd.exe
+.venv\Scripts\activate.bat
+```
+
+```bash
+# macOS / Linux — bash or zsh
+source .venv/bin/activate
+```
+
+You will know it worked because your prompt gets a prefix:
+
+```
+(.venv) PS C:\Users\Owner\hello-cdk>
+```
+
+Verify you are pointing at the venv, not the system Python:
+
+```powershell
+# Windows PowerShell
+(Get-Command python).Source
+# -> C:\Users\Owner\hello-cdk\.venv\Scripts\python.exe
+```
+
+```bash
+# macOS / Linux
+which python
+# -> /Users/you/hello-cdk/.venv/bin/python
+```
+
+To leave the environment:
+
+```bash
+deactivate
+```
+
+> **Windows PowerShell gotcha:** if activation fails with `running scripts is disabled on this system`, allow local scripts for your user:
+>
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> ```
+>
+> This only affects your user account, not the whole machine.
+
+#### Installing CDK dependencies
+
+With the venv **active**:
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt       # cdk init generates this file
+pip install -r requirements-dev.txt   # pytest and friends, if present
+```
+
+A fresh CDK Python project's `requirements.txt` looks like this:
+
+```text
+aws-cdk-lib==2.180.0
+constructs>=10.0.0,<11.0.0
+```
+
+> **Pin `aws-cdk-lib` to an exact version** (`==`, not `>=`). This is the single most effective thing you can do to keep synth reproducible across your laptop, your teammates' laptops, and CI.
+
+After adding a new dependency, freeze the exact set so others can reproduce it:
+
+```bash
+pip install boto3
+pip freeze > requirements.txt
+```
+
+#### Project hygiene
+
+Add the venv to `.gitignore` — never commit it. It contains machine-specific absolute paths and is often hundreds of megabytes.
+
+```gitignore
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+cdk.out/
+```
+
+Commit `requirements.txt` instead. That file, not the venv folder, is the portable description of your environment. A teammate reproduces your setup with three commands:
+
+```bash
+git clone <repo> && cd <repo>
+python -m venv .venv && .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+#### Tell VS Code about it
+
+VS Code usually detects `.venv` automatically. If it does not, or IntelliSense cannot resolve `aws_cdk`:
+
+1. Press `Ctrl+Shift+P` → **Python: Select Interpreter**
+2. Choose the one whose path contains `.venv`
+
+Then open a **new** terminal — VS Code activates the selected interpreter automatically in new terminals, so the `(.venv)` prefix appears without you typing the activate command.
+
+#### Everyday rules
+
+- **Activate before every session.** A new terminal window starts deactivated. Running `cdk synth` outside the venv gives `ModuleNotFoundError: No module named 'aws_cdk'`.
+- **One venv per project.** Do not share a single venv across repos; that recreates the conflicts you were avoiding.
+- **Never `sudo pip install`.** If you feel the need to, you forgot to activate.
+- **The venv is disposable.** If it gets into a weird state, `rm -rf .venv` (PowerShell: `Remove-Item -Recurse -Force .venv`) and rebuild it from `requirements.txt`.
+
+#### Alternatives you may encounter
+
+`venv` + `pip` is the standard-library approach and is what `cdk init` sets up, so it is the right default. You may see these in other projects:
+
+| Tool             | Notes                                                                                                                                                      |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **uv**     | Very fast drop-in replacement.`uv venv` then `uv pip install -r requirements.txt`. Fully compatible with a normal `.venv`.                           |
+| **Poetry** | Manages venv + dependency resolution + lockfile via`pyproject.toml`. Requires adapting the `cdk.json` `app` command to `poetry run python app.py`. |
+| **pipenv** | Similar idea with`Pipfile`/`Pipfile.lock`. Less common now.                                                                                            |
+| **conda**  | Common in data science. Works, but mixes conda and pip package sources, which can get messy.                                                               |
+
+Whichever you pick, `cdk.json` must invoke the interpreter that has `aws-cdk-lib` installed:
+
+```json
+{
+  "app": "python app.py"
+}
+```
+
+That plain `python` resolves correctly **only when the venv is active** — another reason activation is a habit worth building.
+
+#### Walkthrough: Ubuntu on WSL, from scratch
+
+This is the complete sequence on a fresh Ubuntu install under Windows Subsystem for Linux. Every command is run **inside** the WSL terminal, not PowerShell.
+
+**Step 0 — Know which filesystem you are on**
+
+WSL gives you **two separate hard drives** that both appear in the same directory tree:
+
+| Path                           | What it really is                  | Speed |
+| ------------------------------ | ---------------------------------- | ----- |
+| `/mnt/c/...`                 | Your Windows`C:` drive, borrowed | Slow  |
+| `/home/<you>/...` (or `~`) | Linux's own drive                  | Fast  |
+
+Check where you are:
+
+```bash
+pwd
+df -T .     # "9p" = Windows drive, "ext4" = Linux drive
+```
+
+Think of `/mnt/c/` as a shared folder over a network. Linux cannot talk to the Windows drive directly, so every single file operation — open, read, write, check-if-exists — becomes a message passed between two operating systems. One file, no problem. But `npm install` creates tens of thousands of small files, and `cdk synth` reads and writes thousands more. Multiply a tiny delay by 50,000 and a five-second command becomes a two-minute one.
+
+The Linux drive has no such middleman, so it runs at full speed. Two other things also only work properly there: real Unix file permissions (`chmod` is silently ignored on `/mnt/c`), and file-change watching, which tools like `cdk watch` rely on.
+
+**The rule is symmetric — it is about crossing, not about which drive is "better":**
+
+> **Keep files on the same side as the tools that touch them most.**
+
+| Files live on            | Tools you run        | Result                          |
+| ------------------------ | -------------------- | ------------------------------- |
+| Linux (`~`)            | Linux (WSL)          | ✅ Fast                         |
+| Windows (`C:\`)        | Windows (PowerShell) | ✅ Fast                         |
+| Windows (`C:\`)        | Linux (WSL)          | ❌ Slow — crossing             |
+| Linux (`\\wsl$\...`) | Windows (PowerShell) | ❌ Slow — crossing the other way |
+
+Slowness is not a property of the Windows drive. A Windows repo driven by Windows tools is perfectly fast. It only degrades when one side has to reach across to the other. So the question is never "is this a Linux project?" — it is **"which shell will I be typing commands into?"** Put the files there.
+
+**Exceptions where `/mnt/c/` is still the right home:**
+
+- Files you regularly open in Windows applications (Excel, Photoshop, a Windows-only editor).
+- Repos you only read or edit, never build — notes, docs, config. A few markdown files will not notice.
+- Very large media or datasets you do not want to duplicate; read them over `/mnt/c` rather than copying gigabytes.
+
+For anything you **build** — `npm install`, `pip install`, compile, test, `cdk synth` — the Linux side wins by a wide margin.
+
+Move the project across:
+
+```bash
+mkdir -p ~/repos && cd ~/repos
+git clone <your-repo-url>
+cd <your-repo>
+df -T .     # confirm it now says ext4
+```
+
+You are not losing access to your files. The Linux drive shows up in Windows Explorer at `\\wsl$\Ubuntu\home\<user>\`, and `code .` opens it in VS Code exactly as before.
+
+> **Open the project through the WSL remote, not as a Windows folder.** Install the **WSL** extension (`ms-vscode-remote.remote-wsl`), then run `code .` from the WSL terminal. The bottom-left corner should read **WSL: Ubuntu** in green. Opening `\\wsl$\...` as a normal Windows folder puts VS Code on the far side of the boundary again, which reintroduces the slowness and prevents Python from finding your venv.
+
+**Step 1 — Update the package index**
+
+```bash
+sudo apt update && sudo apt upgrade -y
+```
+
+A stale index is the cause of most "package has no installation candidate" errors.
+
+**Step 2 — Check what Python you have**
+
+Ubuntu ships with Python 3 preinstalled, but it is deliberately minimal:
+
+```bash
+python3 --version
+```
+
+Note it is `python3`, not `python`. On Ubuntu the bare `python` command does not exist by default — that is intentional, to avoid ambiguity with the long-dead Python 2.
+
+**Step 3 — Install the pieces Ubuntu leaves out**
+
+```bash
+sudo apt install -y python3-venv python3-pip
+```
+
+This is the step people miss. Debian and Ubuntu split the standard library across packages, so `venv` and `pip` are **not** included with the base `python3`. Without `python3-venv` you get:
+
+```
+The virtual environment was not created successfully because ensurepip is not available.
+```
+
+**Step 4 — Install Node.js (the CDK CLI needs it)**
+
+The version in Ubuntu's own repositories is usually too old. Use NodeSource:
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+node --version    # should print v20.x
+```
+
+**Step 5 — Install the CDK CLI**
+
+```bash
+sudo npm install -g aws-cdk
+cdk --version
+```
+
+> To avoid `sudo` for global npm packages, point npm at a directory you own:
+>
+> ```bash
+> mkdir -p ~/.npm-global
+> npm config set prefix '~/.npm-global'
+> echo 'export PATH=~/.npm-global/bin:$PATH' >> ~/.bashrc
+> source ~/.bashrc
+> npm install -g aws-cdk
+> ```
+
+**Step 6 — Install the AWS CLI v2**
+
+Do **not** use `sudo apt install awscli`. That package was AWS CLI v1 and has been removed from Ubuntu 24.04+, which produces:
+
+```
+E: Package 'awscli' has no installation candidate
+```
+
+Use AWS's official installer instead:
+
+```bash
+sudo apt install -y unzip curl
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+rm -rf awscliv2.zip aws/
+aws --version
+```
+
+On ARM hardware substitute `awscli-exe-linux-aarch64.zip`. Check which you need with `uname -m` (`x86_64` vs `aarch64`).
+
+**Step 7 — Configure credentials**
+
+```bash
+aws configure
+aws sts get-caller-identity
+```
+
+> WSL and Windows have **separate** home directories, so credentials configured in PowerShell are invisible to WSL. If you already set them up on the Windows side, share them instead of re-entering:
+>
+> ```bash
+> ln -s /mnt/c/Users/Owner/.aws ~/.aws
+> ```
+
+**Step 8 — Create and activate the virtual environment**
+
+```bash
+cd ~/repos/my-cdk-project
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Your prompt now shows the `(.venv)` prefix. Confirm the interpreter really is the local one:
+
+```bash
+which python
+# /home/owner/repos/my-cdk-project/.venv/bin/python
+```
+
+Inside an active venv, plain `python` works even though Ubuntu has no system-wide `python` — the venv creates that alias for you.
+
+**Step 9 — Install project dependencies**
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+**Step 10 — Verify end to end**
+
+```bash
+cdk --version
+python -c "import aws_cdk; print(aws_cdk.__version__)"
+cdk synth
+```
+
+**Step 11 — Set up Docker (only if you bundle assets)**
+
+Needed for `PythonFunction`, `DockerImageAsset`, and `DockerImageFunction`. `NodejsFunction` uses esbuild and needs no Docker.
+
+You have two choices, and you only need one:
+
+- **Docker Engine natively in Ubuntu** — `sudo apt install docker.io`. Lighter, no Windows GUI.
+- **Docker Desktop on Windows** — then enable **Settings → Resources → WSL Integration** for your distro so the `docker` command works inside WSL.
+
+Either way, add yourself to the `docker` group so CDK can call Docker without a password prompt:
+
+```bash
+groups | grep -q docker && echo "already in docker group" || sudo usermod -aG docker $USER
+```
+
+Then **close and reopen the WSL terminal** — group membership is only read at login — and test:
+
+```bash
+docker run --rm hello-world
+```
+
+This matters because CDK invokes Docker internally during `cdk synth`. It cannot answer a `sudo` password prompt, so without group membership the synth simply fails.
+
+**Step 12 — Bootstrap, then deploy**
+
+```bash
+cdk bootstrap
+cdk deploy
+```
+
+Common WSL-specific failures:
+
+| Symptom                                            | Cause                                    | Fix                                                                              |
+| -------------------------------------------------- | ---------------------------------------- | -------------------------------------------------------------------------------- |
+| `ensurepip is not available`                     | `python3-venv` not installed           | `sudo apt install python3-venv`                                                |
+| `Package 'awscli' has no installation candidate` | Removed from Ubuntu 24.04+               | Use the official v2 installer (Step 6)                                           |
+| `python: command not found` outside a venv       | Ubuntu only provides`python3`          | Use`python3`, or `sudo apt install python-is-python3`                        |
+| Everything is extremely slow                       | Project lives under`/mnt/c/`           | Move it to`~/` (Step 0)                                                        |
+| `aws` works in PowerShell but not WSL            | Separate installs and separate home dirs | Install the CLI inside WSL too (Step 6)                                          |
+| `Unable to locate credentials`                   | `~/.aws` is empty in WSL               | `aws configure` in WSL, or symlink (Step 7)                                    |
+| `permission denied` on the Docker socket         | Not in the`docker` group               | `sudo usermod -aG docker $USER`, then reopen the terminal (Step 11)            |
+| `docker: command not found` in WSL               | Docker Desktop WSL integration disabled  | Docker Desktop → Settings → Resources → WSL Integration → enable your distro |
+
+#### Running multiple environments with different packages
+
+A venv is just a folder. Nothing stops you from having many, each with a completely different set of packages — that is the entire point.
+
+**The normal case: one venv per project**
+
+```bash
+~/repos/
+├── project-alpha/
+│   ├── .venv/                 # aws-cdk-lib 2.100.0, boto3 1.28
+│   └── requirements.txt
+├── project-beta/
+│   ├── .venv/                 # aws-cdk-lib 2.180.0, boto3 1.35
+│   └── requirements.txt
+└── data-analysis/
+    ├── .venv/                 # pandas, numpy, no CDK at all
+    └── requirements.txt
+```
+
+Each is isolated. Installing into one cannot affect another:
+
+```bash
+cd ~/repos/project-alpha
+python3 -m venv .venv && source .venv/bin/activate
+pip install aws-cdk-lib==2.100.0
+deactivate
+
+cd ~/repos/project-beta
+python3 -m venv .venv && source .venv/bin/activate
+pip install aws-cdk-lib==2.180.0
+deactivate
+```
+
+Verify they genuinely differ:
+
+```bash
+source ~/repos/project-alpha/.venv/bin/activate && pip show aws-cdk-lib | grep Version
+# Version: 2.100.0
+deactivate
+
+source ~/repos/project-beta/.venv/bin/activate && pip show aws-cdk-lib | grep Version
+# Version: 2.180.0
+deactivate
+```
+
+**Switching between them**
+
+Only one venv is active per shell at a time. Activating a second one while the first is active mostly works but leaves `PATH` messy — deactivate first:
+
+```bash
+deactivate                                   # leave the current one
+source ~/repos/project-beta/.venv/bin/activate
+```
+
+Two terminal tabs can hold two *different* active venvs simultaneously, which is handy when working across projects. Activation only modifies environment variables in that one shell.
+
+**Several venvs for the same project**
+
+Useful for testing a library upgrade without disturbing your working setup:
+
+```bash
+cd ~/repos/my-cdk-project
+
+python3 -m venv .venv                    # current, known-good
+python3 -m venv .venv-next               # experiment
+
+source .venv-next/bin/activate
+pip install aws-cdk-lib==2.190.0
+cdk synth > /tmp/next.json
+
+deactivate && source .venv/bin/activate
+cdk synth > /tmp/current.json
+
+diff /tmp/current.json /tmp/next.json     # did the upgrade change my infrastructure?
+```
+
+That `diff` is a genuinely useful CDK habit: it shows exactly what a library upgrade does to your CloudFormation before you deploy it. Add `.venv*` to `.gitignore` so extra environments are never committed.
+
+**Different Python versions per environment**
+
+The venv inherits its version from the interpreter that created it, so install the versions you need and pick explicitly:
+
+```bash
+sudo add-apt-repository ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install -y python3.11 python3.11-venv python3.12 python3.12-venv
+
+python3.11 -m venv .venv-py311
+python3.12 -m venv .venv-py312
+```
+
+For more than a couple of versions, `pyenv` is cleaner — it builds and manages them for you:
+
+```bash
+curl https://pyenv.run | bash
+# then follow the printed instructions to update ~/.bashrc
+
+pyenv install 3.11.9
+pyenv install 3.12.4
+pyenv local 3.12.4          # writes .python-version, auto-selects in this directory
+python -m venv .venv
+```
+
+**Separating dev tools from runtime dependencies**
+
+Keep the split in two files rather than two environments:
+
+`requirements.txt` — what the app needs:
+
+```text
+aws-cdk-lib==2.180.0
+constructs>=10.0.0,<11.0.0
+```
+
+`requirements-dev.txt` — what only developers need:
+
+```text
+-r requirements.txt
+pytest==8.3.2
+black==24.8.0
+mypy==1.11.2
+```
+
+```bash
+pip install -r requirements-dev.txt    # dev machine: pulls in both files
+pip install -r requirements.txt        # CI/deploy: runtime only
+```
+
+The leading `-r requirements.txt` line makes the dev file include the runtime file, so versions never drift apart.
+
+**Listing and cleaning up**
+
+```bash
+# What is installed in the active environment?
+pip list
+pip freeze                       # exact pinned versions, suitable for requirements.txt
+
+# Which environments exist?
+find ~/repos -maxdepth 2 -name ".venv*" -type d
+
+# How much disk are they using?
+du -sh ~/repos/*/.venv
+
+# Delete one — it is completely disposable
+rm -rf ~/repos/old-project/.venv
+```
+
+Because every environment is reconstructible from `requirements.txt`, deleting a `.venv` loses nothing. Rebuild any time with:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+```
+
+**A shortcut worth knowing**
+
+Typing the activate path repeatedly gets old. Add an alias to `~/.bashrc`:
+
+```bash
+echo "alias venv='source .venv/bin/activate'" >> ~/.bashrc
+source ~/.bashrc
+```
+
+Now `cd` into any project and just type `venv`.
+
+### 4. Bootstrap your account
 
 CDK needs a small amount of supporting infrastructure in each account/region pair: an S3 bucket for assets, an ECR repo for Docker images, and some IAM roles. This is a **one-time** step per account+region.
 
@@ -253,15 +850,17 @@ mkdir hello-cdk && cd hello-cdk
 cdk init app --language typescript
 ```
 
-For Python:
+For Python — `cdk init` creates the `.venv` folder for you, but does **not** activate it:
 
-```bash
+```powershell
 cdk init app --language python
-.venv\Scripts\activate          # macOS/Linux: source .venv/bin/activate
+.venv\Scripts\Activate.ps1      # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 > `cdk init` requires an empty directory. It also runs `git init` for you.
+>
+> If you are new to virtual environments, read [Set up a Python virtual environment](#3-set-up-a-python-virtual-environment) first — activation is required in every new terminal.
 
 ### Step 2 — Write a stack
 
@@ -404,20 +1003,20 @@ The `context` block holds **feature flags**. `cdk init` fills these in for you; 
 
 ## The CDK CLI commands you will actually use
 
-| Command | What it does |
-| --- | --- |
-| `cdk init app --language typescript` | Scaffold a new project |
-| `cdk bootstrap` | One-time setup per account+region |
-| `cdk ls` | List stacks in the app |
-| `cdk synth` | Generate CloudFormation templates into `cdk.out/` |
-| `cdk diff` | Compare local code against what is deployed |
-| `cdk deploy` | Deploy one or more stacks |
-| `cdk deploy --all` | Deploy every stack, in dependency order |
-| `cdk deploy --hotswap` | Fast dev-loop deploy that bypasses CloudFormation for Lambda code, ECS images, Step Functions definitions. **Never use in production.** |
-| `cdk watch` | Watch files and auto-hotswap-deploy on save |
-| `cdk destroy` | Delete stacks |
-| `cdk doctor` | Print environment diagnostics |
-| `cdk context --clear` | Wipe cached context values (VPC lookups, AMI IDs) |
+| Command                                | What it does                                                                                                                                 |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cdk init app --language typescript` | Scaffold a new project                                                                                                                       |
+| `cdk bootstrap`                      | One-time setup per account+region                                                                                                            |
+| `cdk ls`                             | List stacks in the app                                                                                                                       |
+| `cdk synth`                          | Generate CloudFormation templates into`cdk.out/`                                                                                           |
+| `cdk diff`                           | Compare local code against what is deployed                                                                                                  |
+| `cdk deploy`                         | Deploy one or more stacks                                                                                                                    |
+| `cdk deploy --all`                   | Deploy every stack, in dependency order                                                                                                      |
+| `cdk deploy --hotswap`               | Fast dev-loop deploy that bypasses CloudFormation for Lambda code, ECS images, Step Functions definitions.**Never use in production.** |
+| `cdk watch`                          | Watch files and auto-hotswap-deploy on save                                                                                                  |
+| `cdk destroy`                        | Delete stacks                                                                                                                                |
+| `cdk doctor`                         | Print environment diagnostics                                                                                                                |
+| `cdk context --clear`                | Wipe cached context values (VPC lookups, AMI IDs)                                                                                            |
 
 Useful flags:
 
@@ -1044,12 +1643,12 @@ new rds.DatabaseInstance(this, 'Db', {
 });
 ```
 
-| Policy | Behavior on stack delete or resource replacement |
-| --- | --- |
-| `RETAIN` | Resource is left in the account, orphaned from the stack |
-| `DESTROY` | Resource is deleted |
-| `SNAPSHOT` | Final snapshot taken, then deleted (RDS, ElastiCache, Redshift) |
-| `RETAIN_ON_UPDATE_OR_DELETE` | Retain in both cases |
+| Policy                         | Behavior on stack delete or resource replacement                |
+| ------------------------------ | --------------------------------------------------------------- |
+| `RETAIN`                     | Resource is left in the account, orphaned from the stack        |
+| `DESTROY`                    | Resource is deleted                                             |
+| `SNAPSHOT`                   | Final snapshot taken, then deleted (RDS, ElastiCache, Redshift) |
+| `RETAIN_ON_UPDATE_OR_DELETE` | Retain in both cases                                            |
 
 **Defaults vary by construct**, so always set this explicitly on anything stateful.
 
@@ -1312,21 +1911,26 @@ This is the standard path for migrating an existing CloudFormation stack into CD
 
 ## Common errors and how to fix them
 
-| Message | Cause | Fix |
-| --- | --- | --- |
-| `This stack uses assets, so the toolkit stack must be deployed` | Account/region not bootstrapped | `cdk bootstrap aws://ACCOUNT/REGION` |
-| `Cannot retrieve value from context provider vpc-provider ... account/region are not specified` | Environment-agnostic stack doing a lookup | Set an explicit `env` on the stack |
-| `Cannot use resource X in a cross-environment fashion` | Two stacks in different accounts/regions sharing a construct | Pass primitives (ARN strings) instead of construct objects |
-| `Export ... cannot be deleted as it is in use by ...` | The "deadly embrace" | Two-phase deploy: remove the consumer first |
-| `UPDATE_ROLLBACK_FAILED` | A resource could not roll back | CloudFormation console → Stack actions → Continue update rollback, optionally skipping the stuck resource |
-| `Bucket already exists` | Hardcoded `bucketName` | Let CDK generate names; only hardcode when you truly must |
-| `Maximum policy size exceeded` | Too many `grant*` calls on one role | Split into multiple roles, or enable the `minimizePolicies` feature flag |
-| `Number of resources in stack is greater than 500` | Stack too big | Split into multiple stacks, or use nested stacks |
-| `Cannot find asset at ...` | Wrong relative path in `fromAsset` | Use `path.join(__dirname, '../lambda')` |
-| `Docker is not running` | Bundling needs Docker | Start Docker Desktop, or use `NodejsFunction` with local esbuild |
-| `cdk: command not found` | CLI not installed or not on PATH | `npm i -g aws-cdk`, or use `npx aws-cdk` |
-| `This CDK CLI is not compatible with the CDK library used by your application` | CLI older than `aws-cdk-lib` | `npm i -g aws-cdk@latest` |
-| Resource unexpectedly replaced | Construct `id` changed | Always read `cdk diff` before deploying; use `overrideLogicalId` to preserve IDs |
+| Message                                                                                           | Cause                                                        | Fix                                                                                                         |
+| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `This stack uses assets, so the toolkit stack must be deployed`                                 | Account/region not bootstrapped                              | `cdk bootstrap aws://ACCOUNT/REGION`                                                                      |
+| `Cannot retrieve value from context provider vpc-provider ... account/region are not specified` | Environment-agnostic stack doing a lookup                    | Set an explicit`env` on the stack                                                                         |
+| `Cannot use resource X in a cross-environment fashion`                                          | Two stacks in different accounts/regions sharing a construct | Pass primitives (ARN strings) instead of construct objects                                                  |
+| `Export ... cannot be deleted as it is in use by ...`                                           | The "deadly embrace"                                         | Two-phase deploy: remove the consumer first                                                                 |
+| `UPDATE_ROLLBACK_FAILED`                                                                        | A resource could not roll back                               | CloudFormation console → Stack actions → Continue update rollback, optionally skipping the stuck resource |
+| `Bucket already exists`                                                                         | Hardcoded`bucketName`                                      | Let CDK generate names; only hardcode when you truly must                                                   |
+| `Maximum policy size exceeded`                                                                  | Too many`grant*` calls on one role                         | Split into multiple roles, or enable the`minimizePolicies` feature flag                                   |
+| `Number of resources in stack is greater than 500`                                              | Stack too big                                                | Split into multiple stacks, or use nested stacks                                                            |
+| `Cannot find asset at ...`                                                                      | Wrong relative path in`fromAsset`                          | Use`path.join(__dirname, '../lambda')`                                                                    |
+| `Docker is not running`                                                                         | Bundling needs Docker                                        | Start Docker Desktop, or use`NodejsFunction` with local esbuild                                           |
+| `cdk: command not found`                                                                        | CLI not installed or not on PATH                             | `npm i -g aws-cdk`, or use `npx aws-cdk`                                                                |
+| `ModuleNotFoundError: No module named 'aws_cdk'`                                                | Python venv not activated in this terminal                   | Activate it:`.venv\Scripts\Activate.ps1`, then `pip install -r requirements.txt`                        |
+| `'python' is not recognized` (Windows)                                                          | Python not installed, or not added to`PATH`                | Reinstall from python.org with**Add python.exe to PATH** ticked, then reopen the terminal             |
+| `ensurepip is not available` (Debian/Ubuntu)                                                    | The`venv` module is packaged separately                    | `sudo apt install python3-venv`                                                                           |
+| `running scripts is disabled on this system`                                                    | PowerShell execution policy blocks venv activation           | `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`                                    |
+| `error: externally-managed-environment`                                                         | `pip install` targeting the system Python                  | Create and activate a venv instead of installing globally                                                   |
+| `This CDK CLI is not compatible with the CDK library used by your application`                  | CLI older than`aws-cdk-lib`                                | `npm i -g aws-cdk@latest`                                                                                 |
+| Resource unexpectedly replaced                                                                    | Construct`id` changed                                      | Always read`cdk diff` before deploying; use `overrideLogicalId` to preserve IDs                         |
 
 **Debugging workflow when a deploy fails:**
 
@@ -1377,25 +1981,25 @@ This is the standard path for migrating an existing CloudFormation stack into CD
 
 ## Glossary
 
-| Term | Meaning |
-| --- | --- |
-| **App** | Root of the construct tree; the whole CDK program |
-| **Stack** | Unit of deployment; maps to one CloudFormation stack |
-| **Stage** | A group of stacks representing one copy of the app (dev/prod) |
-| **Construct** | Any node in the tree; the basic building block |
-| **L1 / CFN resource** | Direct 1:1 mapping of a CloudFormation resource (`CfnBucket`) |
-| **L2** | Curated construct with defaults and helpers (`Bucket`) |
-| **L3 / Pattern** | Multi-resource solution (`ApplicationLoadBalancedFargateService`) |
-| **Synthesis (`synth`)** | Running your code to produce CloudFormation templates |
-| **Cloud Assembly** | The `cdk.out/` directory: templates + assets + metadata |
-| **Token** | Placeholder for a value only known at deploy time |
-| **Asset** | Local file, directory, or Docker image uploaded during deploy |
-| **Bootstrap** | One-time per account+region setup of the `CDKToolkit` stack |
-| **Logical ID** | CloudFormation identifier derived from the construct path |
-| **Physical name** | The actual AWS resource name/ARN after deployment |
-| **Escape hatch** | Technique for setting properties an L2 does not expose |
-| **Aspect** | A visitor applied to every construct in a scope |
-| **Feature flag** | Entry in `cdk.json` context that changes CDK behavior |
+| Term                            | Meaning                                                             |
+| ------------------------------- | ------------------------------------------------------------------- |
+| **App**                   | Root of the construct tree; the whole CDK program                   |
+| **Stack**                 | Unit of deployment; maps to one CloudFormation stack                |
+| **Stage**                 | A group of stacks representing one copy of the app (dev/prod)       |
+| **Construct**             | Any node in the tree; the basic building block                      |
+| **L1 / CFN resource**     | Direct 1:1 mapping of a CloudFormation resource (`CfnBucket`)     |
+| **L2**                    | Curated construct with defaults and helpers (`Bucket`)            |
+| **L3 / Pattern**          | Multi-resource solution (`ApplicationLoadBalancedFargateService`) |
+| **Synthesis (`synth`)** | Running your code to produce CloudFormation templates               |
+| **Cloud Assembly**        | The`cdk.out/` directory: templates + assets + metadata            |
+| **Token**                 | Placeholder for a value only known at deploy time                   |
+| **Asset**                 | Local file, directory, or Docker image uploaded during deploy       |
+| **Bootstrap**             | One-time per account+region setup of the`CDKToolkit` stack        |
+| **Logical ID**            | CloudFormation identifier derived from the construct path           |
+| **Physical name**         | The actual AWS resource name/ARN after deployment                   |
+| **Escape hatch**          | Technique for setting properties an L2 does not expose              |
+| **Aspect**                | A visitor applied to every construct in a scope                     |
+| **Feature flag**          | Entry in`cdk.json` context that changes CDK behavior              |
 
 ---
 
@@ -1408,3 +2012,175 @@ This is the standard path for migrating an existing CloudFormation stack into CD
 - **CDK Patterns** — https://cdkpatterns.com/
 - **GitHub repo and issues** — https://github.com/aws/aws-cdk
 - **cdk-nag** — https://github.com/cdklabs/cdk-nag
+
+---
+
+## Appendix: Windows-native setup runbook
+
+The main guide assumes Linux/WSL. This appendix is the equivalent sequence for running CDK **directly on Windows in PowerShell**, with no WSL involved. Use it if you prefer a single environment, or if WSL is unavailable on your machine.
+
+### WSL vs Windows-native: choosing one
+
+|                                         | WSL (Ubuntu)                            | Windows-native (PowerShell)             |
+| --------------------------------------- | --------------------------------------- | --------------------------------------- |
+| Matches Lambda's runtime (Linux)        | Yes                                     | No                                      |
+| Docker bundling for Python Lambdas      | Reliable                                | Works, needs Docker Desktop             |
+| Shell commands match AWS docs and blogs | Yes                                     | Must be translated                      |
+| Matches CI runners (`ubuntu-latest`)  | Yes                                     | No                                      |
+| Line endings, path separators           | Uniform                                 | CRLF and`\` cause occasional friction |
+| Setup complexity                        | Higher (two filesystems, two tool sets) | Lower                                   |
+| Speed on the Windows drive              | Slow under`/mnt/c`                    | Native                                  |
+
+**Pick one and stay there.** The costly mistake is straddling both — half your tools in PowerShell, half in WSL, credentials in one place, a venv built for the other. Symptoms include `aws` working in one terminal but not the other, and `ModuleNotFoundError` from a venv created by the wrong interpreter.
+
+### Step 1 — Install Node.js
+
+Required even for Python CDK projects, because the CDK CLI is a Node program.
+
+```powershell
+winget install OpenJS.NodeJS.LTS
+```
+
+Close and reopen PowerShell, then verify:
+
+```powershell
+node --version    # v20.x or v22.x
+npm --version
+```
+
+No `winget`? Download the LTS MSI from [nodejs.org](https://nodejs.org/).
+
+### Step 2 — Install Python (only for Python CDK projects)
+
+```powershell
+winget install Python.Python.3.12
+```
+
+If you use the python.org installer instead, **tick "Add python.exe to PATH"** on the first screen.
+
+```powershell
+python --version    # Python 3.12.x
+```
+
+If this opens the Microsoft Store, the Store alias is intercepting the command. Turn it off under **Settings → Apps → Advanced app settings → App execution aliases**, then disable the `python.exe` and `python3.exe` entries.
+
+Unlike Debian/Ubuntu, the Windows installer bundles `pip` and `venv` — nothing extra to install.
+
+### Step 3 — Install the CDK CLI
+
+```powershell
+npm install -g aws-cdk
+cdk --version
+```
+
+No `sudo` equivalent is needed; npm's global prefix on Windows is already user-writable.
+
+### Step 4 — Install the AWS CLI v2
+
+```powershell
+winget install Amazon.AWSCLI
+```
+
+Or download the MSI from [awscli.amazonaws.com/AWSCLIV2.msi](https://awscli.amazonaws.com/AWSCLIV2.msi).
+
+Reopen PowerShell, then:
+
+```powershell
+aws --version    # aws-cli/2.x.x Windows/...
+```
+
+### Step 5 — Configure credentials
+
+```powershell
+aws configure
+aws sts get-caller-identity
+```
+
+Credentials land in `C:\Users\<you>\.aws\`.
+
+### Step 6 — Allow venv activation in PowerShell
+
+PowerShell blocks local scripts by default, which prevents `Activate.ps1` from running. Allow signed and local scripts for your user only:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+Do this once per machine. Without it, activation fails with `running scripts is disabled on this system`.
+
+### Step 7 — Create the project and its virtual environment
+
+```powershell
+mkdir hello-cdk; cd hello-cdk
+cdk init app --language typescript
+```
+
+For Python:
+
+```powershell
+cdk init app --language python
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Verify the prompt shows `(.venv)` and the interpreter is the local one:
+
+```powershell
+(Get-Command python).Source
+# C:\...\hello-cdk\.venv\Scripts\python.exe
+```
+
+### Step 8 — Install Docker Desktop (optional)
+
+Needed only for asset bundling — `PythonFunction`, `DockerImageAsset`, `DockerImageFunction`. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) and leave it running during `cdk synth`.
+
+`NodejsFunction` bundles with esbuild and does **not** require Docker.
+
+### Step 9 — Bootstrap and deploy
+
+```powershell
+cdk bootstrap
+cdk synth
+cdk deploy
+```
+
+### PowerShell command equivalents
+
+| Task                     | Bash (WSL)                    | PowerShell                                    |
+| ------------------------ | ----------------------------- | --------------------------------------------- |
+| Activate venv            | `source .venv/bin/activate` | `.venv\Scripts\Activate.ps1`                |
+| Deactivate               | `deactivate`                | `deactivate`                                |
+| Which interpreter        | `which python`              | `(Get-Command python).Source`               |
+| Delete a directory       | `rm -rf .venv`              | `Remove-Item -Recurse -Force .venv`         |
+| Set an env var (session) | `export KEY=value`          | `$env:KEY = "value"`                        |
+| Chain commands           | `cmd1 && cmd2`              | `cmd1; cmd2`                                |
+| Current directory        | `pwd`                       | `Get-Location` or `$PWD`                  |
+| List files               | `ls -la`                    | `Get-ChildItem -Force`                      |
+| Show a file              | `cat file`                  | `Get-Content file`                          |
+| Find text                | `grep pattern file`         | `Select-String pattern file`                |
+| Make a directory tree    | `mkdir -p a/b/c`            | `New-Item -ItemType Directory -Force a\b\c` |
+
+### Windows-specific troubleshooting
+
+| Symptom                                        | Cause                            | Fix                                                                                                           |
+| ---------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `running scripts is disabled on this system` | Execution policy                 | `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`                                      |
+| `python` opens the Microsoft Store           | Store app-execution alias        | Disable the alias in Settings, or reinstall from python.org with PATH enabled                                 |
+| `'cdk' is not recognized`                    | npm global bin not on PATH       | Reopen the terminal; check`npm config get prefix` is in `$env:PATH`                                       |
+| `The filename or extension is too long`      | 260-character path limit         | Enable long paths:`git config --global core.longpaths true`, and set `LongPathsEnabled=1` in the registry |
+| Git shows every file as modified               | CRLF vs LF line endings          | `git config --global core.autocrlf true`                                                                    |
+| Docker bundling hangs                          | Docker Desktop not running       | Start Docker Desktop and retry                                                                                |
+| venv activates but imports fail                | venv built by a different Python | Delete`.venv` and recreate with the intended interpreter                                                    |
+
+### Moving between WSL and Windows later
+
+The repo itself is portable — only the generated, gitignored directories are not.
+
+Never share `.venv/` or `node_modules/` across the two environments. A venv hardcodes absolute interpreter paths (`Scripts\python.exe` on Windows, `bin/python` on Linux), and `node_modules` can contain natively compiled binaries. Delete and rebuild them on the other side:
+
+```powershell
+Remove-Item -Recurse -Force .venv, node_modules
+```
+
+Then recreate from `requirements.txt` and `package-lock.json`, which are committed and platform-neutral. Credentials must also be configured separately in each environment, since `C:\Users\<you>\.aws\` and `/home/<you>/.aws/` are different directories.

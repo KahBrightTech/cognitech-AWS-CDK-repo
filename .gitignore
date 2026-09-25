@@ -1,0 +1,12 @@
+# Python virtual environments
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Test cache
+.pytest_cache/
+
+# CDK synthesized output
+cdk.out/
