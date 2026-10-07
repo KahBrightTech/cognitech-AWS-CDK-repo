@@ -1,0 +1,49 @@
+name: PR Check
+
+# Runs on every pull request. Needs no AWS credentials: the tests and `cdk synth`
+# work entirely offline because the availability zones come from the config.
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Tests and synth
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+    env:
+      # app.py reads this, so no --context flag is needed below.
+      ENV: ${{ matrix.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          npm install -g aws-cdk@2
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Synthesize ${{ matrix.environment }}
+        run: cdk synth --quiet

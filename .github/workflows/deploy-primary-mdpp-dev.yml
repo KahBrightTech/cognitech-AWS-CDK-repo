@@ -1,0 +1,70 @@
+name: Deploy primary mdpp dev
+
+# Deploys deployments/dev/ into the md-preproduction account (533267408704),
+# us-east-1. One workflow per environment: nothing to pick, so there is no way
+# to run it against the wrong account by mistake.
+#
+# Naming: deploy-<region role>-<account>-<environment>
+#   primary = us-east-1   mdpp = md-preproduction   dev = deployments/dev/
+#
+# The role ARN and region are written in below rather than stored as GitHub
+# secrets or variables. Neither is a credential, and both already appear in
+# deployments/dev/env.yaml. The only GitHub setup needed is an Environment
+# named "dev".
+#
+# `cdk diff` always runs immediately before `cdk deploy`, so the change is in
+# the log even though there is no dry-run option.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-mdpp-dev
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required to request the OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy dev
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      ENV: dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-dev.txt
+          npm install -g aws-cdk@2
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Synthesize
+        run: cdk synth --quiet
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::533267408704:role/github-oidc-cdk-deploy-dev
+          aws-region: us-east-1 
+          role-session-name: cdk-deploy-dev-${{ github.run_id }}
+
+      - name: Show what will change
+        run: cdk diff
+
+      - name: Deploy
+        run: cdk deploy --require-approval never --progress events

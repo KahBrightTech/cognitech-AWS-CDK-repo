@@ -1,9 +1,24 @@
 {
-  // The venv is a Linux one, so VS Code must be connected to WSL for this to work:
-  // Command Palette -> "WSL: Reopen Folder in WSL".
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv-linux/bin/python",
-  // app.py and pyproject.toml put src/ on the path at runtime; tell Pylance too.
-  "python.analysis.extraPaths": ["./src"],
+  // NOTE: VS Code reads .vscode/settings.json from the *workspace root*.
+  // If you open the parent folder (GitReposWSL) rather than this repo, this
+  // file is ignored and GitReposWSL/.vscode/settings.json applies instead.
+
+  // Pylance needs an interpreter that has aws-cdk-lib installed.
+  // Windows VS Code -> the Windows venv. After "WSL: Reopen Folder in WSL",
+  // switch to .venv-linux/bin/python with "Python: Select Interpreter".
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv-win/Scripts/python.exe",
+
+  // app.py and pyproject.toml put src/ on the path at runtime; Pylance needs
+  // telling separately, or the cognitech_cdk.* imports show as unresolved.
+  "python.analysis.extraPaths": ["${workspaceFolder}/src"],
+  "python.analysis.autoSearchPaths": true,
+
   "python.testing.pytestEnabled": true,
-  "python.testing.pytestArgs": ["tests"]
+  "python.testing.pytestArgs": ["tests"],
+
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "cdk.out": true
+  }
 }

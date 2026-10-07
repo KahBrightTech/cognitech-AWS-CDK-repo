@@ -11,8 +11,12 @@
     ]
   },
   "context": {
-    "env": "uat",
+    "_comment_feature_flags": "Feature flags below change what CDK synthesizes. They are not part of deployments/<env>/env.yaml.",
+
+    "_comment_checkSecretUsage": "Fails synth if a Secrets Manager secret is used somewhere it would end up in plaintext.",
     "@aws-cdk/core:checkSecretUsage": true,
+
+    "_comment_restrictDefaultSecurityGroup": "Strips all rules from the VPC default security group (CIS 5.3, HIPAA). Adds Custom::VpcRestrictDefaultSG plus a Lambda and IAM role to every stack with a VPC. Set to false to drop them; CDK will not re-open the group.",
     "@aws-cdk/aws-ec2:restrictDefaultSecurityGroup": true
   }
 }

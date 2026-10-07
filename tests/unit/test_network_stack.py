@@ -1,50 +1,26 @@
 import json
-import textwrap
-from pathlib import Path
 
 import aws_cdk as cdk
 import pytest
 from aws_cdk.assertions import Match, Template
 
-from cognitech_cdk.network_stack import NetworkStack
-from cognitech_cdk.settings import environments, load_settings
-
-BASE = """account_id: "111122223333"
-region: us-east-1
-name_prefix: demo
-cidr: 10.0.0.0/16
-tags:
-  Build-method: aws-cdk
-  Environment: test
-  ManagedBy: aws-cdk/repo
-  Owner: someone@example.com
-  Compliance: hippaa
-"""
+from cognitech_cdk.common.environment import list_environments, load_environment
+from cognitech_cdk.stacks.network_stack import NetworkStack
 
 
-@pytest.fixture
-def settings_for(tmp_path):
-    """Write a throwaway env.yaml from the extra lines given, and load it."""
-
-    def _build(extra: str = "", env: str = "demo"):
-        env_dir = tmp_path / env
-        env_dir.mkdir(parents=True, exist_ok=True)
-        body = textwrap.dedent(extra).strip()
-        (env_dir / "env.yaml").write_text(f"{BASE}{body}\n", encoding="utf-8")
-        return load_settings(env, root=tmp_path)
-
-    return _build
-
-
-def _synth(settings, outdir: Path | None = None) -> Template:
+def _template(environment, outdir=None) -> Template:
     app = cdk.App(outdir=str(outdir) if outdir else None)
     stack = NetworkStack(
         app,
-        f"{settings.name_prefix}-network",
-        settings=settings,
-        env=cdk.Environment(account=settings.account_id, region=settings.region),
+        environment.common.name(environment.network.name, "network"),
+        environment=environment,
+        env=cdk.Environment(account=environment.account_id, region=environment.region),
     )
     return Template.from_stack(stack)
+
+
+def _synth(write_env, network: str) -> Template:
+    return _template(load_environment("test", root=write_env(network)))
 
 
 def _names(template: Template, resource_type: str) -> set[str]:
@@ -56,127 +32,47 @@ def _names(template: Template, resource_type: str) -> set[str]:
     }
 
 
-# --- settings -------------------------------------------------------------
+PUBLIC_ONLY = """
+name: uat
+cidr_block: 10.20.0.0/16
+azs: 2
+private_subnets: false
+"""
+
+WITH_PRIVATE = """
+name: uat
+cidr_block: 10.20.0.0/16
+azs: 2
+private_subnets: true
+"""
 
 
-@pytest.mark.parametrize(
-    "azs, zones",
-    [
-        (1, ["us-east-1a"]),
-        (2, ["us-east-1a", "us-east-1b"]),
-        (3, ["us-east-1a", "us-east-1b", "us-east-1c"]),
-    ],
-)
-def test_azs_pick_the_zones(settings_for, azs, zones):
-    assert settings_for(f"azs: {azs}").zones == zones
+# --- public only ----------------------------------------------------------
 
 
-def test_private_subnets_are_off_by_default(settings_for):
-    settings = settings_for("azs: 2")
-    assert settings.private_subnets is False
-    assert settings.nat_gateways == 0
-
-
-def test_nat_gateways_default_to_one_per_az(settings_for):
-    assert settings_for("azs: 3\nprivate_subnets: true").nat_gateways == 3
-
-
-def test_nat_gateways_are_capped_at_the_az_count(settings_for):
-    assert settings_for("azs: 2\nprivate_subnets: true\nnat_gateways: 9").nat_gateways == 2
-
-
-@pytest.mark.parametrize(
-    "extra, message",
-    [
-        ("azs: 0", "azs must be 1, 2 or 3"),
-        ("azs: 4", "azs must be 1, 2 or 3"),
-        ("azs: 2\nprivate_subnets: true\nnat_gateways: 0", "needs nat_gateways >= 1"),
-    ],
-)
-def test_bad_settings_are_rejected(settings_for, extra, message):
-    with pytest.raises(ValueError, match=message):
-        settings_for(extra)
-
-
-def test_missing_tag_is_rejected(tmp_path):
-    env_dir = tmp_path / "bad"
-    env_dir.mkdir()
-    (env_dir / "env.yaml").write_text(
-        'account_id: "1"\nregion: us-east-1\nname_prefix: x\ncidr: 10.0.0.0/16\n'
-        "tags:\n  Owner: someone@example.com\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="missing Build-method"):
-        load_settings("bad", root=tmp_path)
-
-
-def test_unknown_environment_lists_the_known_ones(settings_for, tmp_path):
-    settings_for("azs: 1", env="uat")
-    with pytest.raises(FileNotFoundError, match="Known environments: uat"):
-        load_settings("nope", root=tmp_path)
-
-
-def test_environments_are_listed_in_deploy_order():
-    assert environments() == ["uat", "prod"]
-
-
-# --- the stack ------------------------------------------------------------
-
-
-def test_public_only_vpc_has_no_nat_gateways(settings_for):
-    template = _synth(settings_for("azs: 2"))
+def test_public_only_builds_vpc_igw_and_subnets(write_env):
+    template = _synth(write_env, PUBLIC_ONLY)
 
     template.resource_count_is("AWS::EC2::VPC", 1)
-    template.resource_count_is("AWS::EC2::Subnet", 2)
     template.resource_count_is("AWS::EC2::InternetGateway", 1)
+    template.resource_count_is("AWS::EC2::Subnet", 2)
+    template.resource_count_is("AWS::EC2::RouteTable", 2)
+    template.has_resource_properties(
+        "AWS::EC2::VPC",
+        {"CidrBlock": "10.20.0.0/16", "EnableDnsHostnames": True, "EnableDnsSupport": True},
+    )
+
+
+def test_public_only_has_no_nat_gateways_or_eips(write_env):
+    template = _synth(write_env, PUBLIC_ONLY)
+
     template.resource_count_is("AWS::EC2::NatGateway", 0)
     template.resource_count_is("AWS::EC2::EIP", 0)
-    assert _names(template, "AWS::EC2::Subnet") == {"demo-public-primary", "demo-public-secondary"}
     assert set(template.find_outputs("*")) == {"VpcId", "PublicSubnetIds"}
 
 
-def test_private_subnets_add_nat_gateways_and_eips(settings_for):
-    template = _synth(settings_for("azs: 2\nprivate_subnets: true"))
-
-    template.resource_count_is("AWS::EC2::Subnet", 4)
-    template.resource_count_is("AWS::EC2::NatGateway", 2)
-    template.resource_count_is("AWS::EC2::EIP", 2)
-    assert _names(template, "AWS::EC2::Subnet") == {
-        "demo-public-primary",
-        "demo-public-secondary",
-        "demo-private-primary",
-        "demo-private-secondary",
-    }
-    assert set(template.find_outputs("*")) == {"VpcId", "PublicSubnetIds", "PrivateSubnetIds"}
-
-
-def test_one_nat_gateway_serves_all_private_subnets(settings_for):
-    template = _synth(settings_for("azs: 3\nprivate_subnets: true\nnat_gateways: 1"))
-
-    template.resource_count_is("AWS::EC2::Subnet", 6)
-    template.resource_count_is("AWS::EC2::NatGateway", 1)
-    template.resource_count_is("AWS::EC2::EIP", 1)
-    # 3 public routes to the IGW + 3 private routes to the one NAT gateway.
-    routes = template.find_resources(
-        "AWS::EC2::Route", {"Properties": {"DestinationCidrBlock": "0.0.0.0/0"}}
-    )
-    assert len(routes) == 6
-
-
-@pytest.mark.parametrize("azs", [1, 2, 3])
-def test_az_count_controls_the_subnet_count(settings_for, azs):
-    template = _synth(settings_for(f"azs: {azs}\nprivate_subnets: true"))
-
-    template.resource_count_is("AWS::EC2::Subnet", azs * 2)
-    template.resource_count_is("AWS::EC2::NatGateway", azs)
-    for zone in "abc"[:azs]:
-        template.has_resource_properties(
-            "AWS::EC2::Subnet", {"AvailabilityZone": f"us-east-1{zone}"}
-        )
-
-
-def test_public_subnets_route_out_and_get_public_ips(settings_for):
-    template = _synth(settings_for("azs: 1"))
+def test_public_subnets_route_to_the_internet_gateway(write_env):
+    template = _synth(write_env, PUBLIC_ONLY)
 
     template.has_resource_properties("AWS::EC2::Subnet", {"MapPublicIpOnLaunch": True})
     template.has_resource_properties(
@@ -185,44 +81,233 @@ def test_public_subnets_route_out_and_get_public_ips(settings_for):
     )
 
 
-def test_everything_is_named_from_the_prefix(settings_for):
-    template = _synth(settings_for("azs: 1\nprivate_subnets: true"))
+# --- with private subnets -------------------------------------------------
 
-    assert _names(template, "AWS::EC2::VPC") == {"demo-vpc"}
-    assert _names(template, "AWS::EC2::InternetGateway") == {"demo-igw"}
-    assert _names(template, "AWS::EC2::NatGateway") == {"demo-primary-natgw"}
-    assert _names(template, "AWS::EC2::EIP") == {"demo-primary-nat-eip"}
-    assert _names(template, "AWS::EC2::RouteTable") == {
-        "demo-public-primary-rtb",
-        "demo-private-primary-rtb",
+
+def test_private_subnets_add_nat_gateways_and_eips(write_env):
+    template = _synth(write_env, WITH_PRIVATE)
+
+    template.resource_count_is("AWS::EC2::Subnet", 4)
+    template.resource_count_is("AWS::EC2::NatGateway", 2)
+    template.resource_count_is("AWS::EC2::EIP", 2)
+    template.has_resource_properties(
+        "AWS::EC2::Route",
+        {"DestinationCidrBlock": "0.0.0.0/0", "NatGatewayId": Match.any_value()},
+    )
+    assert set(template.find_outputs("*")) == {"VpcId", "PublicSubnetIds", "PrivateSubnetIds"}
+
+
+def test_one_nat_gateway_serves_every_private_subnet(write_env):
+    template = _synth(
+        write_env,
+        """
+        name: uat
+        cidr_block: 10.20.0.0/16
+        azs: 3
+        private_subnets: true
+        nat_gateways: 1
+        """,
+    )
+
+    template.resource_count_is("AWS::EC2::NatGateway", 1)
+    template.resource_count_is("AWS::EC2::EIP", 1)
+    # 3 public routes to the IGW + 3 private routes to the single NAT gateway.
+    routes = template.find_resources(
+        "AWS::EC2::Route", {"Properties": {"DestinationCidrBlock": "0.0.0.0/0"}}
+    )
+    assert len(routes) == 6
+
+
+# --- availability zones ---------------------------------------------------
+
+
+@pytest.mark.parametrize("azs", [1, 2, 3, 4])
+def test_az_count_controls_the_subnet_count(write_env, azs):
+    template = _synth(
+        write_env,
+        f"name: uat\ncidr_block: 10.20.0.0/16\nazs: {azs}\nprivate_subnets: true",
+    )
+
+    template.resource_count_is("AWS::EC2::Subnet", azs * 2)
+    template.resource_count_is("AWS::EC2::NatGateway", azs)
+    for letter in "abcd"[:azs]:
+        template.has_resource_properties(
+            "AWS::EC2::Subnet", {"AvailabilityZone": f"us-east-1{letter}"}
+        )
+
+
+# --- naming convention ----------------------------------------------------
+
+
+def test_subnets_follow_the_terraform_naming_convention(write_env):
+    template = _synth(write_env, WITH_PRIVATE)
+
+    assert _names(template, "AWS::EC2::Subnet") == {
+        "int-production-use1-uat-public-primary",
+        "int-production-use1-uat-public-secondary",
+        "int-production-use1-uat-private-primary",
+        "int-production-use1-uat-private-secondary",
     }
 
 
-def test_tags_reach_every_resource(settings_for):
-    template = _synth(settings_for("azs: 1"))
-    template.has_resource_properties(
-        "AWS::EC2::VPC",
-        {
-            "Tags": Match.array_with(
-                [
-                    {"Key": "Build-method", "Value": "aws-cdk"},
-                    {"Key": "Compliance", "Value": "hippaa"},
-                    {"Key": "Owner", "Value": "someone@example.com"},
-                ]
-            )
-        },
+def test_custom_subnet_names_appear_in_resource_names(write_env):
+    template = _synth(
+        write_env,
+        """
+        name: uat
+        cidr_block: 10.20.0.0/16
+        azs: 1
+        private_subnets: true
+        public_subnet_name: edge
+        private_subnet_name: app
+        """,
     )
 
+    assert _names(template, "AWS::EC2::Subnet") == {
+        "int-production-use1-uat-edge-public-primary",
+        "int-production-use1-uat-app-private-primary",
+    }
+    assert _names(template, "AWS::EC2::NatGateway") == {
+        "int-production-use1-uat-edge-ngw-primary"
+    }
+    assert _names(template, "AWS::EC2::EIP") == {"int-production-use1-uat-edge-eip-primary"}
+    assert _names(template, "AWS::EC2::RouteTable") == {
+        "int-production-use1-uat-edge-primary-public-rt",
+        "int-production-use1-uat-app-primary-private-rt",
+    }
 
-# --- the real environments ------------------------------------------------
+
+def test_vpc_igw_and_route_tables_are_named(write_env):
+    template = _synth(write_env, WITH_PRIVATE)
+
+    assert _names(template, "AWS::EC2::VPC") == {"int-production-use1-uat-vpc"}
+    assert _names(template, "AWS::EC2::InternetGateway") == {"int-production-use1-uat-igw"}
+    assert _names(template, "AWS::EC2::NatGateway") == {
+        "int-production-use1-uat-ngw-primary",
+        "int-production-use1-uat-ngw-secondary",
+    }
+    assert _names(template, "AWS::EC2::RouteTable") == {
+        "int-production-use1-uat-primary-public-rt",
+        "int-production-use1-uat-secondary-public-rt",
+        "int-production-use1-uat-primary-private-rt",
+        "int-production-use1-uat-secondary-private-rt",
+    }
 
 
-@pytest.mark.parametrize("env", environments())
-def test_shipped_environment_synthesizes_without_aws(env, tmp_path):
-    """`cdk synth` runs before credentials exist in the PR workflow, so the
-    assembly must not ask AWS for anything."""
-    outdir = tmp_path / env
-    _synth(load_settings(env), outdir=outdir)
+# --- tags -----------------------------------------------------------------
+
+
+# --- subnet CIDRs ---------------------------------------------------------
+
+
+def _cidrs(template: Template) -> dict[str, str]:
+    """Map each subnet's Name tag to its CIDR block."""
+    return {
+        next(t["Value"] for t in r["Properties"]["Tags"] if t["Key"] == "Name"): r[
+            "Properties"
+        ]["CidrBlock"]
+        for r in template.find_resources("AWS::EC2::Subnet").values()
+    }
+
+
+def test_explicit_cidrs_reach_the_template(write_env):
+    template = _synth(
+        write_env,
+        """
+        name: uat
+        cidr_block: 10.20.0.0/16
+        azs: 2
+        private_subnets: true
+        public_subnet_cidrs:  [10.20.100.0/24, 10.20.101.0/24]
+        private_subnet_cidrs: [10.20.200.0/23, 10.20.202.0/23]
+        """,
+    )
+
+    assert _cidrs(template) == {
+        "int-production-use1-uat-public-primary": "10.20.100.0/24",
+        "int-production-use1-uat-public-secondary": "10.20.101.0/24",
+        "int-production-use1-uat-private-primary": "10.20.200.0/23",
+        "int-production-use1-uat-private-secondary": "10.20.202.0/23",
+    }
+
+
+def test_carved_cidrs_avoid_the_explicit_ones(write_env):
+    template = _synth(
+        write_env,
+        """
+        name: uat
+        cidr_block: 10.20.0.0/16
+        azs: 2
+        private_subnets: true
+        public_subnet_cidrs: [10.20.0.0/24, 10.20.1.0/24]
+        """,
+    )
+
+    cidrs = _cidrs(template)
+    assert cidrs["int-production-use1-uat-public-primary"] == "10.20.0.0/24"
+    assert cidrs["int-production-use1-uat-private-primary"] == "10.20.2.0/24"
+    assert len(set(cidrs.values())) == 4
+
+
+def test_cidr_mask_changes_the_carved_size(write_env):
+    template = _synth(
+        write_env,
+        "name: uat\ncidr_block: 10.20.0.0/16\nazs: 2\ncidr_mask: 20",
+    )
+
+    assert set(_cidrs(template).values()) == {"10.20.0.0/20", "10.20.16.0/20"}
+
+
+def test_common_tags_reach_every_resource(write_env):
+    template = _synth(write_env, WITH_PRIVATE)
+
+    expected = Match.array_with(
+        [
+            {"Key": "Build-method", "Value": "aws-cdk"},
+            {"Key": "Compliance", "Value": "hippaa"},
+            {"Key": "Environment", "Value": "test"},
+            {"Key": "ManagedBy", "Value": "aws-cdk/repo"},
+            {"Key": "Owner", "Value": "someone@example.com"},
+        ]
+    )
+    for resource_type in (
+        "AWS::EC2::VPC",
+        "AWS::EC2::Subnet",
+        "AWS::EC2::InternetGateway",
+        "AWS::EC2::NatGateway",
+        "AWS::EC2::EIP",
+        "AWS::EC2::RouteTable",
+    ):
+        template.has_resource_properties(resource_type, {"Tags": expected})
+
+
+# --- the shipped environments ---------------------------------------------
+
+
+@pytest.mark.parametrize("env_name", list_environments())
+def test_shipped_environment_synthesizes_without_aws(env_name, tmp_path):
+    """`cdk synth` runs before credentials exist in CI, so the assembly must
+    not ask AWS for anything."""
+    outdir = tmp_path / env_name
+    _template(load_environment(env_name), outdir=outdir)
 
     manifest = json.loads((outdir / "manifest.json").read_text(encoding="utf-8"))
     assert not manifest.get("missing"), manifest["missing"]
+
+
+def test_dev_is_public_only_and_prod_has_private_subnets():
+    """The shipped configs demonstrate both shapes. Counts come from the config
+    so editing azs in env.yaml does not break this."""
+    dev_env = load_environment("dev")
+    dev = _template(dev_env)
+    assert dev_env.network.private_subnets is False
+    dev.resource_count_is("AWS::EC2::Subnet", dev_env.network.azs)
+    dev.resource_count_is("AWS::EC2::NatGateway", 0)
+    dev.resource_count_is("AWS::EC2::EIP", 0)
+
+    prod_env = load_environment("prod")
+    prod = _template(prod_env)
+    assert prod_env.network.private_subnets is True
+    prod.resource_count_is("AWS::EC2::Subnet", prod_env.network.azs * 2)
+    prod.resource_count_is("AWS::EC2::NatGateway", prod_env.network.nat_gateway_count)
+    prod.resource_count_is("AWS::EC2::EIP", prod_env.network.nat_gateway_count)
