@@ -1,0 +1,6 @@
+# Shell scripts must keep LF endings so they run under WSL/Linux and in CI.
+*.sh text eol=lf
+
+# Normalize everything else, but leave Windows-native files alone.
+* text=auto
+*.ps1 text eol=crlf

@@ -16,23 +16,23 @@ int-production-use1-cdk-dmz-network
 
 `uat` — explicit CIDRs across two AZs:
 
-| Resource | Count | Notes |
-| -------- | ----- | ----- |
-| VPC (`10.20.0.0/16`) | 1 | DNS hostnames and support enabled |
-| Internet gateway + attachment | 1 | |
-| Subnets | 6 | `edge` public, `app` private, `data` isolated, x2 AZs |
-| Route tables + associations | 6 | one per subnet |
-| Default routes | 4 | IGW for `edge`, NAT for `app`; `data` has none |
-| Elastic IP + NAT gateway | 1 | `nat_gateways: 1` |
+| Resource                      | Count | Notes                                                       |
+| ----------------------------- | ----- | ----------------------------------------------------------- |
+| VPC (`10.20.0.0/16`)        | 1     | DNS hostnames and support enabled                           |
+| Internet gateway + attachment | 1     |                                                             |
+| Subnets                       | 6     | `edge` public, `app` private, `data` isolated, x2 AZs |
+| Route tables + associations   | 6     | one per subnet                                              |
+| Default routes                | 4     | IGW for`edge`, NAT for `app`; `data` has none         |
+| Elastic IP + NAT gateway      | 1     | `nat_gateways: 1`                                         |
 
 `dmz` — public only, so no NAT gateways and no Elastic IPs at all:
 
-| Resource | Count |
-| -------- | ----- |
-| VPC (`10.21.0.0/16`) | 1 |
-| Internet gateway + attachment | 1 |
-| Public subnets | 2 |
-| Route tables + default routes | 2 |
+| Resource                      | Count |
+| ----------------------------- | ----- |
+| VPC (`10.21.0.0/16`)        | 1     |
+| Internet gateway + attachment | 1     |
+| Public subnets                | 2     |
+| Route tables + default routes | 2     |
 
 Prod uses the other style — `az_count: 3` and `cidr_mask: 20` — so the same code carves the
 ranges and produces 9 subnets with one NAT gateway per AZ.
@@ -75,15 +75,15 @@ Key points:
 `CommonProps.resource_name(*parts)` concatenates
 `{account_name}-{region_prefix}-{qualifier}-{parts...}`. Empty segments are skipped.
 
-| Resource | Name |
-| -------- | ---- |
-| VPC | `int-production-use1-cdk-uat-vpc` |
-| Internet gateway | `int-production-use1-cdk-uat-igw` |
-| Public subnet | `int-production-use1-cdk-uat-edge-public-primary` |
-| Private subnet | `int-production-use1-cdk-uat-app-private-secondary` |
-| Route table | `int-production-use1-cdk-uat-app-private-secondary-rtb` |
-| NAT gateway | `int-production-use1-cdk-uat-primary-natgw` |
-| Elastic IP | `int-production-use1-cdk-uat-primary-nat-eip` |
+| Resource         | Name                                                      |
+| ---------------- | --------------------------------------------------------- |
+| VPC              | `int-production-use1-cdk-uat-vpc`                       |
+| Internet gateway | `int-production-use1-cdk-uat-igw`                       |
+| Public subnet    | `int-production-use1-cdk-uat-edge-public-primary`       |
+| Private subnet   | `int-production-use1-cdk-uat-app-private-secondary`     |
+| Route table      | `int-production-use1-cdk-uat-app-private-secondary-rtb` |
+| NAT gateway      | `int-production-use1-cdk-uat-primary-natgw`             |
+| Elastic IP       | `int-production-use1-cdk-uat-primary-nat-eip`           |
 
 The `primary` / `secondary` / `tertiary` words come from
 `src/cognitech_cdk/common/naming.py` and follow the availability-zone order declared in the
@@ -205,45 +205,155 @@ Confirm which account your credentials resolve to:
 aws sts get-caller-identity --profile <your-profile>
 ```
 
-### 4.3 Bootstrap the account/region
+### 4.3 Onboarding a new account, step by step
 
-Run once per account **and** region, with administrative credentials, from an activated
-venv:
+Do this once per account **and** region. Steps 1–5 are required for manual deploys;
+steps 6–8 add the GitHub Actions pipeline.
+
+#### Step 1 — Activate the venv and sign in
 
 ```bash
-cdk bootstrap aws://111122223333/us-east-1 --profile <your-sso-profile>
+cd ~/GitReposWSL/cognitech-AWS-CDK-repo
+source .venv-linux/bin/activate          # .\.venv\Scripts\Activate.ps1 on Windows
+aws sso login --profile admin-mdpp
 ```
 
-This creates the `CDKToolkit` stack: an S3 asset bucket, an ECR repo, and five
-`cdk-hnb659fds-*` IAM roles. Repeat for every account and region you deploy into — the uat
-account, the prod account, and any secondary region.
+#### Step 2 — Confirm which account you are about to change
 
-Useful options:
+```bash
+aws sts get-caller-identity --profile admin-mdpp
+```
 
-| Flag | Purpose |
-| ---- | ------- |
-| `--qualifier <10-char>` | isolate this bootstrap from an existing one; must then be set as `@aws-cdk/core:bootstrapQualifier` in `cdk.json` |
-| `--cloudformation-execution-policies` | restrict what deploys may do (defaults to `AdministratorAccess`) |
-| `--trust <account-id>` | let another account deploy here, for a central pipeline account |
-| `--show-template` | print the bootstrap template instead of deploying it |
+The `Account` field is the account that gets bootstrapped. You need
+administrator-level permissions here; the pipeline roles created later are far narrower.
 
-Verify it afterwards:
+#### Step 3 — Point an environment file at it
+
+Set `account_id` and `region` in `deployments/<env>/env.yaml` to match. Bootstrap ignores
+these, but every later command checks them, so doing it now avoids a confusing failure.
+
+```yaml
+account_id: "533267408704"
+region: us-east-1
+```
+
+#### Step 4 — Bootstrap
+
+```bash
+cdk bootstrap aws://533267408704/us-east-1 --profile admin-mdpp
+```
+
+Expect `⏳ Bootstrapping environment ...` followed by `✅ Environment ... bootstrapped`.
+This creates the `CDKToolkit` stack containing an S3 asset bucket, an ECR repo, and five
+IAM roles:
+
+| Role                                          | Used by                                                  |
+| --------------------------------------------- | -------------------------------------------------------- |
+| `cdk-hnb659fds-deploy-role-<acct>-<region>` | the CDK CLI, to create change sets                       |
+| `cdk-hnb659fds-file-publishing-role-...`    | uploading templates and assets to S3                     |
+| `cdk-hnb659fds-image-publishing-role-...`   | pushing Docker images to ECR                             |
+| `cdk-hnb659fds-lookup-role-...`             | context lookups during`cdk diff` / `synth`           |
+| `cdk-hnb659fds-cfn-exec-role-...`           | **CloudFormation itself**, when creating resources |
+
+The last one holds the real privilege — `AdministratorAccess` by default. It is the single
+blast-radius control for everything this repo can do, so for a HIPAA account consider
+narrowing it:
+
+```bash
+cdk bootstrap aws://533267408704/us-east-1 \
+  --cloudformation-execution-policies arn:aws:iam::aws:policy/PowerUserAccess,arn:aws:iam::aws:policy/IAMFullAccess
+```
+
+Other options worth knowing:
+
+| Flag                      | Purpose                                                                                                     |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `--qualifier <10-char>` | isolate from an existing bootstrap; must also be set as`@aws-cdk/core:bootstrapQualifier` in `cdk.json` |
+| `--trust <account-id>`  | let a central pipeline account deploy here                                                                  |
+| `--show-template`       | print the bootstrap template instead of deploying                                                           |
+
+#### Step 5 — Verify, then deploy manually once
 
 ```bash
 aws cloudformation describe-stacks --stack-name CDKToolkit \
-  --query 'Stacks[0].StackStatus' --profile <your-sso-profile>
+  --query 'Stacks[0].StackStatus' --output text --profile admin-mdpp
+# CREATE_COMPLETE
+
+cdk diff   --context env=uat --profile admin-mdpp
+cdk deploy --all --context env=uat --profile admin-mdpp
 ```
+
+Getting one manual deploy working before wiring CI means that when the pipeline fails you
+know it is the pipeline, not the stack.
+
+#### Step 6 — Create the GitHub OIDC provider and roles
+
+Bootstrap does **not** create these. Run the helper script, which is idempotent and
+refuses to run against the wrong account or before bootstrap:
+
+```bash
+./scripts/create_github_oidc_roles.sh \
+  --account-id 533267408704 \
+  --environment uat \
+  --repo KahBrightTech/cognitech-AWS-CDK-repo \
+  --region us-east-1 \
+  --profile admin-mdpp
+```
+
+It creates:
+
+| Resource                                                 | Purpose                                                                             |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| OIDC provider for`token.actions.githubusercontent.com` | lets GitHub tokens be exchanged for AWS credentials                                 |
+| `github-oidc-cdk-deploy-<env>`                         | assumed by the deploy job; may only`sts:AssumeRole` the `cdk-hnb659fds-*` roles |
+| `github-oidc-cdk-plan-<env>`                           | assumed by the PR job;`ReadOnlyAccess` plus the lookup role                       |
+
+**The trust conditions matter and are easy to get wrong.** GitHub changes the token's
+`sub` claim depending on the job:
+
+| Job                              | Has`environment:`? | `sub` claim                         |
+| -------------------------------- | -------------------- | ------------------------------------- |
+| `cdk-deploy.yml` → `deploy` | yes                  | `repo:<org>/<repo>:environment:uat` |
+| `cdk-pr.yml` → `diff`       | no                   | `repo:<org>/<repo>:pull_request`    |
+
+A trust policy written against `ref:refs/heads/main` will fail with
+`Not authorized to perform sts:AssumeRoleWithWebIdentity` even though everything looks
+correct. The script sets each role to the claim its job actually sends.
+
+Run it once per account. For the prod account, re-run with `--environment prod` and that
+account's ID and profile.
+
+#### Step 7 — Wire up GitHub
+
+The script prints these at the end:
+
+| Where in GitHub              | Name                      | Value                                                         |
+| ---------------------------- | ------------------------- | ------------------------------------------------------------- |
+| Environment`uat` → secret | `AWS_DEPLOY_ROLE_ARN`   | `arn:aws:iam::533267408704:role/github-oidc-cdk-deploy-uat` |
+| Repository secret            | `AWS_PLAN_ROLE_ARN_UAT` | `arn:aws:iam::533267408704:role/github-oidc-cdk-plan-uat`   |
+| Repository variable          | `AWS_REGION`            | `us-east-1`                                                 |
+
+Create the GitHub Environment (Settings → Environments) with the **same name** as the
+folder under `deployments/`, or the deploy job's `environment:` reference will not resolve
+and the OIDC `sub` will not match. Add required reviewers to `prod`.
+
+#### Step 8 — Prove the pipeline works
+
+Open a pull request touching `deployments/uat/`. The PR workflow should comment a
+`cdk diff`. Merge it and the deploy workflow should deploy only `uat`.
 
 #### Bootstrap troubleshooting
 
-| Symptom | Cause and fix |
-| ------- | ------------- |
-| `/bin/sh: 1: python: not found` / `Subprocess exited with error 127` | No activated venv, or a Windows venv being used from WSL. See 4.1. |
-| `ModuleNotFoundError: No module named 'yaml'` | Venv activated but dependencies not installed: `pip install -r requirements-dev.txt`. |
-| `Need to perform AWS calls for account X, but the current credentials are for Y` | `account_id` in the environment file does not match your profile. |
-| `ExpiredToken` / `InvalidClientTokenId` | Refresh SSO: `aws sso login --profile <your-profile>`. |
-| `NodeVersionSupportWarning` | Harmless today; upgrade to node 22 before January 2027. |
-| `Newer version of CDK is available` | `npm install -g aws-cdk@2`. |
+| Symptom                                                                            | Cause and fix                                                                      |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `/bin/sh: 1: python: not found` / `Subprocess exited with error 127`           | No activated venv, or a Windows venv used from WSL. See 4.1.                       |
+| `ModuleNotFoundError: No module named 'yaml'`                                    | Venv active but dependencies missing:`pip install -r requirements-dev.txt`.      |
+| `Unsupported feature flag '...'`                                                 | A CDK v1 flag left in`cdk.json`. `tests/unit/test_app_synth.py` catches these. |
+| `Need to perform AWS calls for account X, but the current credentials are for Y` | `account_id` in the environment file does not match your profile.                |
+| `ExpiredToken` / `InvalidClientTokenId`                                        | `aws sso login --profile <your-profile>`.                                        |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity`                        | Trust policy`sub` does not match the job's claim. See the table in Step 6.       |
+| `This CDK deployment requires bootstrap stack version X`                         | Bootstrap is older than the CLI: re-run`cdk bootstrap`.                          |
+| `Node 20 has reached end-of-life`                                                | Upgrade:`nvm install 22 && nvm use 22 && npm install -g aws-cdk@2`.              |
 
 ---
 
@@ -260,13 +370,13 @@ cdk diff   --context env=uat --profile <your-sso-profile>
 cdk deploy --all --context env=uat --profile <your-sso-profile>
 ```
 
-| Flag | Purpose |
-| ---- | ------- |
+| Flag                         | Purpose                                               |
+| ---------------------------- | ----------------------------------------------------- |
 | `--require-approval never` | skip the prompt for IAM/security changes (used in CI) |
-| `--progress events` | stream CloudFormation events |
-| `--exclusively` / `-e` | deploy only the named stack |
-| `--outputs-file out.json` | write stack outputs to a file |
-| `--hotswap` | non-production fast path; never use against prod |
+| `--progress events`        | stream CloudFormation events                          |
+| `--exclusively` / `-e`   | deploy only the named stack                           |
+| `--outputs-file out.json`  | write stack outputs to a file                         |
+| `--hotswap`                | non-production fast path; never use against prod      |
 
 Tear down with `cdk destroy --all --context env=uat`.
 
@@ -276,10 +386,10 @@ Tear down with `cdk destroy --all --context env=uat`.
 
 Pipelines never use static AWS keys; they exchange a GitHub OIDC token for a role.
 
-| Trigger | Workflow | What it does |
-| ------- | -------- | ------------ |
-| Pull request to `main` | `cdk-pr.yml` | pytest once, then `cdk synth` + `cdk diff` per affected environment, commented on the PR |
-| Push to `main`, or manual dispatch | `cdk-deploy.yml` | deploys the affected environments, in `deploy_order`, one at a time |
+| Trigger                             | Workflow           | What it does                                                                                |
+| ----------------------------------- | ------------------ | ------------------------------------------------------------------------------------------- |
+| Pull request to`main`             | `cdk-pr.yml`     | pytest once, then`cdk synth` + `cdk diff` per affected environment, commented on the PR |
+| Push to`main`, or manual dispatch | `cdk-deploy.yml` | deploys the affected environments, in`deploy_order`, one at a time                        |
 
 ### How environments are selected
 
@@ -304,13 +414,13 @@ the install/test/assume-role/deploy sequence is defined once.
 
 ### Required configuration
 
-| Where | Name | Value |
-| ----- | ---- | ----- |
-| Repo secret | `AWS_PLAN_ROLE_ARN_UAT` | read-only role ARN in the uat account |
-| Repo secret | `AWS_PLAN_ROLE_ARN_PROD` | read-only role ARN in the prod account |
-| Environment `uat` secret | `AWS_DEPLOY_ROLE_ARN` | deploy role ARN in the uat account |
-| Environment `prod` secret | `AWS_DEPLOY_ROLE_ARN` | deploy role ARN in the prod account |
-| Repo variable | `AWS_REGION` | e.g. `us-east-1` |
+| Where                      | Name                       | Value                                  |
+| -------------------------- | -------------------------- | -------------------------------------- |
+| Repo secret                | `AWS_PLAN_ROLE_ARN_UAT`  | read-only role ARN in the uat account  |
+| Repo secret                | `AWS_PLAN_ROLE_ARN_PROD` | read-only role ARN in the prod account |
+| Environment`uat` secret  | `AWS_DEPLOY_ROLE_ARN`    | deploy role ARN in the uat account     |
+| Environment`prod` secret | `AWS_DEPLOY_ROLE_ARN`    | deploy role ARN in the prod account    |
+| Repo variable              | `AWS_REGION`             | e.g.`us-east-1`                      |
 
 The **plan** role needs `ReadOnlyAccess` plus `sts:AssumeRole` on
 `cdk-hnb659fds-lookup-role-*`. The **deploy** role only needs `sts:AssumeRole` on the
@@ -351,14 +461,14 @@ deployments/           # <- one folder per environment, values only
 
 Suggested grouping:
 
-| Stack | Holds |
-| ----- | ----- |
-| `network_stack.py` | VPC, subnets, VPC endpoints, transit gateway attachments |
-| `security_stack.py` | security groups, WAF |
-| `platform_stack.py` | IAM roles and policies, SSM parameters, secrets, ECR |
-| `edge_stack.py` | ALB/NLB, target groups, ACM certificates, Route 53 |
-| `data_stack.py` | RDS, DynamoDB, EFS, OpenSearch |
-| `compute_stack.py` | EC2, launch templates, ASGs, ECS, EKS, Lambda |
+| Stack                 | Holds                                                    |
+| --------------------- | -------------------------------------------------------- |
+| `network_stack.py`  | VPC, subnets, VPC endpoints, transit gateway attachments |
+| `security_stack.py` | security groups, WAF                                     |
+| `platform_stack.py` | IAM roles and policies, SSM parameters, secrets, ECR     |
+| `edge_stack.py`     | ALB/NLB, target groups, ACM certificates, Route 53       |
+| `data_stack.py`     | RDS, DynamoDB, EFS, OpenSearch                           |
+| `compute_stack.py`  | EC2, launch templates, ASGs, ECS, EKS, Lambda            |
 
 ### The recipe
 
