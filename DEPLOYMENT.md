@@ -289,16 +289,43 @@ know it is the pipeline, not the stack.
 #### Step 6 — Create the GitHub OIDC provider and roles
 
 Bootstrap does **not** create these. Run the helper script, which is idempotent and
-refuses to run against the wrong account or before bootstrap:
+refuses to run against the wrong account or before bootstrap.
+
+Run it with no arguments and it prompts for each value, pre-filled with defaults
+discovered from your AWS profile, the git remote and the `deployments/` folder:
 
 ```bash
-./scripts/create_github_oidc_roles.sh \
+./scripts/create_github_oidc_roles.sh
+```
+
+```
+Press Enter to accept the value in brackets.
+
+AWS profile [default]: admin-mdpp
+Region [us-east-1]:
+Account ID [533267408704]:
+GitHub repository (org/name) [KahBrightTech/cognitech-AWS-CDK-repo]:
+Environments in deployments/: prod uat
+Environment: uat
+```
+
+Environment has no default on purpose — choosing the wrong one would target the wrong
+account. After the prompts it prints a summary and asks for confirmation before changing
+anything.
+
+Pass flags to skip the prompts entirely, which is also how you would run it in automation:
+
+```bash
+./scripts/create_github_oidc_roles.sh --yes \
   --account-id 533267408704 \
   --environment uat \
   --repo KahBrightTech/cognitech-AWS-CDK-repo \
   --region us-east-1 \
   --profile admin-mdpp
 ```
+
+`--yes` never prompts and fails if a required value is missing. It is also the default
+behaviour when stdin is not a terminal.
 
 It creates:
 

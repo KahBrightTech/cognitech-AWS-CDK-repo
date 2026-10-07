@@ -2,28 +2,51 @@
 #
 # Create the GitHub OIDC provider and the two roles the workflows assume.
 #
+# Run with no arguments to be prompted for each value, with defaults discovered
+# from your AWS profile, the git remote and the deployments/ folder. Pass flags
+# to skip the prompts.
+#
 # Idempotent: re-running updates the trust and permission policies in place and
 # never deletes anything.
 #
-#   ./scripts/create_github_oidc_roles.sh \
-#       --account-id 533267408704 \
-#       --environment uat \
-#       --repo KahBrightTech/cognitech-AWS-CDK-repo \
-#       --region us-east-1 \
-#       --profile admin-mdpp
-#
 set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 ACCOUNT_ID=""
 ENVIRONMENT=""
 REPO=""
-REGION="us-east-1"
-PROFILE=""
+REGION=""
+PROFILE="${AWS_PROFILE:-}"
 QUALIFIER="hnb659fds"
+ASSUME_YES=false
 
 usage() {
-  sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
-  exit 1
+  cat <<'TXT'
+Usage: scripts/create_github_oidc_roles.sh [options]
+
+Creates the GitHub OIDC provider and two IAM roles used by the CDK workflows.
+With no options it prompts for each value, offering a discovered default.
+
+Options:
+  --account-id <id>      AWS account to create the roles in
+  --environment <name>   Environment name, matching a folder in deployments/
+  --repo <org/repo>      GitHub repository allowed to assume the roles
+  --region <region>      Region the CDK bootstrap roles live in
+  --profile <name>       AWS CLI profile to use
+  --qualifier <string>   CDK bootstrap qualifier (default: hnb659fds)
+  -y, --yes              Never prompt; fail if a required value is missing
+  -h, --help             Show this message
+
+Example:
+  scripts/create_github_oidc_roles.sh \
+    --account-id 533267408704 \
+    --environment uat \
+    --repo KahBrightTech/cognitech-AWS-CDK-repo \
+    --region us-east-1 \
+    --profile admin-mdpp
+TXT
+  exit "${1:-1}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -34,15 +57,84 @@ while [[ $# -gt 0 ]]; do
     --region)      REGION="$2"; shift 2 ;;
     --profile)     PROFILE="$2"; shift 2 ;;
     --qualifier)   QUALIFIER="$2"; shift 2 ;;
-    -h|--help)     usage ;;
+    -y|--yes)      ASSUME_YES=true; shift ;;
+    -h|--help)     usage 0 ;;
     *) echo "Unknown argument: $1" >&2; usage ;;
   esac
 done
 
-[[ -n "$ACCOUNT_ID" && -n "$ENVIRONMENT" && -n "$REPO" ]] || usage
+# ------------------------------------------------------------------- discovery
+aws_cli() {
+  if [[ -n "$PROFILE" ]]; then aws --profile "$PROFILE" "$@"; else aws "$@"; fi
+}
+
+discover_account() {
+  aws_cli sts get-caller-identity --query Account --output text 2>/dev/null || true
+}
+
+discover_region() {
+  local found
+  found="$(aws_cli configure get region 2>/dev/null || true)"
+  echo "${found:-${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}}"
+}
+
+discover_repo() {
+  local url
+  url="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+  [[ -z "$url" ]] && return 0
+  url="${url%.git}"
+  url="${url#git@github.com:}"
+  url="${url#ssh://git@github.com/}"
+  url="${url#https://github.com/}"
+  echo "$url"
+}
+
+discover_environments() {
+  local path
+  for path in "$REPO_ROOT"/deployments/*/env.yaml; do
+    [[ -e "$path" ]] || continue
+    basename "$(dirname "$path")"
+  done
+}
+
+prompt() { # $1 = label, $2 = default, $3 = variable to set
+  local label="$1" default="$2" varname="$3" answer=""
+  if [[ -n "$default" ]]; then
+    read -r -p "${label} [${default}]: " answer
+    answer="${answer:-$default}"
+  else
+    while [[ -z "$answer" ]]; do read -r -p "${label}: " answer; done
+  fi
+  printf -v "$varname" '%s' "$answer"
+}
+
+# ----------------------------------------------------------------- interactive
+if [[ "$ASSUME_YES" == false && -t 0 ]]; then
+  echo "Press Enter to accept the value in brackets."
+  echo
+
+  [[ -z "$PROFILE" ]] && prompt "AWS profile" "default" PROFILE
+  [[ -z "$REGION" ]] && prompt "Region" "$(discover_region)" REGION
+  [[ -z "$ACCOUNT_ID" ]] && prompt "Account ID" "$(discover_account)" ACCOUNT_ID
+  [[ -z "$REPO" ]] && prompt "GitHub repository (org/name)" "$(discover_repo)" REPO
+
+  if [[ -z "$ENVIRONMENT" ]]; then
+    known="$(discover_environments || true)"
+    [[ -n "$known" ]] && echo "Environments in deployments/: $(echo "$known" | tr '\n' ' ')"
+    # Deliberately no default: picking the wrong environment targets the wrong account.
+    prompt "Environment" "" ENVIRONMENT
+  fi
+  echo
+fi
+
+REGION="${REGION:-us-east-1}"
+if [[ -z "$ACCOUNT_ID" || -z "$ENVIRONMENT" || -z "$REPO" ]]; then
+  echo "Missing --account-id, --environment or --repo." >&2
+  usage
+fi
 
 AWS=(aws)
-[[ -n "$PROFILE" ]] && AWS+=(--profile "$PROFILE")
+if [[ -n "$PROFILE" ]]; then AWS+=(--profile "$PROFILE"); fi
 
 PROVIDER_HOST="token.actions.githubusercontent.com"
 PROVIDER_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${PROVIDER_HOST}"
@@ -51,11 +143,26 @@ PLAN_ROLE="github-oidc-cdk-plan-${ENVIRONMENT}"
 BOOTSTRAP_ROLES="arn:aws:iam::${ACCOUNT_ID}:role/cdk-${QUALIFIER}-*-role-${ACCOUNT_ID}-${REGION}"
 LOOKUP_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/cdk-${QUALIFIER}-lookup-role-${ACCOUNT_ID}-${REGION}"
 
-echo "Account     : ${ACCOUNT_ID}"
-echo "Region      : ${REGION}"
-echo "Environment : ${ENVIRONMENT}"
-echo "Repository  : ${REPO}"
-echo
+cat <<SUMMARY
+Profile     : ${PROFILE:-<default>}
+Account     : ${ACCOUNT_ID}
+Region      : ${REGION}
+Environment : ${ENVIRONMENT}
+Repository  : ${REPO}
+Qualifier   : ${QUALIFIER}
+
+Will create or update:
+  OIDC provider  ${PROVIDER_HOST}
+  IAM role       ${DEPLOY_ROLE}
+  IAM role       ${PLAN_ROLE}
+
+SUMMARY
+
+if [[ "$ASSUME_YES" == false && -t 0 ]]; then
+  read -r -p "Proceed? [y/N]: " reply
+  [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]] || { echo "Aborted; nothing changed."; exit 0; }
+  echo
+fi
 
 caller_account=$("${AWS[@]}" sts get-caller-identity --query Account --output text)
 if [[ "$caller_account" != "$ACCOUNT_ID" ]]; then
