@@ -1,0 +1,107 @@
+name: CDK PR Check
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: cdk-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.pick.outputs.environments }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements-dev.txt
+
+      - run: pytest -q
+
+      - name: Pick environments
+        id: pick
+        shell: bash
+        run: |
+          result=$(python scripts/select_environments.py \
+            --base "origin/${{ github.base_ref }}" \
+            --head "${{ github.event.pull_request.head.sha }}")
+          echo "Selected: $result"
+          echo "environments=$result" >> "$GITHUB_OUTPUT"
+
+  diff:
+    name: Diff ${{ matrix.environment }}
+    needs: test
+    if: needs.test.outputs.environments != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.test.outputs.environments) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          npm install -g aws-cdk@2
+          pip install -r requirements.txt
+
+      - name: Synthesize
+        run: cdk synth --context env=${{ matrix.environment }} --quiet
+
+      # Read-only role: AWSReadOnlyAccess plus sts:AssumeRole on the CDK lookup role.
+      - name: Configure AWS credentials (plan role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_PLAN_ROLE_ARN_{0}', matrix.environment)] }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: cdk-diff-${{ github.run_id }}
+
+      - name: CDK diff
+        id: diff
+        run: |
+          {
+            echo 'stdout<<DIFF_EOF'
+            cdk diff --context env=${{ matrix.environment }} 2>&1
+            echo 'DIFF_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment diff on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              `### \`cdk diff\` — ${{ matrix.environment }}`,
+              '```',
+              `${{ steps.diff.outputs.stdout }}`.slice(0, 55000),
+              '```',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

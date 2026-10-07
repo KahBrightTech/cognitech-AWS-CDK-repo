@@ -1,0 +1,49 @@
+name: CDK Deploy
+description: Install toolchain, assume the environment role via OIDC, and deploy all stacks.
+
+inputs:
+  environment:
+    description: Config environment name (matches config/<name>.yaml)
+    required: true
+  role-to-assume:
+    description: ARN of the IAM role to assume via GitHub OIDC
+    required: true
+  aws-region:
+    description: AWS region to deploy into
+    required: true
+
+runs:
+  using: composite
+  steps:
+  - uses: actions/setup-python@v5
+    with:
+      python-version: "3.12"
+      cache: pip
+
+  - uses: actions/setup-node@v4
+    with:
+      node-version: "20"
+
+  - name: Install dependencies
+    shell: bash
+    run: |
+      npm install -g aws-cdk@2
+      pip install -r requirements-dev.txt
+
+  - name: Unit tests
+    shell: bash
+    run: pytest -q
+
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: ${{ inputs.role-to-assume }}
+      aws-region: ${{ inputs.aws-region }}
+      role-session-name: cdk-deploy-${{ github.run_id }}
+
+  - name: CDK deploy
+    shell: bash
+    run: |
+      cdk deploy --all \
+        --context env=${{ inputs.environment }} \
+        --require-approval never \
+        --progress events
