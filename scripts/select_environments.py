@@ -15,7 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from cognitech_cdk.common.config import available_environments  # noqa: E402
+from cognitech_cdk.settings import environments  # noqa: E402
 
 # A change to any of these affects every environment.
 SHARED_PATHS = ("src/", "app.py", "cdk.json", "requirements", "scripts/")
@@ -39,7 +39,7 @@ def main() -> int:
     parser.add_argument("--only", help="force a single environment, or 'all'")
     args = parser.parse_args()
 
-    everything = available_environments()
+    everything = environments()
 
     if args.only and args.only != "all":
         selected = [args.only] if args.only in everything else []

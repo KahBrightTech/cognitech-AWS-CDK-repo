@@ -2,121 +2,118 @@
 
 AWS infrastructure built with the AWS CDK (Python).
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the deploy walkthrough and the pipeline setup.
+One VPC per environment: public subnets and an internet gateway, plus optional private
+subnets with NAT gateways and Elastic IPs. You pick how many availability zones.
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the full walkthrough and the pipeline setup.
 
 ## Layout
 
 ```
-app.py                              entrypoint: picks an environment, builds the stacks
+app.py                              entrypoint: picks an environment, builds the stack
 cdk.json
 pyproject.toml                      pytest config (adds src/ to the path)
 
 src/cognitech_cdk/
-  common/config.py                  config schema + environment discovery
-  common/naming.py                  primary/secondary/... helper
-  constructs/network.py             VPC, subnets, route tables, IGW, NAT gateways
-  stacks/network_stack.py           deployment unit
+  settings.py                       reads and validates env.yaml
+  network_stack.py                  VPC, subnets, IGW, NAT gateways, Elastic IPs
 
 deployments/                        one folder per environment
   uat/env.yaml
   prod/env.yaml
 
 scripts/select_environments.py      feeds the GitHub Actions matrix
-tests/unit/
+tests/unit/test_network_stack.py
 .github/workflows/
 ```
 
-**Constructs** are reusable building blocks; **stacks** group them into a deployable
-CloudFormation stack. A construct is not deployable on its own.
+`settings.py` turns one `env.yaml` into a `Settings` object; `network_stack.py` turns that
+into a CloudFormation stack. That is the whole program.
 
-## Defining a network
+## Defining a VPC
 
-Each `subnet_group` is one tier, replicated across every availability zone.
+One flat file per environment, `deployments/<env>/env.yaml`:
 
 ```yaml
-networks:
-  - name: uat
-    cidr_block: 10.20.0.0/16
-    availability_zones: [us-east-1a, us-east-1b]
-    nat_gateways: 1
-    subnet_groups:
-      - name: edge
-        type: public
-        cidrs: [10.20.0.0/20, 10.20.16.0/20]   # one per AZ, same order
-      - name: app
-        type: private
-        cidrs: [10.20.64.0/20, 10.20.80.0/20]
+account_id: "111122223333"
+region: us-east-1
+deploy_order: 10
+
+name_prefix: int-production-use1-cdk-uat
+
+cidr: 10.20.0.0/16
+azs: 2                 # 1, 2 or 3
+
+private_subnets: true  # false = public subnets only, no NAT gateways
+nat_gateways: 1        # omit for one per AZ
+
+tags:
+  Build-method: aws-cdk
+  Environment: user-acceptance-test
+  ManagedBy: aws-cdk/cognitech-AWS-CDK-repo
+  Owner: kbrigthain@gmail.com
+  Compliance: hippaa
 ```
 
-That produces the VPC, the subnets, a route table per subnet, the internet gateway, the
-NAT gateways and all the default routes.
+| Key               | Default           | Meaning                                          |
+| ----------------- | ----------------- | ------------------------------------------------ |
+| `azs`             | `2`               | **1, 2 or 3** availability zones                 |
+| `private_subnets` | `false`           | Add private subnets + NAT gateways + Elastic IPs |
+| `nat_gateways`    | one per AZ        | Only used when `private_subnets: true`           |
+
+### Public subnets only
+
+Leave `private_subnets` out, or set it to `false`:
+
+```yaml
+cidr: 10.40.0.0/16
+azs: 2
+private_subnets: false
+```
+
+→ VPC, 2 public subnets, internet gateway, 2 route tables, 2 default routes.
+**No NAT gateways, no Elastic IPs.**
+
+### With private subnets
+
+```yaml
+private_subnets: true
+nat_gateways: 1
+```
+
+→ the above, plus a private subnet per AZ, 1 NAT gateway, 1 Elastic IP, and a default route
+from the private subnets to it. Omit `nat_gateways` for one per AZ. `private_subnets: true`
+with `nat_gateways: 0` is rejected — those subnets would have no route out.
 
 ### Availability zones
 
-| Key | Behaviour |
-| --- | --------- |
-| `availability_zones: [us-east-1a, us-east-1b]` | exactly these zones, in this order |
-| `az_count: 3` | derives `us-east-1a`, `us-east-1b`, `us-east-1c` from the region |
-
-Set one or the other. Both are resolved at synth time with no AWS API call, so `cdk synth`
-works without credentials.
-
-### Subnet CIDRs
-
-| Key | Behaviour |
-| --- | --------- |
-| `cidrs: [...]` | exactly these ranges, one per AZ |
-| `cidr_mask: 20` | carves the lowest free `/20` blocks out of the VPC range |
-
-Set one or the other per group; you can mix styles between groups in the same VPC, and
-explicit ranges are reserved before anything is carved. The loader rejects CIDRs that fall
-outside the VPC range, overlap each other, or do not match the AZ count.
-
-> Carved CIDRs depend on declaration order. Inserting a group ahead of an existing one
-> shifts the ranges below it and CloudFormation will **replace** those subnets. Append new
-> groups at the end, or use explicit `cidrs`.
-
-### Subnet types and NAT
-
-| `type` | Egress | Requires |
-| ------ | ------ | -------- |
-| `public` | direct, via the internet gateway | — |
-| `private` | outbound only, via a NAT gateway | `nat_gateways >= 1` and a `public` group |
-| `isolated` | none | — |
-
-`nat_gateways` defaults to `0`, so a VPC with no `private` groups creates no NAT gateways
-and no Elastic IPs. The loader rejects the combinations that silently cost money or break:
-a `private` group with no NAT, NAT gateways with no `public` group to host them, and NAT
-gateways that nothing would route through.
+`azs` is `1`, `2` or `3`. Zones are derived from `region` (`us-east-1a`, `-1b`, `-1c`) and
+written straight into the template, so `cdk synth` and the tests need no AWS credentials.
+Subnets are named by position: `primary`, `secondary`, `tertiary`.
 
 ## Naming and tagging
 
-`CommonProps.resource_name(*parts)` builds
-`{account_name}-{region_prefix}-{qualifier}-{parts...}`:
+Every resource is named `{name_prefix}-...`:
 
-| Resource | Name |
-| -------- | ---- |
-| VPC | `int-production-use1-cdk-uat-vpc` |
-| Internet gateway | `int-production-use1-cdk-uat-igw` |
-| Subnet | `int-production-use1-cdk-uat-app-private-primary` |
-| Route table | `int-production-use1-cdk-uat-app-private-primary-rtb` |
-| NAT gateway | `int-production-use1-cdk-uat-primary-natgw` |
-| Elastic IP | `int-production-use1-cdk-uat-primary-nat-eip` |
+| Resource         | Name                                           |
+| ---------------- | ---------------------------------------------- |
+| VPC              | `int-production-use1-cdk-uat-vpc`              |
+| Internet gateway | `int-production-use1-cdk-uat-igw`              |
+| Public subnet    | `int-production-use1-cdk-uat-public-primary`   |
+| Private subnet   | `int-production-use1-cdk-uat-private-secondary`|
+| Route table      | `int-production-use1-cdk-uat-public-primary-rtb` |
+| NAT gateway      | `int-production-use1-cdk-uat-primary-natgw`    |
+| Elastic IP       | `int-production-use1-cdk-uat-primary-nat-eip`  |
 
-`qualifier: cdk` marks these resources as CDK-built so they never collide with the
-Terraform estate on resources that require unique names. Delete the key to drop the segment.
-
-Common tags live under `common.tags` in each environment file and are applied once, in the
-stack constructor, with `Tags.of(self)` — CDK propagates them to every taggable resource.
-`Name` is deliberately not a common tag; it is set per resource. The loader rejects a
-config that puts `Name` in `common.tags` or omits any of `Build-method`, `Environment`,
-`ManagedBy`, `Owner`, `Compliance`.
+`tags` are applied once in the stack constructor with `Tags.of(self)`, which propagates to
+every taggable resource. `Name` is not a common tag — it is set per resource. The loader
+rejects a file that puts `Name` in `tags` or omits `Build-method`, `Environment`,
+`ManagedBy`, `Owner` or `Compliance`.
 
 ## Local usage
 
-`cdk.json` runs the app with `python app.py`, so **always work inside an activated virtual
-environment**. A venv built on Windows cannot be used from WSL and vice versa — keep one
-per platform.
+`cdk.json` runs `python app.py`, so **always work inside an activated virtual environment**.
+A venv built on Windows cannot be used from WSL and vice versa — keep one per platform.
 
 ```powershell
 # Windows
@@ -137,61 +134,55 @@ npm install -g aws-cdk@2
 Then, with the venv active:
 
 ```bash
-pytest                                  # asserts against the synthesized template
+pytest                              # asserts against the synthesized template
 cdk ls     --context env=uat
 cdk synth  --context env=uat
-cdk diff   --context env=uat            # shows what a deploy would change
-cdk deploy --all --context env=uat
+cdk diff   --context env=uat        # what a deploy would change
+cdk deploy --context env=uat
 ```
 
 First deploy in an account/region needs `cdk bootstrap aws://<account-id>/<region>`.
 
 If `cdk` reports `/bin/sh: 1: python: not found` (exit code 127), the venv is not
 activated — Ubuntu has no `python`, only `python3`. See
-[DEPLOYMENT.md](DEPLOYMENT.md#41-local-toolchain).
-
-## Adding to the stack
-
-1. Add a construct under `src/cognitech_cdk/constructs/` taking `common: CommonProps` plus
-   its own typed props, naming resources with `common.resource_name(...)`. Don't re-apply
-   common tags — the stack already did.
-2. Add the matching dataclass in `src/cognitech_cdk/common/config.py` and the keys in each
-   `deployments/<env>/env.yaml`.
-3. Instantiate it from a stack, or add a new stack and register it in `app.py`.
-4. Add assertions in `tests/unit/`.
-
-Pass values between constructs as objects — CDK resolves them to `Ref`/`Fn::GetAtt`
-automatically. Across stacks, pass the construct object and CDK creates the
-export/import plus the deployment ordering.
+[DEPLOYMENT.md](DEPLOYMENT.md#31-local-toolchain).
 
 ## Adding an environment
 
-Create `deployments/<name>/env.yaml`. It is discovered automatically, deployable with
-`--context env=<name>`, and picked up by the pipelines with no workflow edits.
-`deploy_order` controls promotion order.
+Copy `deployments/uat/` to `deployments/<name>/` and edit it. It is discovered
+automatically, deployable with `--context env=<name>`, and picked up by the pipelines with
+no workflow edits. `deploy_order` controls promotion order.
+
+## Adding more resources
+
+1. Add a field to `Settings` in `src/cognitech_cdk/settings.py` and the key to each
+   `deployments/<env>/env.yaml`.
+2. Add the resource to `NetworkStack` in `src/cognitech_cdk/network_stack.py`, naming it
+   `f"{settings.name_prefix}-..."`. Don't re-apply the tags — the stack already tags the
+   whole tree.
+3. For a different lifecycle (databases, compute), add a module next to `network_stack.py`
+   and register it in `app.py`.
+4. Add assertions in `tests/unit/test_network_stack.py`.
+
+The VPC is a normal `ec2.IVpc`, so anything downstream can use `stack.vpc`,
+`stack.vpc.public_subnets` and `stack.vpc.private_subnets` directly.
 
 ## GitHub Actions
 
 Authentication uses GitHub OIDC; no long-lived AWS keys are stored.
 
-One-time AWS setup per account:
+| Where                      | Name                     | Value               |
+| -------------------------- | ------------------------ | ------------------- |
+| Repo secret                | `AWS_PLAN_ROLE_ARN_UAT`  | plan role ARN (uat) |
+| Repo secret                | `AWS_PLAN_ROLE_ARN_PROD` | plan role ARN (prod)|
+| Environment `uat` / `prod` | `AWS_DEPLOY_ROLE_ARN`    | deploy role ARN     |
+| Repo variable              | `AWS_REGION`             | e.g. `us-east-1`    |
 
-1. Create the OIDC provider for `token.actions.githubusercontent.com`.
-2. Create two roles trusting it, scoped to this repo:
-   - a **plan** role: `ReadOnlyAccess` + `sts:AssumeRole` on `cdk-hnb659fds-lookup-role-*`
-   - a **deploy** role: `sts:AssumeRole` on the `cdk-hnb659fds-*-role-*` bootstrap roles
+Run `./scripts/create_github_oidc_roles.sh` once per account to create the provider and
+both roles. Add required reviewers to the `prod` GitHub Environment to gate production.
 
-| Where | Name | Value |
-| ----- | ---- | ----- |
-| Repo secret | `AWS_PLAN_ROLE_ARN_UAT` | plan role ARN (uat) |
-| Repo secret | `AWS_PLAN_ROLE_ARN_PROD` | plan role ARN (prod) |
-| Environment `uat` / `prod` | `AWS_DEPLOY_ROLE_ARN` | deploy role ARN |
-| Repo variable | `AWS_REGION` | e.g. `us-east-1` |
-
-Add required reviewers to the `prod` GitHub Environment to gate production deploys.
-
-- `.github/workflows/cdk-pr.yml` — on PR: runs the tests once, works out which environments
-  the PR affects, then runs `cdk diff` for each and comments the result.
-- `.github/workflows/cdk-deploy.yml` — on push to `main` (or manual dispatch): deploys only
+- `.github/workflows/cdk-pr.yml` — on PR: runs the tests, works out which environments the
+  PR affects, runs `cdk diff` for each and comments the result.
+- `.github/workflows/cdk-deploy.yml` — on push to `main` or manual dispatch: deploys only
   the environments whose `deployments/<env>/` folder changed; a change under `src/` or
   `app.py` deploys all of them, in `deploy_order`, one at a time.

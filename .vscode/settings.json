@@ -1,0 +1,9 @@
+{
+  // The venv is a Linux one, so VS Code must be connected to WSL for this to work:
+  // Command Palette -> "WSL: Reopen Folder in WSL".
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv-linux/bin/python",
+  // app.py and pyproject.toml put src/ on the path at runtime; tell Pylance too.
+  "python.analysis.extraPaths": ["./src"],
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["tests"]
+}
