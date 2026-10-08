@@ -674,8 +674,62 @@ The naming pattern is `deploy-<region role>-<account>-<environment>`, so a secon
 region would be `deploy-secondary-mdpp-dev.yml` and another account
 `deploy-primary-intprod-prod.yml`.
 
-To run one: **Actions →** pick the workflow in the left sidebar **→ Run workflow
-→ Run workflow**. It will not appear there until the file is on `main`.
+#### How it runs: review first, then act
+
+Nothing is ever created or deleted automatically. A push shows you the diff; you
+then choose what to do with it.
+
+**1. Push to `main` → `cdk diff` only.**
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deployments/dev/**"      # this environment's config
+      - "src/**"                  # shared constructs and stacks
+      - "app.py"
+      - "cdk.json"
+      - "requirements*.txt"
+      - ".github/workflows/deploy-primary-mdpp-dev.yml"
+```
+
+The run stops after the diff, which is written to the **run summary** — open the
+run and read it at the top, no log digging. The deploy and destroy steps are
+guarded by `if: inputs.action == ...`, and a push supplies no inputs, so they
+cannot fire.
+
+The `paths` filter keeps environments independent. Editing
+`deployments/prod/env.yaml` does **not** match this list, so it will not trigger
+a dev run. Editing `src/` matches *every* environment's workflow, which is
+correct — shared construct code changes them all.
+
+**2. Reviewed it? → Actions → the workflow → Run workflow**, and pick:
+
+| `action` | What happens |
+| -------- | ------------ |
+| `diff` (default) | Re-runs the diff. Changes nothing. |
+| `deploy` | Diff, then `cdk deploy` — creates or updates the stack. |
+| `destroy` | Diff, then `cdk destroy` — **deletes the stack and everything in it.** |
+
+`cdk diff` runs first in all three cases, so the log always records what the run
+was about to do.
+
+> **Destroy needs explicit confirmation.** Type `dev` into the confirm box or the
+> job fails before it reaches AWS:
+>
+> ```
+> Error: Destroy requires the confirm box to contain exactly: dev
+> ```
+>
+> There is no retention policy on the VPC, so destroy really does delete it.
+
+To gate this further, add **Required reviewers** to the `dev` GitHub Environment
+— the run then pauses before *any* step until someone approves. That is how you
+would protect a production environment.
+
+Add the same `on:` block to each new environment's workflow, changing only the
+`deployments/<name>/**` line and the workflow's own filename.
 
 Each workflow hardcodes everything about its target:
 
@@ -695,22 +749,16 @@ env:
 
 What runs, in order:
 
-| Step | Needs AWS? |
-| ---- | ---------- |
-| Install Python, Node and the CDK CLI | no |
-| `pytest -q` | no |
-| `cdk synth --quiet` | no |
-| Assume the deploy role via OIDC | — |
-| `cdk diff` | yes |
-| `cdk deploy` | yes |
-
-`cdk diff` always runs immediately before `cdk deploy`, so the change is visible
-in the log. There is no dry-run option — if you want one, run `cdk diff` locally
-first, or add a `workflow_dispatch` input and guard the deploy step with
-`if: inputs.action == 'deploy'`.
-
-If the environment has required reviewers, the run pauses before *any* step and
-waits for approval.
+| Step | Needs AWS? | When |
+| ---- | ---------- | ---- |
+| Confirm check (destroy only) | no | `action: destroy` |
+| Install Python, Node and the CDK CLI | no | always |
+| `pytest -q` | no | always |
+| `cdk synth --quiet` | no | always |
+| Assume the deploy role via OIDC | — | always |
+| `cdk diff` | yes | always |
+| `cdk deploy` | yes | `action: deploy` |
+| `cdk destroy --force` | yes | `action: destroy` |
 
 ### On every pull request
 
@@ -727,7 +775,9 @@ zones come from the config rather than an AWS lookup.
 4. Create the GitHub Environment with that name (Step 3).
 5. Copy `.github/workflows/deploy-primary-mdpp-dev.yml` to a new file, then
    change `name:`, the `concurrency.group`, `environment:`, `ENV:`,
-   `role-to-assume:` and `aws-region:`.
+   `role-to-assume:`, `aws-region:`, and the two environment-specific entries
+   under `on.push.paths` (`deployments/<name>/**` and the workflow's own
+   filename).
 6. Add `<name>` to the `environment:` matrix in `.github/workflows/pr.yml`.
 
 ### Which role does what

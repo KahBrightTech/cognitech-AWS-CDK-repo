@@ -14,15 +14,10 @@ class NetworkStack(cdk.Stack):
         self, scope: Construct, construct_id: str, *, environment: Environment, **kwargs
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
-
-        # ec2.Vpc asks AWS which zones the account has. We already know them, so
-        # answer here and keep `cdk synth` working without credentials.
         self.node.set_context(
             f"availability-zones:account={environment.account_id}:region={environment.region}",
             [f"{environment.region}{letter}" for letter in "abcd"],
         )
-
-        # Tags.of is an Aspect: this tags every resource in the stack.
         for key, value in environment.common.tags.items():
             cdk.Tags.of(self).add(key, value)
 

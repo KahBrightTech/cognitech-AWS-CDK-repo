@@ -7,15 +7,44 @@ name: Deploy primary mdpp dev
 # Naming: deploy-<region role>-<account>-<environment>
 #   primary = us-east-1   mdpp = md-preproduction   dev = deployments/dev/
 #
+# HOW IT RUNS
+#   push to main  -> `cdk diff` only. Nothing is ever created or deleted
+#                    automatically; the diff is written to the run summary.
+#   Run workflow  -> choose diff (default), deploy, or destroy.
+#
 # The role ARN and region are written in below rather than stored as GitHub
 # secrets or variables. Neither is a credential, and both already appear in
 # deployments/dev/env.yaml. The only GitHub setup needed is an Environment
 # named "dev".
-#
-# `cdk diff` always runs immediately before `cdk deploy`, so the change is in
-# the log even though there is no dry-run option.
 on:
+  # Shows what WOULD change when something affecting this stack lands on main.
+  # A change to deployments/prod/ does not match, so it will not trigger here.
+  push:
+    branches: [main]
+    paths:
+      - "deployments/dev/**" # this environment's config
+      - "src/**" # shared constructs and stacks
+      - "app.py" # entrypoint
+      - "cdk.json" # feature flags
+      - "requirements*.txt" # pinned CDK version
+      - ".github/workflows/deploy-primary-mdpp-dev.yml" # this file
+
   workflow_dispatch:
+    inputs:
+      action:
+        description: What to do after the diff
+        required: true
+        default: diff
+        type: choice
+        options:
+          - diff # review only, change nothing
+          - deploy # create or update the stack
+          - destroy # DELETE the stack and everything in it
+      confirm:
+        description: 'Type "dev" to allow destroy (ignored otherwise)'
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: deploy-mdpp-dev
@@ -26,14 +55,23 @@ permissions:
   contents: read
 
 jobs:
-  deploy:
-    name: Deploy dev
+  cdk:
+    # Surfaces the chosen action in the Actions list, e.g. "dev: destroy".
+    name: "dev: ${{ inputs.action || 'diff' }}"
     runs-on: ubuntu-latest
+    # Required-reviewer rules on this GitHub Environment gate the whole job.
     environment: dev
     env:
       ENV: dev
 
     steps:
+      # Fail before touching AWS if a destroy was not explicitly confirmed.
+      - name: Check destroy confirmation
+        if: inputs.action == 'destroy' && inputs.confirm != 'dev'
+        run: |
+          echo "::error::Destroy requires the confirm box to contain exactly: dev"
+          exit 1
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -53,18 +91,53 @@ jobs:
       - name: Run tests
         run: pytest -q
 
+      # Needs no AWS credentials: the availability zones come from the config.
       - name: Synthesize
         run: cdk synth --quiet
+
+      # TEMPORARY DEBUG: prints the OIDC claims AWS is being asked to trust.
+      # Compare `sub` with the trust policy on the role. Delete once working.
+      - name: Show OIDC claims
+        run: |
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          payload=$(echo "$token" | cut -d. -f2)
+          # base64url -> base64, then pad to a multiple of 4
+          payload=$(echo "$payload" | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          echo "$payload" | base64 -d | jq '{sub, aud, repository, environment, ref}'
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::533267408704:role/github-oidc-cdk-deploy-dev
-          aws-region: us-east-1 
-          role-session-name: cdk-deploy-dev-${{ github.run_id }}
+          aws-region: us-east-1
+          role-session-name: cdk-dev-${{ github.run_id }}
 
-      - name: Show what will change
-        run: cdk diff
+      # Always runs, whatever the action. On a push this is the whole job.
+      - name: Diff
+        run: |
+          {
+            echo '### `cdk diff` — dev'
+            echo
+            echo '```'
+            cdk diff 2>&1 | tee /dev/stderr
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Next step
+        if: github.event_name == 'push'
+        run: |
+          {
+            echo
+            echo '> Review the diff above, then **Run workflow** on this'
+            echo '> workflow and choose `deploy` to apply it.'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Deploy
+        if: inputs.action == 'deploy'
         run: cdk deploy --require-approval never --progress events
+
+      - name: Destroy
+        if: inputs.action == 'destroy'
+        run: cdk destroy --force

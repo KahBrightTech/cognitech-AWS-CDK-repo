@@ -41,7 +41,6 @@ class NetworkProps:
     azs: int = 2
     private_subnets: bool = False
     nat_gateways: int | None = None
-    # Exact ranges, one per AZ, in order. None carves them from `cidr_block`.
     public_subnet_cidrs: Sequence[str] | None = None
     private_subnet_cidrs: Sequence[str] | None = None
     # Prefix length used when a tier has no explicit CIDRs.
