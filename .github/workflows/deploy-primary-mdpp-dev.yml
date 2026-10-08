@@ -56,14 +56,11 @@ permissions:
 
 jobs:
   cdk:
-    # Surfaces the chosen action in the Actions list, e.g. "dev: destroy".
     name: "dev: ${{ inputs.action || 'diff' }}"
     runs-on: ubuntu-latest
-    # Required-reviewer rules on this GitHub Environment gate the whole job.
     environment: dev
     env:
       ENV: dev
-
     steps:
       # Fail before touching AWS if a destroy was not explicitly confirmed.
       - name: Check destroy confirmation
@@ -71,32 +68,22 @@ jobs:
         run: |
           echo "::error::Destroy requires the confirm box to contain exactly: dev"
           exit 1
-
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-
       - name: Install dependencies
         run: |
           pip install -r requirements-dev.txt
           npm install -g aws-cdk@2
-
       - name: Run tests
         run: pytest -q
-
-      # Needs no AWS credentials: the availability zones come from the config.
       - name: Synthesize
         run: cdk synth --quiet
-
-      # TEMPORARY DEBUG: prints the OIDC claims AWS is being asked to trust.
-      # Compare `sub` with the trust policy on the role. Delete once working.
       - name: Show OIDC claims
         run: |
           token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \

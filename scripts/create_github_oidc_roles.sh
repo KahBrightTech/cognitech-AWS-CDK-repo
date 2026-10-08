@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Create the GitHub OIDC provider and the two roles the workflows assume.
+# Create the GitHub OIDC provider and the role the deploy workflow assumes.
 #
 # Run with no arguments to be prompted for each value, with defaults discovered
 # from your AWS profile, the git remote and the deployments/ folder. Pass flags
@@ -16,6 +16,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACCOUNT_ID=""
 ENVIRONMENT=""
 REPO=""
+OWNER_ID=""
+REPO_ID=""
 REGION=""
 PROFILE="${AWS_PROFILE:-}"
 QUALIFIER="hnb659fds"
@@ -25,13 +27,15 @@ usage() {
   cat <<'TXT'
 Usage: scripts/create_github_oidc_roles.sh [options]
 
-Creates the GitHub OIDC provider and two IAM roles used by the CDK workflows.
+Creates the GitHub OIDC provider and the IAM role used by the deploy workflow.
 With no options it prompts for each value, offering a discovered default.
 
 Options:
   --account-id <id>      AWS account to create the roles in
   --environment <name>   Environment name, matching a folder in deployments/
   --repo <org/repo>      GitHub repository allowed to assume the roles
+  --owner-id <id>        Numeric GitHub owner ID (discovered from the API)
+  --repo-id <id>         Numeric GitHub repository ID (discovered from the API)
   --region <region>      Region the CDK bootstrap roles live in
   --profile <name>       AWS CLI profile to use
   --qualifier <string>   CDK bootstrap qualifier (default: hnb659fds)
@@ -54,6 +58,8 @@ while [[ $# -gt 0 ]]; do
     --account-id)  ACCOUNT_ID="$2"; shift 2 ;;
     --environment) ENVIRONMENT="$2"; shift 2 ;;
     --repo)        REPO="$2"; shift 2 ;;
+    --owner-id)    OWNER_ID="$2"; shift 2 ;;
+    --repo-id)     REPO_ID="$2"; shift 2 ;;
     --region)      REGION="$2"; shift 2 ;;
     --profile)     PROFILE="$2"; shift 2 ;;
     --qualifier)   QUALIFIER="$2"; shift 2 ;;
@@ -95,6 +101,26 @@ discover_environments() {
     [[ -e "$path" ]] || continue
     basename "$(dirname "$path")"
   done
+}
+
+# GitHub now issues OIDC subjects that carry the immutable numeric owner and
+# repository IDs, e.g. repo:org@202037050/repo@1383489754:environment:dev. Names
+# can be recycled, IDs cannot. Both forms are trusted so the roles keep working
+# whichever one GitHub sends.
+discover_github_ids() { # $1 = org/repo -> prints "<owner_id> <repo_id>"
+  local json=""
+  # `gh` first: it carries the user's credentials, so private repos resolve too.
+  if command -v gh >/dev/null 2>&1; then
+    json="$(gh api "repos/$1" 2>/dev/null || true)"
+  fi
+  if [[ -z "$json" ]] && command -v curl >/dev/null 2>&1; then
+    json="$(curl -fsSL -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/$1" 2>/dev/null || true)"
+  fi
+  [[ -n "$json" ]] || return 1
+  printf '%s' "$json" |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["owner"]["id"], d["id"])' \
+    2>/dev/null || return 1
 }
 
 prompt() { # $1 = label, $2 = default, $3 = variable to set
@@ -139,9 +165,20 @@ if [[ -n "$PROFILE" ]]; then AWS+=(--profile "$PROFILE"); fi
 PROVIDER_HOST="token.actions.githubusercontent.com"
 PROVIDER_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${PROVIDER_HOST}"
 DEPLOY_ROLE="github-oidc-cdk-deploy-${ENVIRONMENT}"
-PLAN_ROLE="github-oidc-cdk-plan-${ENVIRONMENT}"
 BOOTSTRAP_ROLES="arn:aws:iam::${ACCOUNT_ID}:role/cdk-${QUALIFIER}-*-role-${ACCOUNT_ID}-${REGION}"
-LOOKUP_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/cdk-${QUALIFIER}-lookup-role-${ACCOUNT_ID}-${REGION}"
+
+if [[ -z "$OWNER_ID" || -z "$REPO_ID" ]]; then
+  if ids="$(discover_github_ids "$REPO")"; then
+    read -r OWNER_ID REPO_ID <<<"$ids"
+  fi
+fi
+
+# Both the name-based and the ID-based subject, so the roles work before and
+# after GitHub switches this repository over.
+REPO_SUBJECTS=("$REPO")
+if [[ -n "$OWNER_ID" && -n "$REPO_ID" ]]; then
+  REPO_SUBJECTS+=("${REPO%%/*}@${OWNER_ID}/${REPO#*/}@${REPO_ID}")
+fi
 
 cat <<SUMMARY
 Profile     : ${PROFILE:-<default>}
@@ -149,14 +186,22 @@ Account     : ${ACCOUNT_ID}
 Region      : ${REGION}
 Environment : ${ENVIRONMENT}
 Repository  : ${REPO}
+Repo IDs    : ${OWNER_ID:-<unresolved>}/${REPO_ID:-<unresolved>}
 Qualifier   : ${QUALIFIER}
 
 Will create or update:
   OIDC provider  ${PROVIDER_HOST}
   IAM role       ${DEPLOY_ROLE}
-  IAM role       ${PLAN_ROLE}
 
 SUMMARY
+
+if [[ -z "$OWNER_ID" || -z "$REPO_ID" ]]; then
+  echo "[warn] Could not read the numeric GitHub IDs for ${REPO}; only the" >&2
+  echo "       name-based subject will be trusted. If the workflow then fails" >&2
+  echo "       with 'Not authorized to perform sts:AssumeRoleWithWebIdentity'," >&2
+  echo "       re-run with --owner-id and --repo-id." >&2
+  echo >&2
+fi
 
 if [[ "$ASSUME_YES" == false && -t 0 ]]; then
   read -r -p "Proceed? [y/N]: " reply
@@ -191,7 +236,12 @@ else
 fi
 
 # ----------------------------------------------------------------------- helpers
-trust_policy() { # $1 = sub claim
+trust_policy() { # $1 = sub claim suffix, e.g. "environment:dev"
+  local subs="" repo
+  for repo in "${REPO_SUBJECTS[@]}"; do
+    subs+="${subs:+,
+          }\"repo:${repo}:$1\""
+  done
   cat <<JSON
 {
   "Version": "2012-10-17",
@@ -202,7 +252,9 @@ trust_policy() { # $1 = sub claim
     "Condition": {
       "StringEquals": {
         "${PROVIDER_HOST}:aud": "sts.amazonaws.com",
-        "${PROVIDER_HOST}:sub": "$1"
+        "${PROVIDER_HOST}:sub": [
+          ${subs}
+        ]
       }
     }
   }]
@@ -226,7 +278,7 @@ upsert_role() { # $1 = role name, $2 = trust policy, $3 = description
 # ------------------------------------------------------------------ deploy role
 # The deploy job sets `environment:`, so GitHub issues sub=repo:<repo>:environment:<name>.
 upsert_role "$DEPLOY_ROLE" \
-  "$(trust_policy "repo:${REPO}:environment:${ENVIRONMENT}")" \
+  "$(trust_policy "environment:${ENVIRONMENT}")" \
   "GitHub Actions CDK deploy for ${ENVIRONMENT}"
 
 "${AWS[@]}" iam put-role-policy --role-name "$DEPLOY_ROLE" \
@@ -244,32 +296,7 @@ JSON
 )"
 echo "[ok]   ${DEPLOY_ROLE} may assume ${BOOTSTRAP_ROLES}"
 
-# -------------------------------------------------------------------- plan role
-# The PR job has no `environment:`, so sub=repo:<repo>:pull_request.
-upsert_role "$PLAN_ROLE" \
-  "$(trust_policy "repo:${REPO}:pull_request")" \
-  "GitHub Actions CDK diff for ${ENVIRONMENT}"
-
-"${AWS[@]}" iam attach-role-policy --role-name "$PLAN_ROLE" \
-  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
-
-"${AWS[@]}" iam put-role-policy --role-name "$PLAN_ROLE" \
-  --policy-name assume-cdk-lookup-role \
-  --policy-document "$(cat <<JSON
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": "sts:AssumeRole",
-    "Resource": "${LOOKUP_ROLE}"
-  }]
-}
-JSON
-)"
-echo "[ok]   ${PLAN_ROLE} has ReadOnlyAccess and may assume the lookup role"
-
 echo
 echo "Add these to GitHub:"
-echo "  Environment '${ENVIRONMENT}' secret  AWS_DEPLOY_ROLE_ARN       = arn:aws:iam::${ACCOUNT_ID}:role/${DEPLOY_ROLE}"
-echo "  Repository secret                    AWS_PLAN_ROLE_ARN_${ENVIRONMENT^^} = arn:aws:iam::${ACCOUNT_ID}:role/${PLAN_ROLE}"
-echo "  Repository variable                  AWS_REGION                = ${REGION}"
+echo "  Environment '${ENVIRONMENT}' secret  AWS_DEPLOY_ROLE_ARN = arn:aws:iam::${ACCOUNT_ID}:role/${DEPLOY_ROLE}"
+echo "  Repository variable                  AWS_REGION          = ${REGION}"

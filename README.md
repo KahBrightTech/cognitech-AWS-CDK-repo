@@ -590,7 +590,6 @@ It creates:
 | -------- | ------- |
 | OIDC provider for `token.actions.githubusercontent.com` | lets GitHub tokens be exchanged for AWS credentials |
 | `github-oidc-cdk-deploy-<env>` | assumed by the deploy job; may only `sts:AssumeRole` the `cdk-hnb659fds-*` roles |
-| `github-oidc-cdk-plan-<env>` | `ReadOnlyAccess` for a PR-time `cdk diff` |
 
 Verify:
 
@@ -602,10 +601,11 @@ aws iam get-role --role-name github-oidc-cdk-deploy-dev \
 
 Copy that ARN — it goes straight into the workflow in Step 4.
 
-> The script finishes by printing an `AWS_PLAN_ROLE_ARN_<ENV>` secret to add.
-> **The current `pr.yml` does not use it** — pull requests only run tests and
-> `cdk synth`, which need no AWS access. The plan role is harmless; skip that
-> secret unless you later add a credentialed `cdk diff` to the PR workflow.
+> **Pull requests need no AWS access.** `pr.yml` only runs tests and `cdk synth`,
+> which work offline, and it does not request `id-token: write`. So the script
+> creates no PR-time role. If you later add a credentialed `cdk diff` to the PR
+> workflow, create a read-only role for it then — with the trust policy pinned
+> to the `pull_request` subject.
 
 #### Step 3 — Create the GitHub Environment
 
@@ -616,6 +616,18 @@ The name must match. The workflow sets `environment: dev`, and the OIDC trust
 policy expects the claim
 `repo:KahBrightTech/cognitech-AWS-CDK-repo:environment:dev`. A mismatch fails
 with `Not authorized to perform sts:AssumeRoleWithWebIdentity`.
+
+GitHub is migrating to **immutable subject claims**, which splice the numeric
+owner and repository IDs into that string:
+
+```
+repo:KahBrightTech@202037050/cognitech-AWS-CDK-repo@1383489754:environment:dev
+```
+
+Names can be recycled, IDs cannot, so the ID form is the one AWS should pin to.
+`create_github_oidc_roles.sh` looks both IDs up from the GitHub API and trusts
+the two forms, so the roles keep working before and after the switch. Pass
+`--owner-id` / `--repo-id` if the lookup cannot reach the API.
 
 This is also where **Required reviewers** live — add them on any environment
 that should pause for approval before deploying.
@@ -744,7 +756,8 @@ env:
 
 > **The `environment:` value is not free-form.** It must match the folder under
 > `deployments/` *and* the GitHub Environment name, because the OIDC trust policy
-> expects the claim `repo:<org>/<repo>:environment:dev`. The *file name* and the
+> expects the claim `repo:<org>/<repo>:environment:dev` (or its immutable
+> `repo:<org>@<id>/<repo>@<id>:environment:dev` form). The *file name* and the
 > `name:` field can be anything you like.
 
 What runs, in order:
@@ -865,7 +878,7 @@ stack or in SSM Parameter Store.
 | `common.tags is missing ...`                                                     | Add the required tag keys.                                               |
 | `Need to perform AWS calls for account X, but the current credentials are for Y` | `account_id` does not match your profile.                              |
 | `ExpiredToken` / `InvalidClientTokenId`                                        | `aws sso login --profile <your-profile>`                               |
-| `Not authorized to perform sts:AssumeRoleWithWebIdentity`                        | GitHub Environment name does not match the folder under`deployments/`. |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity`                        | The `sub` in the token does not match the role's trust policy. Re-run `scripts/create_github_oidc_roles.sh` — it trusts both the name-based and the immutable ID-based claim. Otherwise check the GitHub Environment name matches the folder under `deployments/`. |
 | `This CDK deployment requires bootstrap stack version X`                         | Re-run`cdk bootstrap`.                                                 |
 
 ### Editor setup
