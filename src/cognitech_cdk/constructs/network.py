@@ -43,9 +43,7 @@ class NetworkProps:
     nat_gateways: int | None = None
     public_subnet_cidrs: Sequence[str] | None = None
     private_subnet_cidrs: Sequence[str] | None = None
-    # Prefix length used when a tier has no explicit CIDRs.
     cidr_mask: int = DEFAULT_CIDR_MASK
-    # Names used in the middle of each subnet's resource name.
     public_subnet_name: str = "public"
     private_subnet_name: str = "private"
 
@@ -61,7 +59,6 @@ class NetworkProps:
                 f"Network '{self.name}': private subnets need at least one NAT gateway. "
                 f"Set private_subnets: false for a VPC with no NAT gateways."
             )
-        # Fail fast on bad CIDRs rather than at deploy time.
         self.subnet_cidrs()
 
     @property
@@ -75,13 +72,11 @@ class NetworkProps:
 
     def subnet_cidrs(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """Return `(public_cidrs, private_cidrs)`, one entry per AZ.
-
         Explicit ranges are taken as given and reserved first; any tier without
         them is carved from the lowest free `/{cidr_mask}` blocks in the VPC.
         """
         vpc = ipaddress.ip_network(self.cidr_block)
         taken: list[Any] = []
-
         explicit = (
             (self.public_subnet_name, self.public_subnet_cidrs),
             (self.private_subnet_name, self.private_subnet_cidrs),

@@ -10,7 +10,26 @@ name: Deploy primary mdpp dev
 # HOW IT RUNS
 #   push to main  -> `cdk diff` only. Nothing is ever created or deleted
 #                    automatically; the diff is written to the run summary.
-#   Run workflow  -> choose diff (default), deploy, or destroy.
+#   Run workflow  -> choose diff (default), deploy, or destroy, and which
+#                    stacks to act on.
+#
+# STACK SELECTION
+#   The stack list is not written down here. `cdk list` asks app.py what this
+#   environment builds, so registering a stack in app.py or renaming one in
+#   deployments/dev/env.yaml is picked up with no change to this file.
+#
+#   GitHub builds the "Run workflow" form before any runner exists, so it
+#   cannot show that detected list in a dropdown. Instead the stacks input is
+#   free text defaulting to "all", and every run prints the available names to
+#   the summary so you can copy one for the next run. A name that does not
+#   match anything fails the job before AWS is touched.
+#
+#     all                      every stack in this environment (default)
+#     md-preproduction-use1-dev-network    one stack, by name
+#     *network*                any stack matching the pattern
+#     stack-a stack-b          several, separated by spaces
+#
+#   Dependencies of a selected stack are deployed too, as CDK normally does.
 #
 # The role ARN and region are written in below rather than stored as GitHub
 # secrets or variables. Neither is a credential, and both already appear in
@@ -40,6 +59,11 @@ on:
           - diff # review only, change nothing
           - deploy # create or update the stack
           - destroy # DELETE the stack and everything in it
+      stacks:
+        description: 'Stacks to act on: "all", or names/patterns separated by spaces'
+        required: false
+        default: all
+        type: string
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'
         required: false
@@ -56,7 +80,7 @@ permissions:
 
 jobs:
   cdk:
-    name: "dev: ${{ inputs.action || 'diff' }}"
+    name: "dev: ${{ inputs.action || 'diff' }} ${{ inputs.stacks || 'all' }}"
     runs-on: ubuntu-latest
     environment: dev
     env:
@@ -84,6 +108,55 @@ jobs:
         run: pytest -q
       - name: Synthesize
         run: cdk synth --quiet
+
+      # Asks app.py what this environment builds, then turns the requested
+      # selection into arguments for the cdk commands below. The input is read
+      # from an env var, never interpolated into the script, so a crafted value
+      # cannot run as shell code.
+      - name: Select stacks
+        env:
+          REQUESTED: ${{ inputs.stacks }}
+        run: |
+          set -euo pipefail
+          mapfile -t available < <(cdk list | sed '/^$/d')
+          if [ "${#available[@]}" -eq 0 ]; then
+            echo "::error::cdk list returned no stacks for ENV=$ENV"
+            exit 1
+          fi
+
+          {
+            echo "### Stacks detected in \`dev\`"
+            echo
+            printf -- '- `%s`\n' "${available[@]}"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          requested="${REQUESTED:-all}"
+          [ -n "${requested// /}" ] || requested=all
+
+          if [ "$requested" = "all" ]; then
+            echo "TARGETS=--all" >> "$GITHUB_ENV"
+            echo "SELECTED=all (${#available[@]} stack(s))" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          targets=()
+          for want in $requested; do
+            matched=()
+            for have in "${available[@]}"; do
+              # $want is deliberately unquoted so patterns like *network* match.
+              case "$have" in $want) matched+=("$have") ;; esac
+            done
+            if [ "${#matched[@]}" -eq 0 ]; then
+              echo "::error::No stack matches '$want'. Available: ${available[*]}"
+              exit 1
+            fi
+            targets+=("$want")
+          done
+
+          echo "TARGETS=${targets[*]}" >> "$GITHUB_ENV"
+          echo "SELECTED=${targets[*]}" >> "$GITHUB_ENV"
+
       - name: Show OIDC claims
         run: |
           token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
@@ -105,10 +178,10 @@ jobs:
       - name: Diff
         run: |
           {
-            echo '### `cdk diff` — dev'
+            echo '### `cdk diff` — dev: '"$SELECTED"
             echo
             echo '```'
-            cdk diff 2>&1 | tee /dev/stderr
+            cdk diff $TARGETS 2>&1 | tee /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -118,13 +191,14 @@ jobs:
           {
             echo
             echo '> Review the diff above, then **Run workflow** on this'
-            echo '> workflow and choose `deploy` to apply it.'
+            echo '> workflow, pick the stacks you want (or `all`) and choose'
+            echo '> `deploy` to apply it.'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Deploy
         if: inputs.action == 'deploy'
-        run: cdk deploy --require-approval never --progress events
+        run: cdk deploy $TARGETS --require-approval never --progress events
 
       - name: Destroy
         if: inputs.action == 'destroy'
-        run: cdk destroy --force
+        run: cdk destroy $TARGETS --force

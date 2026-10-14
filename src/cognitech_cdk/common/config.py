@@ -9,19 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping
 
-# Suffix per availability zone, matching the Terraform modules.
 ORDINALS = ("primary", "secondary", "tertiary", "quaternary")
 MAX_AZS = len(ORDINALS)
-
-# Tags every resource must carry. `Name` is excluded: it is built per resource.
 REQUIRED_TAGS = ("Build-method", "Environment", "ManagedBy", "Owner", "Compliance")
-
 
 def ordinal(index: int) -> str:
     """`primary`, `secondary`, `tertiary`, `quaternary` for an AZ position."""
     return ORDINALS[index]
-
-
 @dataclass(frozen=True)
 class Common:
     """Values every resource needs. Mirrors the Terraform `common` object.
@@ -37,7 +31,6 @@ class Common:
     })
     ```
     """
-
     account_name: str
     region_prefix: str
     tags: Mapping[str, str] = field(default_factory=dict)
