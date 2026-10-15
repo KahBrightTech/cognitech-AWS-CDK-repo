@@ -189,10 +189,16 @@ def test_existing_ids_and_prefix_lists_are_used_as_given(write_env):
         """,
     )
 
-    group = _groups(template)["int-production-use1-mixed-sg"]
+    # An sg- id can be written inline; a prefix list always becomes its own
+    # resource, so both places have to be looked at.
+    inline = _groups(template)["int-production-use1-mixed-sg"]["SecurityGroupIngress"]
+    separate = [
+        resource["Properties"]
+        for resource in template.find_resources("AWS::EC2::SecurityGroupIngress").values()
+    ]
     sources = {
         rule.get("SourceSecurityGroupId") or rule.get("SourcePrefixListId")
-        for rule in group["SecurityGroupIngress"]
+        for rule in (*inline, *separate)
     }
     assert sources == {"sg-0123456789abcdef0", "pl-0123456789abcdef0"}
 

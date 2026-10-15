@@ -1,42 +1,5 @@
 name: Deploy primary mdpp dev
-
-# Deploys deployments/dev/ into the md-preproduction account (533267408704),
-# us-east-1. One workflow per environment: nothing to pick, so there is no way
-# to run it against the wrong account by mistake.
-#
-# Naming: deploy-<region role>-<account>-<environment>
-#   primary = us-east-1   mdpp = md-preproduction   dev = deployments/dev/
-#
-# HOW IT RUNS
-#   push to main  -> `cdk diff` only. Nothing is ever created or deleted
-#                    automatically; the diff is written to the run summary.
-#   Run workflow  -> choose diff (default), deploy, or destroy, and which
-#                    stacks to act on.
-#
-# STACK SELECTION
-#   Nothing is typed and no stack name is maintained by hand. `cdk list` asks
-#   app.py what this environment builds, so registering a stack in app.py or
-#   renaming one in deployments/dev/env.yaml is picked up automatically.
-#
-#   GitHub builds the "Run workflow" form from this file before any runner
-#   exists, so a dropdown cannot be filled in while the job runs. Instead the
-#   sync-stack-choices workflow runs `cdk list` whenever the app changes and
-#   commits the result into the generated block below, so the dropdown is
-#   detected rather than written. Do not edit those lines; run
-#   `python scripts/sync_stack_choices.py` instead.
-#
-#   Picking "all" (the default) acts on every stack the run itself detects, so
-#   it is right even if the dropdown has not been regenerated yet. Any other
-#   choice is checked against `cdk list` before AWS is touched. Dependencies of
-#   a selected stack are deployed too, as CDK normally does.
-#
-# The role ARN and region are written in below rather than stored as GitHub
-# secrets or variables. Neither is a credential, and both already appear in
-# deployments/dev/env.yaml. The only GitHub setup needed is an Environment
-# named "dev".
 on:
-  # Shows what WOULD change when something affecting this stack lands on main.
-  # A change to deployments/prod/ does not match, so it will not trigger here.
   push:
     branches: [main]
     paths:
@@ -67,6 +30,7 @@ on:
         options:
           - all
           - md-preproduction-use1-dev-network
+          - md-preproduction-use1-dev-security
         # END generated stack options
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'

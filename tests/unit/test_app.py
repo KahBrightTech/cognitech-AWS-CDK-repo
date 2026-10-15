@@ -39,24 +39,27 @@ def _stacks(outdir: Path) -> set[str]:
     return {p.name.removesuffix(".template.json") for p in outdir.glob("*.template.json")}
 
 
-def _expected_stack(env_name: str) -> str:
-    """Build the stack name from the config, so edits to env.yaml do not break these."""
+def _expected_stacks(env_name: str) -> set[str]:
+    """Build the stack names from the config, so edits to env.yaml do not break these."""
     environment = load_environment(env_name)
-    return environment.common.name(environment.network.name, "network")
+    names = {environment.common.name(environment.network.name, "network")}
+    if environment.security_groups:
+        names.add(environment.common.name(environment.network.name, "security"))
+    return names
 
 
 def test_defaults_to_dev_when_nothing_is_set(tmp_path):
     result = _run(tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert _stacks(tmp_path) == {_expected_stack("dev")}
+    assert _stacks(tmp_path) == _expected_stacks("dev")
 
 
 def test_env_variable_selects_the_environment(tmp_path):
     result = _run(tmp_path, env_var="prod")
 
     assert result.returncode == 0, result.stderr
-    assert _stacks(tmp_path) == {_expected_stack("prod")}
+    assert _stacks(tmp_path) == _expected_stacks("prod")
 
 
 def test_context_overrides_the_variable(tmp_path):
@@ -64,7 +67,7 @@ def test_context_overrides_the_variable(tmp_path):
     result = _run(tmp_path, env_var="prod", context="dev")
 
     assert result.returncode == 0, result.stderr
-    assert _stacks(tmp_path) == {_expected_stack("dev")}
+    assert _stacks(tmp_path) == _expected_stacks("dev")
 
 
 @pytest.mark.parametrize("kwargs", [{"env_var": "staging"}, {"context": "staging"}])

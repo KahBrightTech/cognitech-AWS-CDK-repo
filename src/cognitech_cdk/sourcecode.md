@@ -20,9 +20,11 @@ deployment env.yaml
         |
         v
 common/environment.py ----> common/config.py
-        |                    constructs/network.py (NetworkProps)
+        |                    constructs/network.py  (NetworkProps)
+        |                    constructs/security.py (SecurityGroupProps)
         v
-stacks/network_stack.py ---> constructs/network.py (Network)
+stacks/network_stack.py ---> constructs/network.py  (Network)
+stacks/security_stack.py --> constructs/security.py (SecurityGroups)
 ```
 
 The app entry point, `app.py`, is one level above this package. It chooses an
