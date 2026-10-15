@@ -14,22 +14,21 @@ name: Deploy primary mdpp dev
 #                    stacks to act on.
 #
 # STACK SELECTION
-#   The stack list is not written down here. `cdk list` asks app.py what this
-#   environment builds, so registering a stack in app.py or renaming one in
-#   deployments/dev/env.yaml is picked up with no change to this file.
+#   Nothing is typed and no stack name is maintained by hand. `cdk list` asks
+#   app.py what this environment builds, so registering a stack in app.py or
+#   renaming one in deployments/dev/env.yaml is picked up automatically.
 #
-#   GitHub builds the "Run workflow" form before any runner exists, so it
-#   cannot show that detected list in a dropdown. Instead the stacks input is
-#   free text defaulting to "all", and every run prints the available names to
-#   the summary so you can copy one for the next run. A name that does not
-#   match anything fails the job before AWS is touched.
+#   GitHub builds the "Run workflow" form from this file before any runner
+#   exists, so a dropdown cannot be filled in while the job runs. Instead the
+#   sync-stack-choices workflow runs `cdk list` whenever the app changes and
+#   commits the result into the generated block below, so the dropdown is
+#   detected rather than written. Do not edit those lines; run
+#   `python scripts/sync_stack_choices.py` instead.
 #
-#     all                      every stack in this environment (default)
-#     md-preproduction-use1-dev-network    one stack, by name
-#     *network*                any stack matching the pattern
-#     stack-a stack-b          several, separated by spaces
-#
-#   Dependencies of a selected stack are deployed too, as CDK normally does.
+#   Picking "all" (the default) acts on every stack the run itself detects, so
+#   it is right even if the dropdown has not been regenerated yet. Any other
+#   choice is checked against `cdk list` before AWS is touched. Dependencies of
+#   a selected stack are deployed too, as CDK normally does.
 #
 # The role ARN and region are written in below rather than stored as GitHub
 # secrets or variables. Neither is a credential, and both already appear in
@@ -60,10 +59,15 @@ on:
           - deploy # create or update the stack
           - destroy # DELETE the stack and everything in it
       stacks:
-        description: 'Stacks to act on: "all", or names/patterns separated by spaces'
+        description: Stack to act on
         required: false
         default: all
-        type: string
+        type: choice
+        # BEGIN generated stack options -- scripts/sync_stack_choices.py
+        options:
+          - all
+          - md-preproduction-use1-dev-network
+        # END generated stack options
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'
         required: false
@@ -109,8 +113,8 @@ jobs:
       - name: Synthesize
         run: cdk synth --quiet
 
-      # Asks app.py what this environment builds, then turns the requested
-      # selection into arguments for the cdk commands below. The input is read
+      # Asks app.py what this environment builds, then turns the choice made in
+      # the form into arguments for the cdk commands below. The input is read
       # from an env var, never interpolated into the script, so a crafted value
       # cannot run as shell code.
       - name: Select stacks
@@ -140,22 +144,19 @@ jobs:
             exit 0
           fi
 
-          targets=()
-          for want in $requested; do
-            matched=()
-            for have in "${available[@]}"; do
-              # $want is deliberately unquoted so patterns like *network* match.
-              case "$have" in $want) matched+=("$have") ;; esac
-            done
-            if [ "${#matched[@]}" -eq 0 ]; then
-              echo "::error::No stack matches '$want'. Available: ${available[*]}"
-              exit 1
+          for have in "${available[@]}"; do
+            if [ "$have" = "$requested" ]; then
+              echo "TARGETS=$requested" >> "$GITHUB_ENV"
+              echo "SELECTED=$requested" >> "$GITHUB_ENV"
+              exit 0
             fi
-            targets+=("$want")
           done
 
-          echo "TARGETS=${targets[*]}" >> "$GITHUB_ENV"
-          echo "SELECTED=${targets[*]}" >> "$GITHUB_ENV"
+          # Only reachable if the dropdown is older than the app.
+          echo "::error::'$requested' is not a stack in this environment, so the" \
+               "list in the form is out of date. Run the sync-stack-choices" \
+               "workflow. Available: ${available[*]}"
+          exit 1
 
       - name: Show OIDC claims
         run: |
@@ -177,7 +178,6 @@ jobs:
       # Always runs, whatever the action. On a push this is the whole job.
       - name: Diff
         run: |
-          set -f # keep wildcards intact for cdk rather than matching files
           {
             echo '### `cdk diff` — dev: '"$SELECTED"
             echo
@@ -198,12 +198,8 @@ jobs:
 
       - name: Deploy
         if: inputs.action == 'deploy'
-        run: |
-          set -f
-          cdk deploy $TARGETS --require-approval never --progress events
+        run: cdk deploy $TARGETS --require-approval never --progress events
 
       - name: Destroy
         if: inputs.action == 'destroy'
-        run: |
-          set -f
-          cdk destroy $TARGETS --force
+        run: cdk destroy $TARGETS --force

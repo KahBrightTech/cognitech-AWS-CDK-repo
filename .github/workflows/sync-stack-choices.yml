@@ -1,0 +1,71 @@
+name: Sync stack choices
+
+# Fills in the stack dropdown of every deploy workflow.
+#
+# GitHub builds the "Run workflow" form from the YAML on the default branch,
+# before any runner exists, so a `choice` input cannot be populated while a job
+# runs. This workflow does it one step earlier instead: whenever something that
+# can change the stack list lands on main, it runs `cdk list` for each
+# environment and commits the answer into the generated block of the matching
+# deploy workflow. Nobody types a stack name anywhere.
+#
+# The commit is made with GITHUB_TOKEN, which deliberately does not trigger
+# further workflow runs, so this cannot loop. If main is protected against
+# direct pushes, grant this workflow an exception or run
+# `python scripts/sync_stack_choices.py` locally and commit the result.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app.py" # where stacks are registered
+      - "src/**" # stack definitions
+      - "deployments/**" # names come from env.yaml
+      - "cdk.json"
+      - "scripts/sync_stack_choices.py"
+      - ".github/workflows/sync-stack-choices.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-stack-choices
+  cancel-in-progress: false
+
+permissions:
+  contents: write # to commit the refreshed dropdowns
+
+jobs:
+  sync:
+    name: Refresh stack dropdowns
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          npm install -g aws-cdk@2
+
+      - name: Sync
+        run: python scripts/sync_stack_choices.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit any change
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- .github/workflows; then
+            echo "Dropdowns already match the app; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows
+          git commit -m "Sync deploy workflow stack dropdowns with the app"
+          git push
