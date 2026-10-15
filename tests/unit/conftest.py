@@ -21,7 +21,6 @@ common:
     ManagedBy: aws-cdk/repo
     Owner: someone@example.com
     Compliance: hippaa
-network:
 """
 
 
@@ -29,14 +28,27 @@ network:
 def write_env(tmp_path):
     """Write `deployments/<name>/env.yaml` from a `network:` block.
 
+    `security_groups` is the body of the optional list of the same name, left
+    out entirely when not given.
+
     Returns the deployments root, for `load_environment(name, root=...)`.
     """
 
-    def _write(network: str, *, name: str = "test") -> Path:
+    def _write(
+        network: str, *, security_groups: str | None = None, name: str = "test"
+    ) -> Path:
         env_dir = tmp_path / name
         env_dir.mkdir(parents=True, exist_ok=True)
-        body = textwrap.indent(textwrap.dedent(network).strip(), "  ")
-        (env_dir / "env.yaml").write_text(f"{COMMON}{body}\n", encoding="utf-8")
+
+        body = f"network:\n{_block(network)}\n"
+        if security_groups is not None:
+            body += f"security_groups:\n{_block(security_groups)}\n"
+
+        (env_dir / "env.yaml").write_text(f"{COMMON}{body}", encoding="utf-8")
         return tmp_path
 
     return _write
+
+
+def _block(text: str) -> str:
+    return textwrap.indent(textwrap.dedent(text).strip(), "  ")

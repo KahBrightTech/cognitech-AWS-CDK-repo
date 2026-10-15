@@ -34,6 +34,7 @@ from cognitech_cdk.common.environment import (  # noqa: E402
     load_environment,
 )
 from cognitech_cdk.stacks.network_stack import NetworkStack  # noqa: E402
+from cognitech_cdk.stacks.security_stack import SecurityStack  # noqa: E402
 
 DEFAULT_ENV = "dev"
 ENV_VAR = "ENV"
@@ -52,12 +53,24 @@ if env_name not in known:
 environment = load_environment(env_name)
 aws_env = cdk.Environment(account=environment.account_id, region=environment.region)
 
-NetworkStack(
+network = NetworkStack(
     app,
     environment.common.name(environment.network.name, "network"),
     environment=environment,
     env=aws_env,
     description=f"VPC, subnets and gateways for {env_name}",
 )
+
+# Only built where the environment declares groups: CloudFormation rejects a
+# template with no resources, so an empty security_groups list means no stack.
+if environment.security_groups:
+    SecurityStack(
+        app,
+        environment.common.name(environment.network.name, "security"),
+        environment=environment,
+        vpc=network.network.vpc,
+        env=aws_env,
+        description=f"Security groups for {env_name}",
+    )
 
 app.synth()

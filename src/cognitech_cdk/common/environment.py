@@ -14,6 +14,7 @@ import yaml
 
 from cognitech_cdk.common.config import Common
 from cognitech_cdk.constructs.network import NetworkProps
+from cognitech_cdk.constructs.security import SecurityGroupProps
 
 DEPLOYMENTS_DIR = Path(__file__).resolve().parents[3] / "deployments"
 ENV_FILE = "env.yaml"
@@ -26,6 +27,7 @@ class Environment:
     region: str
     common: Common
     network: NetworkProps
+    security_groups: tuple[SecurityGroupProps, ...] = ()
 
     @property
     def cdk_env(self) -> Mapping[str, str]:
@@ -48,6 +50,7 @@ def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment
         region=str(raw["region"]),
         common=Common.from_dict(raw.get("common") or {}, env_name),
         network=NetworkProps.from_dict(raw["network"]),
+        security_groups=SecurityGroupProps.load_all(raw.get("security_groups")),
     )
 
 

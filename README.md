@@ -834,6 +834,12 @@ bootstrap time matters for a HIPAA account.
    `src/cognitech_cdk/stacks/` and register it in `app.py`.
 4. **Test** — add assertions in `tests/unit/`.
 
+Nothing has to be added to the deploy workflows: they ask `cdk list` what the
+environment builds, and the `sync-stack-choices` workflow rewrites their stack
+dropdown from the same source once the change is on `main`. `pytest` fails if a
+committed dropdown no longer matches the app, so the fix is to run
+`python scripts/sync_stack_choices.py` and commit the result.
+
 Suggested stack grouping, roughly one per lifecycle:
 
 | Stack                 | Holds                                                    |
