@@ -177,6 +177,7 @@ jobs:
       # Always runs, whatever the action. On a push this is the whole job.
       - name: Diff
         run: |
+          set -f # keep wildcards intact for cdk rather than matching files
           {
             echo '### `cdk diff` — dev: '"$SELECTED"
             echo
@@ -197,8 +198,12 @@ jobs:
 
       - name: Deploy
         if: inputs.action == 'deploy'
-        run: cdk deploy $TARGETS --require-approval never --progress events
+        run: |
+          set -f
+          cdk deploy $TARGETS --require-approval never --progress events
 
       - name: Destroy
         if: inputs.action == 'destroy'
-        run: cdk destroy $TARGETS --force
+        run: |
+          set -f
+          cdk destroy $TARGETS --force
