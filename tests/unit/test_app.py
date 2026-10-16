@@ -45,6 +45,8 @@ def _expected_stacks(env_name: str) -> set[str]:
     names = {environment.common.name(environment.network.name, "network")}
     if environment.security_groups:
         names.add(environment.common.name(environment.network.name, "security"))
+    if environment.iam.roles:
+        names.add(environment.common.name(environment.network.name, "iam"))
     return names
 
 

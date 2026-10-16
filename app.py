@@ -33,6 +33,7 @@ from cognitech_cdk.common.environment import (  # noqa: E402
     list_environments,
     load_environment,
 )
+from cognitech_cdk.stacks.iam_stack import IamStack  # noqa: E402
 from cognitech_cdk.stacks.network_stack import NetworkStack  # noqa: E402
 from cognitech_cdk.stacks.security_stack import SecurityStack  # noqa: E402
 
@@ -71,6 +72,15 @@ if environment.security_groups:
         vpc=network.network.vpc,
         env=aws_env,
         description=f"Security groups for {env_name}",
+    )
+
+if environment.iam.roles:
+    IamStack(
+        app,
+        environment.common.name(environment.network.name, "iam"),
+        environment=environment,
+        env=aws_env,
+        description=f"IAM roles and instance profiles for {env_name}",
     )
 
 app.synth()

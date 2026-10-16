@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=./iam-policy.schema.json
+# Attached to dev eks-nodes; replace example-config-bucket for your resources.
+Version: "2012-10-17"
+Statement:
+- Sid: ReadExampleConfig
+  Effect: Allow
+  Action: s3:GetObject
+  Resource: arn:aws:s3:::example-config-bucket/config/*
+  Condition:
+    Bool:
+      aws:SecureTransport: "true"

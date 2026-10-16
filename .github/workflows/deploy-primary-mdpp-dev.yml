@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - "deployments/dev/**" # this environment's config
+      - "policies/**" # external IAM trust and permissions documents
       - "src/**" # shared constructs and stacks
       - "app.py" # entrypoint
       - "cdk.json" # feature flags
@@ -31,6 +32,7 @@ on:
           - all
           - md-preproduction-use1-dev-network
           - md-preproduction-use1-dev-security
+          - md-preproduction-use1-dev-iam
         # END generated stack options
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'

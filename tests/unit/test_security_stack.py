@@ -238,6 +238,37 @@ def test_the_stack_is_tagged_like_every_other_stack(write_env):
     )
 
 
+def test_the_groups_wait_for_the_vpc(write_env):
+    """The dependency is implicit in passing the VPC object, so pin it down.
+
+    Without it CloudFormation could try to build a group before its VPC, or
+    delete the VPC while the groups still point at it. CDK only works the
+    ordering out while synthesizing, so the assembly is what gets checked.
+    """
+    environment = load_environment(
+        "test", root=write_env(NETWORK, security_groups=CLUSTER)
+    )
+    app = cdk.App()
+    env = cdk.Environment(account=environment.account_id, region=environment.region)
+    network = NetworkStack(app, "network", environment=environment, env=env)
+    security = SecurityStack(
+        app, "security", environment=environment, vpc=network.network.vpc, env=env
+    )
+
+    assembly = app.synth()
+    assert network in security.dependencies
+    assert "network" in [
+        artifact.id for artifact in assembly.get_stack_by_name("security").dependencies
+    ]
+
+    # The VPC id has to arrive as an import, not a value copied at synth time.
+    groups = Template.from_stack(security).find_resources("AWS::EC2::SecurityGroup")
+    assert all(
+        "Fn::ImportValue" in resource["Properties"]["VpcId"]
+        for resource in groups.values()
+    )
+
+
 # --- what the config refuses ---------------------------------------------
 
 

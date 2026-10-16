@@ -13,6 +13,7 @@ from typing import Any, Mapping
 import yaml
 
 from cognitech_cdk.common.config import Common
+from cognitech_cdk.constructs.iam import IamProps
 from cognitech_cdk.constructs.network import NetworkProps
 from cognitech_cdk.constructs.security import SecurityGroupProps
 
@@ -28,6 +29,7 @@ class Environment:
     common: Common
     network: NetworkProps
     security_groups: tuple[SecurityGroupProps, ...] = ()
+    iam: IamProps = IamProps()
 
     @property
     def cdk_env(self) -> Mapping[str, str]:
@@ -51,6 +53,9 @@ def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment
         common=Common.from_dict(raw.get("common") or {}, env_name),
         network=NetworkProps.from_dict(raw["network"]),
         security_groups=SecurityGroupProps.load_all(raw.get("security_groups")),
+        # External policy paths are project-root-relative, alongside
+        # deployments/, rather than environment-folder-relative.
+        iam=IamProps.from_dict(raw.get("iam"), base_dir=root.parent),
     )
 
 

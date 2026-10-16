@@ -102,8 +102,12 @@ src/cognitech_cdk/
     environment.py                      reads deployments/<env>/env.yaml
   constructs/
     network.py                          Network: VPC, IGW, subnets, NAT gateways, EIPs
+    security.py                         SecurityGroups: groups and the rules between them
+    iam.py                              Iam: service roles and EC2 instance profiles
   stacks/
     network_stack.py                    NetworkStack: tags, construct, outputs
+    security_stack.py                   SecurityStack: security groups, one export per group
+    iam_stack.py                        IamStack: roles, profiles, names and ARN exports
 
 deployments/
   dev/env.yaml                          one folder per environment
@@ -113,7 +117,9 @@ tests/unit/
 .github/workflows/
   deploy-primary-mdpp-dev.yml           deploy dev into md-preproduction
   pr.yml                                tests + synth on every PR
+  sync-stack-choices.yml                regenerates the stack dropdown from `cdk list`
 scripts/create_github_oidc_roles.sh     one-time AWS setup for the pipeline
+scripts/sync_stack_choices.py           writes that dropdown into the deploy workflows
 ```
 
 **Constructs** are reusable building blocks. **Stacks** group constructs into one
@@ -182,6 +188,14 @@ network:
   cidr_block: 10.20.0.0/16
   azs: 2
   private_subnets: false
+
+security_groups:             # optional, see below
+- name: eks-nodes
+  description: EKS worker nodes
+  ingress:
+  - description: Node to node
+    source: eks-nodes
+    protocol: all
 ```
 
 ### `common`
@@ -310,7 +324,406 @@ Positions use the Terraform words: `primary`, `secondary`, `tertiary`,
 
 Raising `azs` adds subnets; lowering it **deletes** them. Run `cdk diff` first.
 
+### `security_groups`
+
+Optional. A list of security groups to build for whatever runs in the VPC — a
+cluster, a load balancer, a database. Each entry becomes one security group in
+its own `SecurityStack`; an environment that lists none gets no such stack.
+
+| Key                   | Required | Default        | Purpose                                     |
+| --------------------- | -------- | -------------- | ------------------------------------------- |
+| `name`                | yes      | —              | Name segment, e.g. `eks-nodes`              |
+| `description`         | no       | generated      | Shown in the console; cannot be changed later |
+| `ingress`             | no       | none           | Inbound rules                               |
+| `egress`              | no       | allow all out  | Outbound rules; listing any closes the rest |
+| `allow_all_outbound`  | no       | see below      | `false` with no `egress` blocks all outbound |
+| `tags`                | no       | none           | Extra tags, e.g. `kubernetes.io/cluster/dev` |
+
+Each rule takes:
+
+| Key           | Required | Default   | Purpose                                              |
+| ------------- | -------- | --------- | ---------------------------------------------------- |
+| `source`      | ingress  | —         | Where the traffic comes from                         |
+| `destination` | egress   | —         | Where the traffic goes                               |
+| `description` | no       | generated | Shown against the rule in the console                |
+| `protocol`    | no       | `tcp`     | `tcp`, `udp`, `icmp` or `all`                        |
+| `ports`       | tcp/udp  | —         | `443`, or a range like `30000-32767`                 |
+
+`source` and `destination` are one of:
+
+| Value            | Meaning                                       |
+| ---------------- | --------------------------------------------- |
+| `eks-nodes`      | another group in this list, or the group itself |
+| `10.20.0.0/16`   | an IPv4 range                                 |
+| `2600:1f18::/32` | an IPv6 range                                 |
+| `sg-0abc123`     | a group that already exists outside this stack |
+| `pl-0abc123`     | a prefix list, e.g. an AWS service range      |
+
+A cluster and its nodes referring to each other is the normal case and is safe:
+rules between two groups are built as separate resources, so neither has to
+exist before the other.
+
+```yaml
+security_groups:
+- name: eks-cluster
+  description: EKS control plane
+  ingress:
+  - description: API server from the nodes
+    source: eks-nodes
+    ports: 443
+
+- name: eks-nodes
+  description: EKS worker nodes
+  tags:
+    kubernetes.io/cluster/dev: owned
+  ingress:
+  - description: Node to node, all ports
+    source: eks-nodes          # a group may reference itself
+    protocol: all
+  - description: Control plane to kubelet
+    source: eks-cluster
+    ports: 10250
+  - description: Ingress controller to the NodePort range
+    source: alb
+    ports: 30000-32767
+
+- name: alb
+  description: Public load balancer in front of the cluster
+  ingress:
+  - description: HTTPS from anywhere
+    source: 0.0.0.0/0
+    ports: 443
+```
+
+Outbound is open unless `egress` is listed, in which case those rules are the
+only way out:
+
+```yaml
+- name: database
+  description: Postgres, no route to the internet
+  ingress:
+  - description: Postgres from the nodes
+    source: eks-nodes
+    ports: 5432
+  egress:
+  - description: Replication to the secondary
+    destination: 10.20.0.0/16
+    ports: 5432
+```
+
+Mistakes are caught when the config is read, before anything is built: a group
+name that is not defined, a repeated group or rule, a port outside 0–65535, a
+backwards range, a malformed CIDR, and `allow_all_outbound: true` alongside
+`egress` rules that AWS would then ignore.
+
+Each group's ID is exported as `{stack_name}-{name}-sg-id`, and in code a group
+is reached by its configured name:
+
+```python
+stack.security_groups["eks-nodes"]          # ec2.SecurityGroup
+```
+
+The groups live in their own stack, which takes the VPC from the network stack.
+CDK turns that into a CloudFormation export/import, so the ordering is enforced
+by AWS rather than by you remembering it: the network stack is deployed first,
+and it cannot be destroyed while the security stack still imports its VPC.
+
+#### Security groups and EKS
+
+A cluster uses these three group roles. Only two of them are built here;
+creating the groups does not attach them to a cluster or its nodes.
+
+| Group                            | Created by          | Attached to                        |
+| -------------------------------- | ------------------- | ---------------------------------- |
+| `eks-cluster-sg-<cluster>-<id>`  | EKS automatically   | control plane ENIs and, normally, managed node ENIs |
+| `eks-cluster` (this config)      | this stack          | control plane ENIs, when passed to the cluster |
+| `eks-nodes` (this config)        | this stack          | nodes, when configured in the launch template |
+
+EKS creates its own cluster security group on every cluster and there is no way
+to turn that off. By default it allows all traffic from itself and all traffic
+outbound. On cluster updates, EKS restores its self-referencing rules and
+required tags if removed. You can restrict unrestricted outbound traffic while
+preserving required cluster communication; EKS does not restore every rule.
+
+The `eks-cluster` group here is the *additional* group to pass to the cluster as
+`resourcesVpcConfig.securityGroupIds`. AWS adds it to the group above rather
+than replacing it, and only on the control plane ENIs. Add custom control-plane
+rules to this group; a second custom group is unnecessary just to add rules.
+Node-level rules belong on `eks-nodes`. If the node launch template specifies
+custom security groups, EKS does not automatically attach its cluster security
+group to those nodes, so the custom rules must permit the required traffic.
+
+Security group permissions are additive: a restrictive additional group does
+not override traffic another attached group allows.
+
+Once `eks-cluster` is attached to the control plane ENIs, rules can use
+`source: eks-cluster` to match traffic from those interfaces. The EKS-created
+group's ID is only available after cluster creation, so it cannot be a
+pre-creation reference in this config.
+
+See [the source documentation](src/cognitech_cdk/sourcecode.md#security-groups-for-eks)
+and [AWS's security group requirements](https://docs.aws.amazon.com/eks/latest/userguide/sec-group-reqs.html).
+
 ---
+
+### `iam`
+
+Optional. Configures a separate IAM stack for service roles and EC2 instance
+profiles. Environments with no roles get no IAM stack; prod is unchanged.
+
+```yaml
+iam:
+  roles:
+  - name: eks-cluster
+    description: EKS control plane service role
+    assumed_by: eks.amazonaws.com
+    managed_policies:
+    - AmazonEKSClusterPolicy
+  - name: eks-nodes
+    description: EKS EC2 worker node role
+    assumed_by: ec2.amazonaws.com
+    managed_policies:
+    - AmazonEKSWorkerNodePolicy
+    - AmazonEC2ContainerRegistryPullOnly
+    - AmazonEKS_CNI_Policy
+  instance_profiles:
+  - name: eks-nodes
+    role: eks-nodes
+```
+
+| Section | Key | Purpose |
+| ------- | --- | ------- |
+| `roles` | `name` | Required config key; letters/digits, hyphens and underscores |
+| `roles` | `assumed_by` | AWS service principal shorthand; use exactly one of this or `trust_policy` |
+| `roles` | `trust_policy` | Full IAM trust document or a relative YAML file path |
+| `roles` | `description` | Optional description |
+| `roles` | `managed_policies` | Optional list of AWS-managed policy names, not ARNs; paths such as `service-role/...` are supported |
+| `roles` | `managed_policy_arns` | Optional list of existing managed-policy ARNs, including customer-managed policies |
+| `roles` | `inline_policies` | Optional mapping of policy names to IAM permission documents or relative YAML file paths |
+| `instance_profiles` | `name` | Required profile config key |
+| `instance_profiles` | `role` | Required exact name of an EC2-trusted role in the same `roles` list |
+
+With `assumed_by`, trust is limited to the configured service. With
+`trust_policy`, trust is exactly the document supplied; the two fields cannot
+be combined, and no extra principal is added. No administrator policies are
+attached by default. Unknown fields, malformed entries, duplicate names or
+policies, unknown profile roles, and profiles without an explicit EC2
+`Allow` / `sts:AssumeRole` service trust statement are rejected.
+IAM names include the environment because IAM is account-wide, and complete
+names are checked against the 64-character role and 128-character profile limits.
+
+#### Custom permissions and trust
+
+Policies and trust belong to the **role**, never to the instance profile.
+An instance profile only carries one EC2-trusted role. All three permission
+fields can be combined: `managed_policies` imports AWS-managed policies by
+name, `managed_policy_arns` attaches existing policies by ARN, and
+`inline_policies` creates named policies embedded in the role.
+
+For example, this role uses explicit EC2 trust, attaches a customer-managed
+policy and adds an inline S3 permission. Replace the example policy ARN and
+bucket with your actual resources before deploying:
+
+```yaml
+iam:
+  roles:
+  - name: app-worker
+    trust_policy:
+      Version: "2012-10-17"
+      Statement:
+      - Effect: Allow
+        Principal:
+          Service: ec2.amazonaws.com
+        Action: sts:AssumeRole
+    managed_policies:
+    - AmazonEKSWorkerNodePolicy
+    managed_policy_arns:
+    - arn:aws:iam::111122223333:policy/team/CustomWorkerPolicy
+    inline_policies:
+      ReadAppConfig:
+        Version: "2012-10-17"
+        Statement:
+        - Sid: ReadConfig
+          Effect: Allow
+          Action:
+          - s3:GetObject
+          Resource: arn:aws:s3:::example-config-bucket/config/*
+          Condition:
+            Bool:
+              aws:SecureTransport: "true"
+  instance_profiles:
+  - name: app-worker
+    role: app-worker
+```
+
+The ARN attachment does **not** create that managed policy; it must already
+exist. Inline permissions do not change who can assume the role.
+
+##### Policies in separate YAML files
+
+`trust_policy` and each value in `inline_policies` accept either an embedded
+document or a string naming a YAML file. Paths are relative to the repository
+root, not the directory containing `env.yaml` or the terminal's working directory. No extra fields
+or YAML tags are needed:
+
+```yaml
+iam:
+  roles:
+  - name: app-worker
+    trust_policy: policies/ec2-trust.yaml
+    inline_policies:
+      ReadAppConfig: policies/read-app-config.yaml
+  instance_profiles:
+  - name: app-worker
+    role: app-worker
+```
+
+For that example, place the policies in the repository-root `policies/` folder:
+
+```text
+deployments/
+  dev/
+    env.yaml
+policies/
+  ec2-trust.yaml
+  read-app-config.yaml
+```
+
+Contents of `policies/ec2-trust.yaml`:
+
+```yaml
+Version: "2012-10-17"
+Statement:
+- Effect: Allow
+  Principal:
+    Service: ec2.amazonaws.com
+  Action: sts:AssumeRole
+```
+
+Contents of `policies/read-app-config.yaml` (replace the bucket before use):
+
+```yaml
+Version: "2012-10-17"
+Statement:
+- Effect: Allow
+  Action: s3:GetObject
+  Resource: arn:aws:s3:::example-config-bucket/config/*
+  Condition:
+    Bool:
+      aws:SecureTransport: "true"
+```
+
+Files contain a complete IAM policy document, not an `iam:` or role wrapper.
+They are loaded with safe YAML parsing, then validated exactly like embedded
+documents. Mixing embedded and file-based permission policies is supported.
+`assumed_by` and `trust_policy` remain mutually exclusive, even when trust
+comes from a file. File-based permission documents still become **inline IAM
+policies** on the role; they do not create customer-managed policies.
+
+The repository includes [a reference permission policy](policies/example-read-config.yaml)
+that allows `s3:GetObject` on `example-config-bucket/config/*` over HTTPS.
+Dev attaches it to the `eks-nodes` role as `TestReadConfig`. The bucket name is
+still an example; replace it in the file to target your resources. The reference is:
+
+```yaml
+inline_policies:
+  TestReadConfig: policies/example-read-config.yaml
+```
+
+For VS Code YAML validation, root-level policy files can start with
+`# yaml-language-server: $schema=./iam-policy.schema.json` to use the local
+[IAM document schema](policies/iam-policy.schema.json). This overrides
+SchemaStore's unrelated Aerleon schema for `policies/**/*.yaml`, which otherwise
+reports errors such as `Missing property "terms"`. The directive is a YAML
+comment and does not change the policy loaded by CDK; IAM-specific validation
+still runs when loading the environment.
+
+Missing/unreadable files, malformed YAML and invalid policy documents fail
+configuration loading with the role, policy name (for permissions) and file
+path in the error. Only local relative paths are accepted, not absolute paths
+or URLs. File contents cannot recursively include other policy files.
+
+Commit the referenced files with the configuration so CI can read them.
+The existing dev workflow watches both `deployments/dev/` and root-level
+`policies/`. If you keep shared policies elsewhere, add their paths to
+that workflow's push filters too.
+
+For non-EC2 roles, a custom trust document can instead use AWS account/role
+principals, federated principals, multiple statements and conditions. For
+example, an automation role can use:
+
+```yaml
+trust_policy:
+  Version: "2012-10-17"
+  Statement:
+  - Effect: Allow
+    Principal:
+      AWS: arn:aws:iam::111122223333:role/trusted-automation
+    Action: sts:AssumeRole
+    Condition:
+      StringEquals:
+        sts:ExternalId: example-external-id
+```
+
+Use this **instead of** `assumed_by`; it is not suitable for an EC2 instance
+profile unless the document also explicitly trusts EC2. Use narrowly scoped
+principals and conditions, not a wildcard trust principal.
+
+Quote policy version dates so YAML treats them as strings. Documents use IAM
+JSON field names (`Statement`, `Effect`, `Action`, `Principal`, `Resource`,
+`Condition`); `Statement` can be a single mapping or a nonempty list. Trust
+statements require a principal and cannot specify resources; inline permission
+statements require resources and cannot specify principals. `Deny` and the
+corresponding `Not*` fields are preserved, not silently converted to `Allow`.
+Conditions and metadata are preserved. Local validation checks document
+structure, not whether AWS accepts every action, condition or referenced
+identity. Conditions and deny statements still govern whether EC2 can actually
+assume a profile's role.
+
+Dev loads `eks-cluster` trust from
+[`policies/eks-cluster-trust.yaml`](policies/eks-cluster-trust.yaml)
+and keeps shorthand trust on `eks-nodes`. The node role also attaches
+`TestReadConfig` from the example permission-policy file above.
+Switching trust formats preserves the role's
+logical ID and name.
+
+Dev creates:
+
+| Resource | Name | Usage |
+| -------- | ---- | ----- |
+| Control-plane role | `md-preproduction-use1-dev-eks-cluster-role` | Pass to the EKS cluster's `role` / `roleArn` |
+| Node role | `md-preproduction-use1-dev-eks-nodes-role` | Pass its ARN to a managed node group's `nodeRole` |
+| Node instance profile | `md-preproduction-use1-dev-eks-nodes-profile` | Attach to self-managed EC2 worker instances |
+
+For managed node groups, EKS manages the instance profile. Do not specify
+`IamInstanceProfile` in their launch templates; supply the node role ARN instead.
+The profile created here is for self-managed EC2 workers. Creating the roles and
+profile does not create a cluster, node group or EC2 instance.
+
+`AmazonEKS_CNI_Policy` is on the dev node role so the IPv4 VPC CNI can work
+without a separate add-on identity. AWS recommends moving this policy to a
+dedicated VPC CNI role using IRSA or EKS Pod Identity; remove it from the node
+role after that identity is configured. These roles target conventional
+EC2-backed EKS, not EKS Auto Mode or Fargate.
+
+The IAM stack has no VPC dependency. A future cluster stack can receive both
+the VPC and these roles, letting CDK establish the appropriate dependencies:
+
+```python
+iam_stack.iam.roles["eks-cluster"]             # iam.IRole
+iam_stack.iam.roles["eks-nodes"]               # iam.IRole
+iam_stack.iam.instance_profiles["eks-nodes"]   # iam.CfnInstanceProfile
+```
+
+Names and ARNs are exported as `{stack_name}-{name}-role-name`,
+`{stack_name}-{name}-role-arn`, `{stack_name}-{name}-profile-name` and
+`{stack_name}-{name}-profile-arn`.
+
+Select `md-preproduction-use1-dev-iam` in the deploy workflow, or choose `all`.
+Review the diff before deploying permission changes.
+
+See AWS's [cluster IAM role](https://docs.aws.amazon.com/eks/latest/userguide/cluster-iam-role.html)
+and [node IAM role](https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html) guidance.
 
 ## Naming convention
 
@@ -325,6 +738,9 @@ the Terraform modules:
 | Route table      | `{account}-{region}-{vpc}-{subnet}-{ordinal}-{type}-rt` | `int-production-use1-dev-edge-primary-public-rt` |
 | NAT gateway      | `{account}-{region}-{vpc}-{subnet}-ngw-{ordinal}`       | `int-production-use1-dev-edge-ngw-primary`       |
 | Elastic IP       | `{account}-{region}-{vpc}-{subnet}-eip-{ordinal}`       | `int-production-use1-dev-edge-eip-primary`       |
+| Security group   | `{account}-{region}-{name}-sg`                          | `int-production-use1-eks-nodes-sg`               |
+| IAM role         | `{account}-{region}-{environment}-{name}-role`         | `int-production-use1-dev-eks-nodes-role`         |
+| Instance profile | `{account}-{region}-{environment}-{name}-profile`      | `int-production-use1-dev-eks-nodes-profile`      |
 
 When a subnet group keeps its default name, the repeated word is dropped:
 `public_subnet_name: public` gives `int-production-use1-dev-public-primary`, not
@@ -846,7 +1262,8 @@ Suggested stack grouping, roughly one per lifecycle:
 | --------------------- | -------------------------------------------------------- |
 | `network_stack.py`  | VPC, subnets, VPC endpoints, transit gateway attachments |
 | `security_stack.py` | security groups, WAF                                     |
-| `platform_stack.py` | IAM roles and policies, SSM parameters, secrets, ECR     |
+| `iam_stack.py`      | IAM service roles and EC2 instance profiles              |
+| `platform_stack.py` | SSM parameters, secrets, ECR                             |
 | `edge_stack.py`     | ALB/NLB, target groups, ACM certificates, Route 53       |
 | `data_stack.py`     | RDS, DynamoDB, EFS, OpenSearch                           |
 | `compute_stack.py`  | EC2, launch templates, ASGs, ECS, EKS, Lambda            |
@@ -881,6 +1298,10 @@ stack or in SSM Parameter Store.
 | `subnet CIDRs ... overlap`                                                       | Two explicit ranges collide.                                             |
 | `no free /N block left`                                                          | `cidr_mask` is too large for the VPC; widen `cidr_block` or lower the mask. |
 | `private subnets need at least one NAT gateway`                                  | Set`private_subnets: false`, or raise `nat_gateways`.                |
+| `points at '...', which is not a group in this environment`                      | A rule's`source`/`destination` is a typo. Use a group name from the same list, a CIDR, an `sg-` id or a `pl-` id. |
+| `'...' is defined twice` / `duplicate ingress rule`                            | Two groups share a name, or a group repeats the same peer and ports.     |
+| `allow_all_outbound is true`                                                     | A group lists`egress` rules and leaves outbound open; drop one.        |
+| `ports must be a number` / `outside 0-65535` / `runs backwards`              | Use`443` or `30000-32767`, low end first.                            |
 | `common.tags is missing ...`                                                     | Add the required tag keys.                                               |
 | `Need to perform AWS calls for account X, but the current credentials are for Y` | `account_id` does not match your profile.                              |
 | `ExpiredToken` / `InvalidClientTokenId`                                        | `aws sso login --profile <your-profile>`                               |

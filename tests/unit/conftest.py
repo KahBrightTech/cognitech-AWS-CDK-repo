@@ -28,14 +28,17 @@ common:
 def write_env(tmp_path):
     """Write `deployments/<name>/env.yaml` from a `network:` block.
 
-    `security_groups` is the body of the optional list of the same name, left
-    out entirely when not given.
+    `security_groups` and `iam` are optional YAML bodies, omitted when not given.
 
     Returns the deployments root, for `load_environment(name, root=...)`.
     """
 
     def _write(
-        network: str, *, security_groups: str | None = None, name: str = "test"
+        network: str,
+        *,
+        security_groups: str | None = None,
+        iam: str | None = None,
+        name: str = "test",
     ) -> Path:
         env_dir = tmp_path / name
         env_dir.mkdir(parents=True, exist_ok=True)
@@ -43,6 +46,8 @@ def write_env(tmp_path):
         body = f"network:\n{_block(network)}\n"
         if security_groups is not None:
             body += f"security_groups:\n{_block(security_groups)}\n"
+        if iam is not None:
+            body += f"iam:\n{_block(iam)}\n"
 
         (env_dir / "env.yaml").write_text(f"{COMMON}{body}", encoding="utf-8")
         return tmp_path

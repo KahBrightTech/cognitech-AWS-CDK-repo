@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AWS IAM policy document",
+  "type": "object",
+  "required": ["Statement"],
+  "additionalProperties": false,
+  "properties": {
+    "Version": {
+      "type": "string",
+      "enum": ["2008-10-17", "2012-10-17"]
+    },
+    "Id": { "type": "string" },
+    "Statement": {
+      "oneOf": [
+        { "$ref": "#/definitions/statement" },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/statement" }
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "stringOrList": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      ]
+    },
+    "principal": {
+      "oneOf": [
+        { "const": "*" },
+        {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "enum": ["AWS", "Service", "Federated", "CanonicalUser"]
+          },
+          "additionalProperties": { "$ref": "#/definitions/stringOrList" }
+        }
+      ]
+    },
+    "statement": {
+      "type": "object",
+      "required": ["Effect"],
+      "additionalProperties": false,
+      "properties": {
+        "Sid": { "type": "string" },
+        "Effect": { "enum": ["Allow", "Deny"] },
+        "Action": { "$ref": "#/definitions/stringOrList" },
+        "NotAction": { "$ref": "#/definitions/stringOrList" },
+        "Resource": { "$ref": "#/definitions/stringOrList" },
+        "NotResource": { "$ref": "#/definitions/stringOrList" },
+        "Principal": { "$ref": "#/definitions/principal" },
+        "NotPrincipal": { "$ref": "#/definitions/principal" },
+        "Condition": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            { "required": ["Action"] },
+            { "required": ["NotAction"] }
+          ]
+        },
+        { "not": { "required": ["Resource", "NotResource"] } },
+        { "not": { "required": ["Principal", "NotPrincipal"] } }
+      ]
+    }
+  }
+}
