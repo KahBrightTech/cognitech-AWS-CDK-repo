@@ -480,8 +480,8 @@ and [AWS's security group requirements](https://docs.aws.amazon.com/eks/latest/u
 `IamRoleProps` describes a role's config name, optional description, and exactly
 one trust format: a service shorthand (`assumed_by`) or a full `trust_policy`.
 It accepts AWS-managed policy names (`managed_policies`), existing managed-policy
-ARNs (`managed_policy_arns`) and named permission documents (`inline_policies`).
-`trust_policy` and each `inline_policies` value may also be a relative YAML file
+ARNs (`managed_policy_arns`) and named permission documents (`custom_policies`).
+`trust_policy` and each `custom_policies` value may also be a relative YAML file
 path instead of an embedded mapping.
 `InstanceProfileProps` associates a profile name with exactly one role from the
 same configuration; profiles do not have their own policies.
@@ -506,7 +506,7 @@ resolves string values against that directory, reads UTF-8 text and uses
 must be policy mappings, not references to further files. Absolute paths and
 URLs are rejected; direct parser callers must supply `base_dir` when using files
 rather than relying on the process working directory. Errors identify the
-role, inline policy name where applicable, and file.
+role, custom policy name where applicable, and file.
 
 The parsed props contain the resolved documents, so the construct does not
 need separate file-handling branches. Moving a policy between embedded YAML
@@ -532,7 +532,7 @@ the documents are not re-encoded through CDK's L2 `PolicyDocument`.
 Output logical IDs also stay stable across trust format changes.
 
 Managed-policy ARNs attach existing policies rather than creating them.
-Inline policies are embedded in the role. They can be combined with AWS-managed
+Custom policies are embedded in the role as inline IAM policies. They can be combined with AWS-managed
 policies without changing trust. See the
 [custom policy and trust examples](../../README.md#custom-permissions-and-trust).
 

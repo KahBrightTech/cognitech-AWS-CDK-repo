@@ -499,7 +499,7 @@ iam:
 | `roles` | `description` | Optional description |
 | `roles` | `managed_policies` | Optional list of AWS-managed policy names, not ARNs; paths such as `service-role/...` are supported |
 | `roles` | `managed_policy_arns` | Optional list of existing managed-policy ARNs, including customer-managed policies |
-| `roles` | `inline_policies` | Optional mapping of policy names to IAM permission documents or relative YAML file paths |
+| `roles` | `custom_policies` | Optional mapping of policy names to IAM permission documents or relative YAML file paths |
 | `instance_profiles` | `name` | Required profile config key |
 | `instance_profiles` | `role` | Required exact name of an EC2-trusted role in the same `roles` list |
 
@@ -518,7 +518,7 @@ Policies and trust belong to the **role**, never to the instance profile.
 An instance profile only carries one EC2-trusted role. All three permission
 fields can be combined: `managed_policies` imports AWS-managed policies by
 name, `managed_policy_arns` attaches existing policies by ARN, and
-`inline_policies` creates named policies embedded in the role.
+`custom_policies` creates named inline policies embedded in the role.
 
 For example, this role uses explicit EC2 trust, attaches a customer-managed
 policy and adds an inline S3 permission. Replace the example policy ARN and
@@ -539,7 +539,7 @@ iam:
     - AmazonEKSWorkerNodePolicy
     managed_policy_arns:
     - arn:aws:iam::111122223333:policy/team/CustomWorkerPolicy
-    inline_policies:
+    custom_policies:
       ReadAppConfig:
         Version: "2012-10-17"
         Statement:
@@ -561,7 +561,7 @@ exist. Inline permissions do not change who can assume the role.
 
 ##### Policies in separate YAML files
 
-`trust_policy` and each value in `inline_policies` accept either an embedded
+`trust_policy` and each value in `custom_policies` accept either an embedded
 document or a string naming a YAML file. Paths are relative to the repository
 root, not the directory containing `env.yaml` or the terminal's working directory. No extra fields
 or YAML tags are needed:
@@ -571,7 +571,7 @@ iam:
   roles:
   - name: app-worker
     trust_policy: policies/ec2-trust.yaml
-    inline_policies:
+    custom_policies:
       ReadAppConfig: policies/read-app-config.yaml
   instance_profiles:
   - name: app-worker
@@ -626,7 +626,7 @@ Dev attaches it to the `eks-nodes` role as `TestReadConfig`. The bucket name is
 still an example; replace it in the file to target your resources. The reference is:
 
 ```yaml
-inline_policies:
+custom_policies:
   TestReadConfig: policies/example-read-config.yaml
 ```
 

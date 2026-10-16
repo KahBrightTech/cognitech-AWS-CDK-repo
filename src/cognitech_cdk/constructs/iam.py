@@ -66,7 +66,8 @@ def _policy_document(
         path = (resolved_base / raw).resolve()
         if not path.is_relative_to(resolved_base):
             raise ValueError(
-                f"{label}: policy file path must remain under the repository root."
+                f"{label}: policy file path must be relative and remain under "
+                "the repository root."
             )
         label = f"{label}, file '{path}'"
         try:
@@ -154,7 +155,7 @@ class IamRoleProps:
     description: str | None = None
     managed_policies: tuple[str, ...] = ()
     managed_policy_arns: tuple[str, ...] = ()
-    inline_policies: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    custom_policies: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     trust_policy: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -168,7 +169,7 @@ class IamRoleProps:
         data = _mapping(
             raw, "IAM role", {
                 "name", "assumed_by", "description", "managed_policies",
-                "managed_policy_arns", "inline_policies", "trust_policy",
+                "managed_policy_arns", "custom_policies", "trust_policy",
             }
         )
         name = _name(data.get("name"), "IAM role name")
@@ -221,12 +222,12 @@ class IamRoleProps:
             for arn in arns
         ):
             raise ValueError(f"IAM role '{name}': duplicate managed policy.")
-        inline = data.get("inline_policies", {})
+        inline = data.get("custom_policies", {})
         if not isinstance(inline, Mapping):
             raise ValueError(
-                f"IAM role '{name}': inline_policies must map names to policy documents."
+                f"IAM role '{name}': custom_policies must map names to policy documents."
             )
-        inline_policies = {}
+        custom_policies = {}
         for policy_name, document in inline.items():
             if not isinstance(policy_name, str) or not re.fullmatch(
                 r"[\w+=,.@-]{1,128}", policy_name, flags=re.ASCII
@@ -234,8 +235,8 @@ class IamRoleProps:
                 raise ValueError(
                     f"IAM role '{name}': invalid inline policy name '{policy_name}'."
                 )
-            inline_policies[policy_name] = _policy_document(
-                document, f"IAM role '{name}', inline policy '{policy_name}'",
+            custom_policies[policy_name] = _policy_document(
+                document, f"IAM role '{name}', custom policy '{policy_name}'",
                 base_dir=base_dir,
             )
         trust_policy = (
@@ -248,7 +249,7 @@ class IamRoleProps:
         return cls(
             name=name, assumed_by=service, description=description,
             managed_policies=tuple(policies), managed_policy_arns=tuple(arns),
-            inline_policies=inline_policies, trust_policy=trust_policy,
+            custom_policies=custom_policies, trust_policy=trust_policy,
         )
 
     @property
@@ -375,9 +376,9 @@ class Iam(Construct):
                 )
                 for index, arn in enumerate(role.managed_policy_arns)
             ]
-            inline_policies = [
+            custom_policies = [
                 iam.CfnRole.PolicyProperty(policy_name=key, policy_document=document)
-                for key, document in role.inline_policies.items()
+                for key, document in role.custom_policies.items()
             ]
             resource: iam.CfnRole | iam.Role
             if role.trust_policy is not None:
@@ -391,7 +392,7 @@ class Iam(Construct):
                     managed_policy_arns=[
                         policy.managed_policy_arn for policy in policies
                     ] or None,
-                    policies=inline_policies or None,
+                    policies=custom_policies or None,
                 )
                 self.roles[role.name] = iam.Role.from_role_arn(
                     self, f"{role.name}RoleReference", resource.attr_arn
@@ -409,7 +410,7 @@ class Iam(Construct):
                     assumed_by=iam.ServicePrincipal(role.assumed_by),
                     managed_policies=policies,
                 )
-                if inline_policies:
+                if custom_policies:
                     cfn_role = resource.node.default_child
                     if not isinstance(cfn_role, iam.CfnRole):
                         raise TypeError(
@@ -417,7 +418,7 @@ class Iam(Construct):
                         )
                     # Preserve the document instead of re-encoding it through
                     # CDK's L2 PolicyDocument.
-                    cfn_role.policies = inline_policies
+                    cfn_role.policies = custom_policies
                 self.roles[role.name] = resource
             cdk.Tags.of(resource).add("Name", name)
 

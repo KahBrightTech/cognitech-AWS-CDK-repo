@@ -349,7 +349,7 @@ def _custom_config(*, explicit_trust=True):
             **({"trust_policy": TRUST} if explicit_trust else {"assumed_by": "ec2.amazonaws.com"}),
             "managed_policies": ["AmazonEKSWorkerNodePolicy"],
             "managed_policy_arns": [POLICY_ARN],
-            "inline_policies": {"ReadConfig": PERMISSIONS},
+            "custom_policies": {"ReadConfig": PERMISSIONS},
         }],
         "instance_profiles": [{"name": "eks-nodes", "role": "eks-nodes"}],
     }
@@ -411,7 +411,7 @@ def test_custom_trust_role_can_receive_further_cdk_permissions(write_env):
 
 
 @pytest.mark.parametrize("explicit_trust", [False, True])
-def test_inline_policy_version_id_and_not_fields_are_preserved(write_env, explicit_trust):
+def test_custom_policy_version_id_and_not_fields_are_preserved(write_env, explicit_trust):
     document = {
         "Version": "2008-10-17",
         "Id": "LegacyPolicy",
@@ -422,7 +422,7 @@ def test_inline_policy_version_id_and_not_fields_are_preserved(write_env, explic
         }],
     }
     config = _custom_config(explicit_trust=explicit_trust)
-    config["roles"][0]["inline_policies"] = {"Legacy": document}
+    config["roles"][0]["custom_policies"] = {"Legacy": document}
     _, stack = _stack(write_env, yaml.safe_dump(config))
     role = next(iter(Template.from_stack(stack).find_resources("AWS::IAM::Role").values()))
     assert role["Properties"]["Policies"] == [{
@@ -463,9 +463,9 @@ def test_federated_trust_and_single_statement_are_preserved(write_env):
         ({"assumed_by": "ec2.amazonaws.com", "managed_policy_arns": ["arn:aws:s3:::bucket"]}, "managed_policy_arns"),
         ({"assumed_by": "ec2.amazonaws.com", "managed_policy_arns": [POLICY_ARN, POLICY_ARN]}, "duplicate"),
         ({"assumed_by": "ec2.amazonaws.com", "managed_policy_arns": ["arn:aws:iam::aws:policy/ReadOnlyAccess"], "managed_policies": ["ReadOnlyAccess"]}, "duplicate"),
-        ({"assumed_by": "ec2.amazonaws.com", "inline_policies": []}, "inline_policies"),
-        ({"assumed_by": "ec2.amazonaws.com", "inline_policies": {"bad/name": PERMISSIONS}}, "policy name"),
-        ({"assumed_by": "ec2.amazonaws.com", "inline_policies": {"Empty": {}}}, "Statement"),
+        ({"assumed_by": "ec2.amazonaws.com", "custom_policies": []}, "custom_policies"),
+        ({"assumed_by": "ec2.amazonaws.com", "custom_policies": {"bad/name": PERMISSIONS}}, "policy name"),
+        ({"assumed_by": "ec2.amazonaws.com", "custom_policies": {"Empty": {}}}, "Statement"),
     ],
 )
 def test_invalid_custom_role_fields(overrides, message):
@@ -496,7 +496,7 @@ def test_invalid_policy_statements(trust, statement, message):
     if trust:
         role["trust_policy"] = document
     else:
-        role.update(assumed_by="ec2.amazonaws.com", inline_policies={"Bad": document})
+        role.update(assumed_by="ec2.amazonaws.com", custom_policies={"Bad": document})
     with pytest.raises(ValueError, match=message):
         IamProps.from_dict({"roles": [role]})
 
@@ -560,7 +560,7 @@ def test_policy_files_match_embedded_documents(
 ):
     config = _custom_config()
     role = config["roles"][0]
-    policy_dir = tmp_path.parent / "policies"
+    policy_dir = tmp_path / "policies"
     policy_dir.mkdir(parents=True)
     trust_file = policy_dir / "trust.yaml"
     permissions_file = policy_dir / "permissions.yml"
@@ -570,9 +570,11 @@ def test_policy_files_match_embedded_documents(
     _, embedded_stack = _stack(write_env, yaml.safe_dump(config))
     expected = Template.from_stack(embedded_stack).to_json()
     if file_trust:
-        role["trust_policy"] = "policies/trust.yaml"
+        role["trust_policy"] = f"{tmp_path.name}/policies/trust.yaml"
     if file_permissions:
-        role["inline_policies"]["ReadConfig"] = "policies/permissions.yml"
+        role["custom_policies"]["ReadConfig"] = (
+            f"{tmp_path.name}/policies/permissions.yml"
+        )
     root = write_env(NETWORK, iam=yaml.safe_dump(config))
     # Files are relative to env.yaml, not the app's working directory.
     monkeypatch.chdir(tmp_path.parent.parent)
@@ -587,20 +589,22 @@ def test_policy_files_match_embedded_documents(
 
 def test_embedded_and_file_permissions_can_be_mixed(write_env, tmp_path):
     config = _custom_config()
-    config["roles"][0]["inline_policies"]["FromFile"] = "policies/extra.yaml"
+    config["roles"][0]["custom_policies"]["FromFile"] = (
+        f"{tmp_path.name}/policies/extra.yaml"
+    )
     root = write_env(NETWORK, iam=yaml.safe_dump(config))
-    policy_dir = tmp_path.parent / "policies"
+    policy_dir = tmp_path / "policies"
     policy_dir.mkdir()
     (policy_dir / "extra.yaml").write_text(
         yaml.safe_dump(PERMISSIONS), encoding="utf-8"
     )
     environment = load_environment("test", root=root)
-    assert environment.iam.roles[0].inline_policies == {
+    assert environment.iam.roles[0].custom_policies == {
         "ReadConfig": PERMISSIONS, "FromFile": PERMISSIONS,
     }
 
 
-@pytest.mark.parametrize("field", ["trust_policy", "inline_policies"])
+@pytest.mark.parametrize("field", ["trust_policy", "custom_policies"])
 @pytest.mark.parametrize(
     "contents,message",
     [
@@ -621,22 +625,22 @@ def test_embedded_and_file_permissions_can_be_mixed(write_env, tmp_path):
 def test_bad_policy_files_report_role_and_file(write_env, tmp_path, field, contents, message):
     role = {"name": "from-file"}
     if field == "trust_policy":
-        role["trust_policy"] = "bad.yaml"
+        role["trust_policy"] = f"{tmp_path.name}/policies/bad.yaml"
     else:
         role.update(
-            assumed_by="ec2.amazonaws.com", inline_policies={"Custom": "bad.yaml"}
+            assumed_by="ec2.amazonaws.com",
+            custom_policies={"Custom": f"{tmp_path.name}/policies/bad.yaml"},
         )
     root = write_env(NETWORK, iam=yaml.safe_dump({"roles": [role]}))
     if contents is not None:
-        (tmp_path.parent / "policies").mkdir(exist_ok=True)
-        (tmp_path.parent / "policies" / "bad.yaml").write_text(
-            contents, encoding="utf-8"
-        )
+        policy_dir = tmp_path / "policies"
+        policy_dir.mkdir()
+        (policy_dir / "bad.yaml").write_text(contents, encoding="utf-8")
     with pytest.raises(ValueError, match=message) as error:
         load_environment("test", root=root)
     assert "from-file" in str(error.value)
     assert "bad.yaml" in str(error.value)
-    if field == "inline_policies":
+    if field == "custom_policies":
         assert "Custom" in str(error.value)
 
 
@@ -661,7 +665,10 @@ def test_policy_file_requires_explicit_base_directory():
 
 def test_file_trust_does_not_bypass_instance_profile_validation(write_env, tmp_path):
     config = {
-        "roles": [{"name": "not-ec2", "trust_policy": "trust.yaml"}],
+        "roles": [{
+            "name": "not-ec2",
+            "trust_policy": f"{tmp_path.name}/policies/trust.yaml",
+        }],
         "instance_profiles": [{"name": "nodes", "role": "not-ec2"}],
     }
     root = write_env(NETWORK, iam=yaml.safe_dump(config))
@@ -671,7 +678,7 @@ def test_file_trust_does_not_bypass_instance_profile_validation(write_env, tmp_p
             "Principal": {"Service": "eks.amazonaws.com"},
         }],
     }
-    policy_dir = tmp_path.parent / "policies"
+    policy_dir = tmp_path / "policies"
     policy_dir.mkdir()
     (policy_dir / "trust.yaml").write_text(yaml.safe_dump(trust), encoding="utf-8")
     with pytest.raises(ValueError, match="must trust EC2"):
