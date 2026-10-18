@@ -36,6 +36,7 @@ on:
           - md-preproduction-use1-dev-storage
           - md-preproduction-use1-dev-key-pairs
           - md-preproduction-use1-dev-certificates
+          - md-preproduction-use1-dev-eks
         # END generated stack options
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'
