@@ -367,9 +367,10 @@ The constructor first initializes the CDK stack. It then:
    resources.
 3. Creates the `Network` construct using the environment's shared and network
    settings.
-4. Publishes the VPC ID and comma-separated public subnet IDs as CloudFormation
-   outputs.
-5. Publishes private subnet IDs only when private subnets are configured.
+4. Publishes the VPC ID, comma-separated public subnet IDs, and one output per
+   public subnet as CloudFormation exports.
+5. Publishes the same private subnet outputs only when private subnets are
+   configured.
 
 Other stacks or deployment steps can use these outputs to find the network
 resources after deployment.
@@ -377,9 +378,9 @@ resources after deployment.
 ### `_output(logical_id, value, export_suffix)`
 
 Creates a CloudFormation output and gives it an export name based on the stack
-name plus a suffix. The suffix distinguishes the VPC ID, public subnet IDs, and
-private subnet IDs. Exports let other CloudFormation stacks refer to these
-values.
+name plus a suffix. The suffix distinguishes the VPC ID, subnet ID lists, and
+individual subnets such as `public-subnet-primary-id`. Exports let other
+CloudFormation stacks refer to these values.
 
 ## `constructs/security.py` - security group settings and AWS resources
 
@@ -553,6 +554,35 @@ instance profile. This stack does not create or attach to a cluster or nodes.
 The dev worker role includes IPv4 VPC CNI permissions until a dedicated IRSA or
 Pod Identity role is configured for the add-on. See the
 [IAM configuration reference](../../README.md#iam) for policy names and usage.
+
+## Shared helpers for the Tenant-account stacks
+
+- `common/schema.py` validates YAML values (`mapping`, `name`, `strings`,
+  `items`, `lookup`, ...) with labels that name the failing entry.
+- `common/documents.py` loads repository-relative YAML/JSON files, refuses
+  paths outside the repository, and renders `[[placeholder]]` values.
+- `constructs/lookups.py` resolves Route53 hosted zone IDs and SSO role ARNs
+  at deploy time through one read-only Lambda-backed custom resource, so synth
+  needs no AWS credentials.
+- `stacks/base.py` provides `EnvironmentStack`: common tags,
+  `resource_name(...)` and `output(...)` with `{stack}-{suffix}` export names.
+  The loaded config is `self.config`; `cdk.Stack.environment` is read-only.
+
+## Tenant-account family modules
+
+Each family is a `constructs/<family>.py` (frozen props parsed from one YAML
+key, with a docstring example) plus a `stacks/<family>_stack.py` that builds the
+resources and exports their IDs. `common/environment.py` parses every key when
+the environment loads, and `app.py` builds a stack only for keys that are
+present, passing upstream resources (VPC, security groups, roles, buckets,
+certificates, clusters, ...) as objects. The
+[Tenant-account stacks](../../README.md#tenant-account-stacks) section lists
+every key, its Terraform modules and dependencies.
+
+`eks_stack.py` and `eks_addons_stack.py` are separate so add-on changes never
+touch the control plane or nodes, and add-ons are created after nodes exist.
+Native add-ons are `AWS::EKS::Addon`; the AWS Load Balancer Controller and any
+`helm_charts` go through the cluster's kubectl provider (kubectl v1.36 layer).
 
 ## `__init__.py` files - package markers
 

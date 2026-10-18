@@ -17,6 +17,9 @@
     "@aws-cdk/core:checkSecretUsage": true,
 
     "_comment_restrictDefaultSecurityGroup": "Strips all rules from the VPC default security group (CIS 5.3, HIPAA). Adds Custom::VpcRestrictDefaultSG plus a Lambda and IAM role to every stack with a VPC. Set to false to drop them; CDK will not re-open the group.",
-    "@aws-cdk/aws-ec2:restrictDefaultSecurityGroup": true
+    "@aws-cdk/aws-ec2:restrictDefaultSecurityGroup": true,
+
+    "_comment_defaultCrossStackReferences": "Strong references keep a producer stack from deleting an export another stack still imports. Pinned so a CDK upgrade cannot change it silently.",
+    "@aws-cdk/core:defaultCrossStackReferences": "strong"
   }
 }

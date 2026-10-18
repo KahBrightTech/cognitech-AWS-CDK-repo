@@ -36,17 +36,29 @@ def _run(outdir: Path, *, env_var: str | None = None, context: str | None = None
 
 
 def _stacks(outdir: Path) -> set[str]:
-    return {p.name.removesuffix(".template.json") for p in outdir.glob("*.template.json")}
+    return {
+        p.name.removesuffix(".template.json") for p in outdir.glob("*.template.json")
+        if not p.name.endswith(".nested.template.json")  # nested stacks deploy with their parent
+    }
+
+
+STACKS = (
+    ("security_groups", "security"), ("iam", "iam"), ("transit_gateway", "transit-gateway"),
+    ("storage", "storage"), ("key_pairs", "key-pairs"), ("secrets", "secrets"), ("ssm", "ssm"),
+    ("certificates", "certificates"), ("backups", "backup"), ("load_balancing", "load-balancing"),
+    ("waf", "waf"), ("ecr", "ecr"), ("eks", "eks"), ("ecs", "ecs"),
+    ("rds", "rds"), ("opensearch", "opensearch"), ("firehose", "firehose"), ("lambdas", "lambda"),
+    ("events", "events"), ("cognito", "cognito"),
+)
 
 
 def _expected_stacks(env_name: str) -> set[str]:
     """Build the stack names from the config, so edits to env.yaml do not break these."""
     environment = load_environment(env_name)
     names = {environment.common.name(environment.network.name, "network")}
-    if environment.security_groups:
-        names.add(environment.common.name(environment.network.name, "security"))
-    if environment.iam.roles:
-        names.add(environment.common.name(environment.network.name, "iam"))
+    for attribute, suffix in STACKS:
+        if getattr(environment, attribute):
+            names.add(environment.common.name(environment.network.name, suffix))
     return names
 
 

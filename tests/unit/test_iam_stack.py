@@ -269,9 +269,11 @@ def test_final_role_name_limit_is_checked(write_env):
 
 def test_dev_has_expected_roles_and_profile():
     environment = load_environment("dev")
-    assert {role.name for role in environment.iam.roles} == {"eks-cluster", "eks-nodes"}
+    assert {role.name for role in environment.iam.roles} == {
+        "eks-cluster", "eks-nodes", "ec2", "default", "source-replication",
+    }
     assert [(profile.name, profile.role) for profile in environment.iam.instance_profiles] == [
-        ("eks-nodes", "eks-nodes")
+        ("eks-nodes", "eks-nodes"), ("ec2", "ec2"),
     ]
     assert load_environment("prod").iam == IamProps()
 
@@ -693,3 +695,536 @@ def test_file_trust_and_service_shorthand_cannot_be_combined(tmp_path):
                 "trust_policy": "missing.yaml",
             }],
         }, base_dir=tmp_path)
+
+
+# --- Customer-managed policies, extended role fields and users ---------------
+
+READ = {
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Sid": "ReadBucket",
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": "arn:[[partition]]:s3:::[[account_name]]-[[account_number]]-[[region]]/*",
+    }],
+}
+RENDERED_RESOURCE = {"Fn::Join": ["", [
+    "arn:", {"Ref": "AWS::Partition"}, ":s3:::int-production-111122223333-us-east-1/*",
+]]}
+
+
+def _props_stack(config, *, base_dir=None, env_name="test", write_env=None):
+    environment = load_environment(env_name, root=write_env(NETWORK, name=env_name))
+    stack = IamStack(
+        cdk.App(), f"{env_name}-iam", environment=environment,
+        props=IamProps.from_dict(config, base_dir=base_dir),
+        env=cdk.Environment(account=environment.account_id, region=environment.region),
+    )
+    return stack, Template.from_stack(stack)
+
+
+def _users_config(**user):
+    return {
+        "policies": [{"name": "shared-read", "document": READ}],
+        "users": [{
+            "name": "deployer",
+            "path": "/automation/",
+            "groups": ["ops"],
+            "managed_policies": ["ReadOnlyAccess"],
+            "customer_managed_policies": ["shared-read"],
+            "policy": {"name": "deployer-own", "description": "Deployer", "document": READ},
+            "group_policies": [{
+                "group_name": "ops", "policy_name": "ops-read", "document": READ,
+            }],
+            **user,
+        }],
+    }
+
+
+def test_customer_managed_policy_renders_placeholders(write_env):
+    config = {"policies": [{
+        "name": "app-read", "description": "App read", "path": "/app/", "document": READ,
+    }]}
+    stack, template = _props_stack(config, write_env=write_env)
+    template.resource_count_is("AWS::IAM::ManagedPolicy", 1)
+    template.has_resource_properties("AWS::IAM::ManagedPolicy", {
+        "ManagedPolicyName": "int-production-use1-test-app-read-policy",
+        "Description": "App read",
+        "Path": "/app/",
+        "PolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "ReadBucket", "Effect": "Allow", "Action": "s3:GetObject",
+                "Resource": RENDERED_RESOURCE,
+            }],
+        },
+    })
+    assert stack.iam.managed_policies.keys() == {"app-read"}
+    policy_id = next(iter(template.find_resources("AWS::IAM::ManagedPolicy")))
+    outputs = {
+        output["Export"]["Name"]: output["Value"]
+        for output in template.find_outputs("*").values()
+    }
+    assert outputs == {
+        "test-iam-app-read-policy-arn": {"Ref": policy_id},
+        "test-iam-app-read-policy-name": "int-production-use1-test-app-read-policy",
+    }
+
+
+def test_policy_document_file_matches_embedded(write_env, tmp_path):
+    (tmp_path / "policies").mkdir()
+    (tmp_path / "policies" / "read.json").write_text(json.dumps(READ), encoding="utf-8")
+    embedded = {"policies": [{"name": "app-read", "document": READ}]}
+    from_file = {"policies": [{"name": "app-read", "document": "policies/read.json"}]}
+    _, expected = _props_stack(embedded, write_env=write_env)
+    _, actual = _props_stack(from_file, base_dir=tmp_path, write_env=write_env)
+    assert actual.to_json() == expected.to_json()
+
+
+def test_iam_stack_with_only_policies_or_users_is_truthy():
+    assert not IamProps()
+    assert IamProps.from_dict({"policies": [{"name": "p", "document": READ}]})
+    assert IamProps.from_dict({"users": [{"name": "u"}]})
+    assert IamProps.from_dict({"roles": [{"name": "r", "assumed_by": "ec2.amazonaws.com"}]})
+
+
+@pytest.mark.parametrize("explicit_trust", [False, True])
+def test_roles_attach_customer_managed_policies_and_new_fields(write_env, explicit_trust):
+    role = {
+        "name": "app",
+        **({"trust_policy": TRUST} if explicit_trust else {"assumed_by": "ec2.amazonaws.com"}),
+        "path": "/app/",
+        "max_session_duration": 7200,
+        "permissions_boundary": "boundary",
+        "managed_policies": ["AmazonSSMManagedInstanceCore"],
+        "customer_managed_policies": ["app-read"],
+    }
+    config = {
+        "policies": [
+            {"name": "app-read", "document": READ},
+            {"name": "boundary", "document": READ},
+        ],
+        "roles": [role],
+        "instance_profiles": [{"name": "app", "role": "app"}],
+    }
+    stack, template = _props_stack(config, write_env=write_env)
+    policies = template.find_resources("AWS::IAM::ManagedPolicy")
+    ids = {
+        resource["Properties"]["ManagedPolicyName"].split("-test-")[1]: logical_id
+        for logical_id, resource in policies.items()
+    }
+    role_id, resource = next(iter(template.find_resources("AWS::IAM::Role").items()))
+    props = resource["Properties"]
+    assert props["Path"] == "/app/"
+    assert props["MaxSessionDuration"] == 7200
+    assert props["PermissionsBoundary"] == {"Ref": ids["boundary-policy"]}
+    assert props["ManagedPolicyArns"] == [
+        {"Fn::Join": ["", [
+            "arn:", {"Ref": "AWS::Partition"}, ":iam::aws:policy/AmazonSSMManagedInstanceCore",
+        ]]},
+        {"Ref": ids["app-read-policy"]},
+    ]
+    if explicit_trust:
+        assert props["AssumeRolePolicyDocument"] == TRUST
+    # A pathed role's name is its Ref, not a segment parsed from its ARN.
+    template.has_resource_properties(
+        "AWS::IAM::InstanceProfile", {"Roles": [{"Ref": role_id}]}
+    )
+    outputs = template.find_outputs("*")
+    assert outputs["appRoleName"]["Value"] == {"Ref": role_id}
+    assert stack.iam.managed_policies.keys() == {"app-read", "boundary"}
+
+
+def test_permissions_boundary_accepts_policy_arn(write_env):
+    arn = "arn:aws:iam::111122223333:policy/Boundary"
+    _, template = _props_stack(
+        {"roles": [{
+            "name": "app", "assumed_by": "ec2.amazonaws.com", "permissions_boundary": arn,
+        }]},
+        write_env=write_env,
+    )
+    template.has_resource_properties("AWS::IAM::Role", {"PermissionsBoundary": arn})
+
+
+def test_custom_trust_role_without_path_keeps_original_template_shape(write_env):
+    config = _custom_config()
+    config["roles"][0]["max_session_duration"] = 3600
+    _, template = _props_stack(config, write_env=write_env)
+    role_id = next(iter(template.find_resources("AWS::IAM::Role")))
+    profile = next(iter(template.find_resources("AWS::IAM::InstanceProfile").values()))
+    assert json.dumps({"Fn::GetAtt": [role_id, "Arn"]}) in json.dumps(
+        profile["Properties"]["Roles"]
+    )
+    template.has_resource_properties("AWS::IAM::Role", {"MaxSessionDuration": 3600})
+
+
+def test_adding_policies_and_users_does_not_change_existing_roles():
+    environment = load_environment("dev")
+    extended = replace(
+        environment.iam,
+        policies=environment.iam.policies + IamProps.from_dict(_users_config()).policies,
+        users=IamProps.from_dict(_users_config()).users,
+    )
+    templates = []
+    for props in (environment.iam, extended):
+        stack = IamStack(
+            cdk.App(), "dev-iam", environment=environment, props=props,
+            env=cdk.Environment(account=environment.account_id, region=environment.region),
+        )
+        templates.append(Template.from_stack(stack))
+    for resource_type in ("AWS::IAM::Role", "AWS::IAM::InstanceProfile"):
+        assert templates[0].find_resources(resource_type) == templates[1].find_resources(resource_type)
+    before = templates[0].find_outputs("*")
+    after = templates[1].find_outputs("*")
+    assert {key: after[key] for key in before} == before
+
+
+def test_role_trust_and_custom_policies_render_placeholders(write_env):
+    trust = {"Statement": [{
+        "Effect": "Allow", "Action": "sts:AssumeRole",
+        "Principal": {"AWS": "arn:[[partition]]:iam::[[account_number]]:root"},
+    }]}
+    _, template = _props_stack(
+        {"roles": [{"name": "app", "trust_policy": trust, "custom_policies": {"Read": READ}}]},
+        write_env=write_env,
+    )
+    role = next(iter(template.find_resources("AWS::IAM::Role").values()))["Properties"]
+    assert role["AssumeRolePolicyDocument"]["Statement"][0]["Principal"] == {
+        "AWS": {"Fn::Join": ["", ["arn:", {"Ref": "AWS::Partition"}, ":iam::111122223333:root"]]}
+    }
+    assert role["Policies"][0]["PolicyDocument"]["Statement"][0]["Resource"] == RENDERED_RESOURCE
+    template.resource_count_is("Custom::DeployTimeLookup", 0)
+
+
+def test_sso_role_placeholders_resolve_at_deploy_time(write_env):
+    trust = {"Statement": [{
+        "Effect": "Allow", "Action": "sts:AssumeRole",
+        "Principal": {"AWS": ["[[admin_role]]", "[[network_role]]"]},
+    }]}
+    config = {
+        "roles": [
+            {"name": "a", "trust_policy": trust},
+            {"name": "b", "trust_policy": trust},
+        ],
+    }
+    _, template = _props_stack(config, write_env=write_env)
+    lookups = template.find_resources("Custom::DeployTimeLookup")
+    assert sorted(resource["Properties"]["PermissionSet"] for resource in lookups.values()) == [
+        "AdministratorAccess", "NetworkAdministrator",
+    ]
+    ids = {resource["Properties"]["PermissionSet"]: key for key, resource in lookups.items()}
+    roles = template.find_resources("AWS::IAM::Role")
+    role = next(
+        resource["Properties"] for resource in roles.values()
+        if resource["Properties"].get("RoleName", "").endswith("-a-role")
+    )
+    assert role["AssumeRolePolicyDocument"]["Statement"][0]["Principal"]["AWS"] == [
+        {"Fn::GetAtt": [ids["AdministratorAccess"], "Value"]},
+        {"Fn::GetAtt": [ids["NetworkAdministrator"], "Value"]},
+    ]
+
+
+def test_user_groups_and_policies_without_access_key(write_env):
+    stack, template = _props_stack(_users_config(), write_env=write_env)
+    template.resource_count_is("AWS::IAM::User", 1)
+    template.resource_count_is("AWS::IAM::Group", 1)
+    template.resource_count_is("AWS::IAM::ManagedPolicy", 3)
+    template.resource_count_is("AWS::IAM::AccessKey", 0)
+    template.resource_count_is("AWS::SecretsManager::Secret", 0)
+    policy_ids = {
+        resource["Properties"]["ManagedPolicyName"]: logical_id
+        for logical_id, resource in template.find_resources("AWS::IAM::ManagedPolicy").items()
+    }
+    group_id = next(iter(template.find_resources("AWS::IAM::Group")))
+    template.has_resource_properties("AWS::IAM::Group", {
+        "GroupName": "int-production-use1-test-ops-group",
+        "ManagedPolicyArns": [{"Ref": policy_ids["int-production-use1-test-ops-read-policy"]}],
+    })
+    user = next(iter(template.find_resources("AWS::IAM::User").values()))["Properties"]
+    assert user["UserName"] == "int-production-use1-test-deployer-user"
+    assert user["Path"] == "/automation/"
+    assert user["Groups"] == [{"Ref": group_id}]
+    assert user["ManagedPolicyArns"] == [
+        {"Fn::Join": ["", ["arn:", {"Ref": "AWS::Partition"}, ":iam::aws:policy/ReadOnlyAccess"]]},
+        {"Ref": policy_ids["int-production-use1-test-shared-read-policy"]},
+        {"Ref": policy_ids["int-production-use1-test-deployer-own-policy"]},
+    ]
+    tags = {tag["Key"]: tag["Value"] for tag in user["Tags"]}
+    assert tags["Name"] == user["UserName"]
+    assert tags["Compliance"] == "hippaa"
+    assert stack.iam.users.keys() == {"deployer"}
+    assert stack.iam.groups.keys() == {"ops"}
+    assert stack.iam.managed_policies.keys() == {"shared-read", "deployer-own", "ops-read"}
+    assert stack.iam.user_secrets == {}
+    assert {output["Export"]["Name"] for output in template.find_outputs("*").values()} == {
+        f"test-iam-{name}-{kind}-{attribute}"
+        for name, kind in (
+            ("shared-read", "policy"), ("deployer-own", "policy"), ("ops-read", "policy"),
+            ("ops", "group"), ("deployer", "user"),
+        )
+        for attribute in ("arn", "name")
+    }
+
+
+def test_shared_groups_are_created_once(write_env):
+    config = {"users": [
+        {"name": "a", "groups": ["ops"]},
+        {"name": "b", "groups": ["ops", "audit"]},
+    ]}
+    _, template = _props_stack(config, write_env=write_env)
+    template.resource_count_is("AWS::IAM::Group", 2)
+    groups = template.find_resources("AWS::IAM::Group")
+    assert "ManagedPolicyArns" not in next(iter(groups.values()))["Properties"]
+
+
+def test_access_key_secret_never_exposes_secret_material(write_env):
+    stack, template = _props_stack(
+        _users_config(create_access_key=True), write_env=write_env
+    )
+    template.resource_count_is("AWS::IAM::AccessKey", 1)
+    key_id = next(iter(template.find_resources("AWS::IAM::AccessKey")))
+    secrets = template.find_resources("AWS::SecretsManager::Secret")
+    assert len(secrets) == 1
+    secret_id, secret = next(iter(secrets.items()))
+    assert secret["DeletionPolicy"] == "Retain"
+    assert secret["UpdateReplacePolicy"] == "Retain"
+    props = secret["Properties"]
+    assert props["Name"] == "int-production-use1-test-deployer-credentials"
+    joined = props["SecretString"]["Fn::Join"][1]
+    assert {"Fn::GetAtt": [key_id, "SecretAccessKey"]} in joined
+    assert {"Ref": key_id} in joined
+    assert "GenerateSecretString" not in props
+    rendered = json.dumps(template.to_json())
+    # The secret access key is only ever a CloudFormation reference inside the secret.
+    assert rendered.count('"SecretAccessKey"') == 1
+    assert "SecretAccessKey" not in json.dumps(template.find_outputs("*"))
+    assert "AccessKeyId" not in json.dumps(template.find_outputs("*"))
+    outputs = template.find_outputs("*")
+    assert outputs["deployerCredentialsSecretArn"] == {
+        "Value": {"Ref": secret_id},
+        "Export": {"Name": "test-iam-deployer-user-credentials-secret-arn"},
+    }
+    assert stack.iam.user_secrets.keys() == {"deployer"}
+
+
+def test_access_key_secret_options(write_env):
+    secret_policy = {"Statement": [{
+        "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": "*",
+        "Principal": {"AWS": "arn:aws:iam::[[account_number]]:role/reader"},
+    }]}
+    _, template = _props_stack(
+        _users_config(create_access_key=True, secrets_manager={
+            "name": "deploy-keys", "description": "Deploy keys",
+            "removal_policy": "destroy", "policy": secret_policy,
+        }),
+        write_env=write_env,
+    )
+    secret_id, secret = next(iter(template.find_resources("AWS::SecretsManager::Secret").items()))
+    assert secret["DeletionPolicy"] == "Delete"
+    assert secret["Properties"]["Name"] == "int-production-use1-test-deploy-keys-credentials"
+    assert secret["Properties"]["Description"] == "Deploy keys"
+    template.has_resource_properties("AWS::SecretsManager::ResourcePolicy", {
+        "SecretId": {"Ref": secret_id},
+        "BlockPublicPolicy": True,
+        "ResourcePolicy": {"Statement": [{
+            "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": "*",
+            "Principal": {"AWS": "arn:aws:iam::111122223333:role/reader"},
+        }]},
+    })
+
+
+def test_final_user_and_policy_name_limits_are_checked(write_env):
+    environment = load_environment("test", root=write_env(NETWORK))
+    environment = replace(
+        environment, common=replace(environment.common, account_name="a" * 60)
+    )
+    for config, message in (
+        ({"users": [{"name": "u"}]}, "IAM user name .* at most 64"),
+        ({"policies": [{"name": "p" * 70, "document": READ}]}, "IAM policy name .* at most 128"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            IamStack(cdk.App(), "too-long", environment=environment, props=IamProps.from_dict(config))
+
+
+POLICY = {"name": "p", "document": READ}
+
+
+@pytest.mark.parametrize(
+    "config,message",
+    [
+        ({"policies": {}}, "iam.policies must be a list"),
+        ({"users": None}, "iam.users must be a list"),
+        ({"policies": [{"name": "p"}]}, "document is required"),
+        ({"policies": [{"name": "bad/name", "document": READ}]}, "IAM policy name"),
+        ({"policies": [{**POLICY, "typo": 1}]}, "unknown fields"),
+        ({"policies": [{**POLICY, "description": ""}]}, "description"),
+        ({"policies": [{**POLICY, "path": "app"}]}, "path"),
+        ({"policies": [{**POLICY, "path": "//"}]}, "path"),
+        ({"policies": [POLICY, {**POLICY, "name": "P"}]}, "duplicate policy"),
+        (
+            {"policies": [{"name": "p", "document": {"Statement": [{
+                "Effect": "Allow", "Action": "s3:*", "Resource": "*", "Principal": "*",
+            }]}}]},
+            "must not specify Principal",
+        ),
+        (
+            {"policies": [{"name": "p", "document": {"Statement": [{
+                "Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::[[bucket]]",
+            }]}}]},
+            "unsupported placeholders: bucket",
+        ),
+        (
+            {"roles": [{"name": "r", "assumed_by": "ec2.amazonaws.com",
+                        "customer_managed_policies": ["missing"]}]},
+            "unknown customer-managed policy 'missing'",
+        ),
+        (
+            {"roles": [{"name": "r", "assumed_by": "ec2.amazonaws.com",
+                        "permissions_boundary": "missing"}]},
+            "unknown customer-managed policy 'missing'",
+        ),
+        (
+            {"roles": [{"name": "r", "assumed_by": "ec2.amazonaws.com",
+                        "permissions_boundary": "arn:aws:s3:::bucket"}]},
+            "permissions_boundary",
+        ),
+        (
+            {"policies": [POLICY], "roles": [{"name": "r", "assumed_by": "ec2.amazonaws.com",
+                                              "customer_managed_policies": ["p", "P"]}]},
+            "duplicate customer-managed policy",
+        ),
+        ({"roles": [{"name": "r", "assumed_by": "ec2.amazonaws.com", "path": "x/"}]}, "path"),
+        (
+            {"roles": [{"name": "r", "assumed_by": "ec2.amazonaws.com",
+                        "max_session_duration": 60}]},
+            "max_session_duration",
+        ),
+        (
+            {"roles": [{"name": "r", "assumed_by": "ec2.amazonaws.com",
+                        "max_session_duration": True}]},
+            "max_session_duration",
+        ),
+        (
+            {"roles": [{"name": "r", "assumed_by": "ec2.amazonaws.com",
+                        "force_detach_policies": True}]},
+            "unknown fields",
+        ),
+        ({"users": [{}]}, "IAM user name"),
+        ({"users": ["bad"]}, "IAM user must be a mapping"),
+        ({"users": [{"name": "u", "force_destroy": True}]}, "unknown fields"),
+        ({"users": [{"name": "u", "groups": "ops"}]}, "groups must be a list"),
+        ({"users": [{"name": "u", "groups": ["ops", "OPS"]}]}, "duplicate group"),
+        ({"users": [{"name": "u", "groups": ["bad/group"]}]}, "group name"),
+        (
+            {"users": [{"name": "a", "groups": ["ops"]}, {"name": "b", "groups": ["OPS"]}]},
+            "differ only by case",
+        ),
+        ({"users": [{"name": "u"}, {"name": "U"}]}, "duplicate user"),
+        ({"users": [{"name": "u", "create_access_key": "yes"}]}, "create_access_key"),
+        ({"users": [{"name": "u", "secrets_manager": {}}]}, "requires create_access_key"),
+        (
+            {"users": [{"name": "u", "create_access_key": True,
+                        "secrets_manager": {"removal_policy": "snapshot"}}]},
+            "removal_policy",
+        ),
+        (
+            {"users": [{"name": "u", "create_access_key": True,
+                        "secrets_manager": {"recovery_window_in_days": 7}}]},
+            "unknown fields",
+        ),
+        (
+            {"users": [
+                {"name": "a", "create_access_key": True, "secrets_manager": {"name": "keys"}},
+                {"name": "b", "create_access_key": True, "secrets_manager": {"name": "keys"}},
+            ]},
+            "duplicate user credentials secret",
+        ),
+        (
+            {"users": [{"name": "u", "group_policies": [
+                {"group_name": "ops", "policy_name": "x", "document": READ},
+            ]}]},
+            "not in groups",
+        ),
+        ({"users": [{"name": "u", "group_policies": {}}]}, "group_policies must be a list"),
+        (
+            {"users": [{"name": "u", "groups": ["ops"], "group_policies": [
+                {"group_name": "ops", "policy_name": "x"},
+            ]}]},
+            "document is required",
+        ),
+        (
+            {"policies": [POLICY], "users": [{"name": "u", "policy": POLICY}]},
+            "duplicate policy",
+        ),
+        ({"users": [{"name": "u", "customer_managed_policies": ["missing"]}]}, "unknown customer-managed"),
+        ({"users": [{"name": "u", "managed_policies": ["arn:aws:iam::aws:policy/X"]}]}, "not ARNs"),
+        ({"users": [{"name": "u", "managed_policy_arns": ["bad"]}]}, "managed_policy_arns"),
+        ({"users": [{"name": "u", "notifications_email": "nope"}]}, "notifications_email"),
+        ({"users": [{"name": "u", "regions": ["Mars"]}]}, "regions"),
+        ({"users": [{"name": "u", "user_type": "admin"}]}, "user_type"),
+    ],
+)
+def test_invalid_policy_and_user_config_fails_explicitly(config, message):
+    with pytest.raises(ValueError, match=message):
+        IamProps.from_dict(config)
+
+
+@pytest.mark.parametrize(
+    "statement,message",
+    [
+        ({"Effect": "Allow", "Action": "secretsmanager:*", "Principal": "*"}, "public Principal"),
+        (
+            {"Effect": "Allow", "Action": "secretsmanager:*", "Principal": {"AWS": ["*"]}},
+            "public Principal",
+        ),
+        (
+            {"Effect": "Allow", "Action": "secretsmanager:*",
+             "NotPrincipal": {"AWS": "arn:aws:iam::111122223333:root"}},
+            "must specify Principal",
+        ),
+        ({"Effect": "Allow", "Action": "secretsmanager:*"}, "must specify Principal"),
+    ],
+)
+def test_secret_resource_policy_cannot_be_public(statement, message):
+    with pytest.raises(ValueError, match=message):
+        IamProps.from_dict({"users": [{
+            "name": "u", "create_access_key": True,
+            "secrets_manager": {"policy": {"Statement": [statement]}},
+        }]})
+
+
+def test_conditional_public_secret_policy_and_metadata_fields_are_accepted():
+    props = IamProps.from_dict({"users": [{
+        "name": "u", "create_access_key": True,
+        "description": "CI user", "notifications_email": "ops@example.com",
+        "regions": ["us-east-1"], "user_type": "service-linked",
+        "secrets_manager": {"policy": {"Statement": [{
+            "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Principal": "*",
+            "Condition": {"StringEquals": {"aws:PrincipalOrgID": "o-example"}},
+        }]}},
+    }]})
+    user = props.users[0]
+    assert user.secrets_manager.policy is not None
+    assert (user.notifications_email, user.regions, user.user_type) == (
+        "ops@example.com", ("us-east-1",), "service-linked",
+    )
+
+
+def test_policy_and_user_documents_read_relative_files(write_env, tmp_path):
+    (tmp_path / "policies").mkdir()
+    (tmp_path / "policies" / "read.yaml").write_text(yaml.safe_dump(READ), encoding="utf-8")
+    config = yaml.safe_dump({
+        "policies": [{"name": "p", "document": f"{tmp_path.name}/policies/read.yaml"}],
+        "users": [{
+            "name": "u",
+            "policy": {"name": "own", "document": f"{tmp_path.name}/policies/read.yaml"},
+        }],
+    })
+    environment = load_environment("test", root=write_env(NETWORK, iam=config))
+    assert [policy.document for policy in environment.iam.all_policies] == [READ, READ]
+
+
+def test_missing_policy_file_reports_policy_and_file(write_env, tmp_path):
+    config = yaml.safe_dump({"policies": [{"name": "p", "document": f"{tmp_path.name}/missing.yaml"}]})
+    with pytest.raises(ValueError, match="IAM policy 'p'.*missing.yaml.*cannot read"):
+        load_environment("test", root=write_env(NETWORK, iam=config))

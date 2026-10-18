@@ -68,7 +68,9 @@ def test_public_only_has_no_nat_gateways_or_eips(write_env):
 
     template.resource_count_is("AWS::EC2::NatGateway", 0)
     template.resource_count_is("AWS::EC2::EIP", 0)
-    assert set(template.find_outputs("*")) == {"VpcId", "PublicSubnetIds"}
+    assert set(template.find_outputs("*")) == {
+        "VpcId", "PublicSubnetIds", "PublicSubnetPrimaryId", "PublicSubnetSecondaryId",
+    }
 
 
 def test_public_subnets_route_to_the_internet_gateway(write_env):
@@ -94,7 +96,26 @@ def test_private_subnets_add_nat_gateways_and_eips(write_env):
         "AWS::EC2::Route",
         {"DestinationCidrBlock": "0.0.0.0/0", "NatGatewayId": Match.any_value()},
     )
-    assert set(template.find_outputs("*")) == {"VpcId", "PublicSubnetIds", "PrivateSubnetIds"}
+    assert set(template.find_outputs("*")) == {
+        "VpcId",
+        "PublicSubnetIds", "PublicSubnetPrimaryId", "PublicSubnetSecondaryId",
+        "PrivateSubnetIds", "PrivateSubnetPrimaryId", "PrivateSubnetSecondaryId",
+    }
+
+
+def test_each_subnet_id_has_a_stable_export(write_env):
+    template = _synth(write_env, WITH_PRIVATE)
+    outputs = template.find_outputs("*")
+    subnets = template.find_resources("AWS::EC2::Subnet")
+
+    for subnet_type in ("Public", "Private"):
+        for position in ("Primary", "Secondary"):
+            output = outputs[f"{subnet_type}Subnet{position}Id"]
+            assert output["Value"]["Ref"] in subnets
+            assert output["Export"]["Name"] == (
+                f"int-production-use1-uat-network-{subnet_type.lower()}-"
+                f"subnet-{position.lower()}-id"
+            )
 
 
 def test_one_nat_gateway_serves_every_private_subnet(write_env):

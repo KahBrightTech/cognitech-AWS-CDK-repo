@@ -33,6 +33,10 @@ on:
           - md-preproduction-use1-dev-network
           - md-preproduction-use1-dev-security
           - md-preproduction-use1-dev-iam
+          - md-preproduction-use1-dev-storage
+          - md-preproduction-use1-dev-key-pairs
+          - md-preproduction-use1-dev-certificates
+          - md-preproduction-use1-dev-eks
         # END generated stack options
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'

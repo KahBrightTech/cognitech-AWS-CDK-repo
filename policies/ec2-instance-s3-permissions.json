@@ -1,0 +1,28 @@
+{
+  "Statement": [
+    {
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": ["us-east-1", "us-west-2"]
+        }
+      },
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:s3:::terragruntuse1",
+        "arn:aws:s3:::terragruntuse1/*"
+      ]
+    },
+    {
+      "Action": ["s3:PutObject"],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": ["us-east-1", "us-west-2"]
+        }
+      },
+      "Effect": "Allow",
+      "Resource": ["arn:aws:s3:::terragruntuse1/logs/*"]
+    }
+  ],
+  "Version": "2012-10-17"
+}

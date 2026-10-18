@@ -73,7 +73,10 @@ def _built_stacks(env_name: str, outdir: Path) -> set[str]:
     )
     assert result.returncode == 0, result.stderr
 
-    return {p.name.removesuffix(".template.json") for p in outdir.glob("*.template.json")}
+    return {
+        p.name.removesuffix(".template.json") for p in outdir.glob("*.template.json")
+        if not p.name.endswith(".nested.template.json")  # nested stacks deploy with their parent
+    }
 
 
 def test_render_replaces_the_options_and_nothing_else():

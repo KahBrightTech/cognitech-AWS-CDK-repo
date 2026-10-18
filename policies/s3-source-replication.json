@@ -1,0 +1,73 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetReplicationConfiguration",
+        "s3:GetObjectVersionForReplication",
+        "s3:GetObjectVersionAcl",
+        "s3:GetObjectVersionTagging",
+        "s3:GetObjectRetention",
+        "s3:GetObjectLegalHold"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:s3:::int-preproduction-use1-shared-services-src-replication-bucket",
+        "arn:aws:s3:::int-preproduction-use1-shared-services-src-replication-bucket/*"
+      ]
+    },
+    {
+      "Action": [
+        "s3:ReplicateObject",
+        "s3:ReplicateDelete",
+        "s3:ReplicateTags",
+        "s3:GetObjectVersionTagging",
+        "s3:ObjectOwnerOverrideToBucketOwner"
+      ],
+      "Effect": "Allow",
+      "Condition": {
+        "StringLikeIfExists": {
+          "s3:x-amz-server-side-encryption": [
+            "aws:kms",
+            "aws:kms:dsse",
+            "AES256"
+          ]
+        }
+      },
+      "Resource": [
+        "arn:aws:s3:::mdproduction-use1-shared-services-dest-replication-bucket/*"
+      ]
+    },
+    {
+      "Action": ["kms:Decrypt"],
+      "Effect": "Allow",
+      "Condition": {
+        "StringLike": {
+          "kms:ViaService": "s3.us-east-1.amazonaws.com",
+          "kms:EncryptionContext:aws:s3:arn": [
+            "arn:aws:s3:::int-preproduction-use1-shared-services-src-replication-bucket/*"
+          ]
+        }
+      },
+      "Resource": [
+        "arn:aws:kms:us-east-1:730335294148:key/784d68ea-880c-4755-ae12-beb3037aefc2"
+      ]
+    },
+    {
+      "Action": ["kms:Encrypt"],
+      "Effect": "Allow",
+      "Condition": {
+        "StringLike": {
+          "kms:ViaService": ["s3.us-east-1.amazonaws.com"],
+          "kms:EncryptionContext:aws:s3:arn": [
+            "arn:aws:s3:::mdproduction-use1-shared-services-dest-replication-bucket/*"
+          ]
+        }
+      },
+      "Resource": [
+        "arn:aws:kms:us-east-1:485147667400:key/mrk-587301af90c9440c813284f882515d18"
+      ]
+    }
+  ]
+}

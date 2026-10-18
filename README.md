@@ -100,14 +100,20 @@ src/cognitech_cdk/
   common/
     config.py                           Common: naming + tags, mirrors the Terraform object
     environment.py                      reads deployments/<env>/env.yaml
+    schema.py                           shared YAML validators
+    documents.py                        repo-relative YAML/JSON files and [[placeholders]]
   constructs/
     network.py                          Network: VPC, IGW, subnets, NAT gateways, EIPs
     security.py                         SecurityGroups: groups and the rules between them
-    iam.py                              Iam: service roles and EC2 instance profiles
+    iam.py                              Iam: roles, policies, users and EC2 instance profiles
+    lookups.py                          deploy-time lookups (hosted zones, SSO roles)
+    <family>.py                         one module per Tenant-account family (see below)
   stacks/
+    base.py                             EnvironmentStack: tags, names and exports
     network_stack.py                    NetworkStack: tags, construct, outputs
     security_stack.py                   SecurityStack: security groups, one export per group
     iam_stack.py                        IamStack: roles, profiles, names and ARN exports
+    <family>_stack.py                   one stack per Tenant-account family (see below)
 
 deployments/
   dev/env.yaml                          one folder per environment
@@ -252,6 +258,20 @@ network:
 
 `private_subnets: true` with `nat_gateways: 0` is rejected: those subnets would
 have no route out.
+
+The network stack exports the VPC ID as `{stack_name}-vpc-id`, each subnet tier
+as a comma-separated list, and each subnet by AZ position:
+
+| Output | Export name |
+| ------ | ----------- |
+| `VpcId` | `{stack_name}-vpc-id` |
+| `PublicSubnetIds` | `{stack_name}-public-subnet-ids` |
+| `PublicSubnetPrimaryId` | `{stack_name}-public-subnet-primary-id` |
+| `PrivateSubnetIds` | `{stack_name}-private-subnet-ids` |
+| `PrivateSubnetPrimaryId` | `{stack_name}-private-subnet-primary-id` |
+
+Additional subnets use `secondary`, `tertiary` and `quaternary`. Private
+outputs exist only when `private_subnets: true`.
 
 ### Subnet CIDR ranges
 
@@ -724,6 +744,115 @@ Review the diff before deploying permission changes.
 
 See AWS's [cluster IAM role](https://docs.aws.amazon.com/eks/latest/userguide/cluster-iam-role.html)
 and [node IAM role](https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html) guidance.
+
+### Tenant-account stacks
+
+The rest of the Terraform `formations/Tenant-account` formation is ported as one
+config-driven stack per family. A stack is built only when its key is present in
+`env.yaml`, so environments opt in section by section. Each construct module's
+docstring has a complete YAML example and the validation rules.
+
+| YAML key | Stack suffix | Terraform modules | Uses |
+| --- | --- | --- | --- |
+| `transit_gateway` | `transit-gateway` | Transit-gateway, -attachments, -route-table, -association, -propagation, -routes, -subnet-route | network |
+| `s3_buckets` | `storage` | S3-Private-bucket | IAM roles (replication) |
+| `key_pairs` | `key-pairs` | EC2-key-pair | |
+| `secrets` | `secrets` | Secrets-manager | |
+| `ssm` (`parameters`, `documents`) | `ssm` | SSM-Parameter-store, SSM-Documents | secrets, buckets |
+| `certificates` | `certificates` | ACM-Public-Certs | |
+| `backups` | `backup` | AWSBackup | |
+| `load_balancing` | `load-balancing` | Load-Balancers, Target-groups, alb-listeners, alb-listener-rule, nlb-listener | network, security groups, certificates, buckets |
+| `waf` | `waf` | Waf-ipsets, WAF-rulegroup, WAF | load balancers |
+| `ecr_repositories` | `ecr` | ECR | |
+| `eks` | `eks` | Deploy-eks (cluster, nodes, access, namespaces, RBAC) | network, security groups, IAM roles |
+| `eks_addons` | nested in `eks` | Deploy-eks (add-ons, Helm controllers) | EKS clusters, certificates |
+| `ecs_clusters` | `ecs` | Deploy-ecs | network, security groups, IAM, target groups, ECR, secrets |
+| `rds_instances` | `rds` | RDS | network, security groups, secrets |
+| `opensearch_domains` | `opensearch` | AWS-OpenSearch | network, security groups |
+| `firehose_streams` | `firehose` | AWS-Firehose | buckets, OpenSearch, IAM roles |
+| `lambdas`, `lambda_invocations` | `lambda` | Lambdas/Template, Lambda-invocations | network, IAM roles, buckets |
+| `events` | `events` | Event-Bridge | Lambda functions |
+| `cognito` | `cognito` | AWS-Cognito | certificates, Lambda functions |
+
+IAM policies and users (`iam.policies`, `iam.users`) extend the existing `iam`
+stack. Stacks receive each other's resources as objects, so CDK creates the
+exports/imports and deploys producers first.
+
+**Dev mirrors Terraform md-preproduction Dev**: the `ec2`, `default` and
+`source-replication` roles/policies and `ec2` instance profile; the app, audit
+and software buckets; the `key-pair` key pair; and the `*.dev.kahbrigthllc.com`
+certificate. It also adds an EKS 1.36 cluster (`main`, one `t3.medium` node in
+public subnets, scaling to two) and its add-ons. Names keep this repo's `dev`
+segment, so nothing collides with Terraform's `development` resources in the
+same account.
+
+**EKS add-ons.** Native `AWS::EKS::Addon` resources, each configured separately:
+`vpc-cni`, `coredns`, `kube-proxy`, `eks-pod-identity-agent`, `aws-ebs-csi-driver`,
+`aws-efs-csi-driver`, `aws-fsx-csi-driver`, `aws-secrets-store-csi-driver-provider`,
+`metrics-server`, `external-dns`, `cert-manager` and
+`amazon-cloudwatch-observability`. Add-ons that call AWS get least-privilege EKS
+Pod Identity roles.
+
+Helm-based add-ons have typed settings in `eks_addons`:
+
+| Key | Chart | AWS resources created |
+| --- | --- | --- |
+| `aws_load_balancer_controller` | aws-load-balancer-controller 3.6.0 | Pod Identity role with [AWS's policy](policies/aws-load-balancer-controller-v3.6.0.json) |
+| `karpenter` | karpenter 1.15.0 (`oci://public.ecr.aws`) | controller role ([official policy](policies/karpenter-controller-v1.15.0.json)), interruption SQS queue, 5 EventBridge rules, `EC2NodeClass` + `NodePool` |
+| `argocd` | argo-cd 10.10.5 | ALB ingress; optional Identity Center SAML via Dex |
+| `nginx_ingress` | F5 NGINX Ingress Controller 2.8.0 | NLB with TLS at the load balancer |
+| `gateway_api` | NGINX Gateway Fabric 2.8.0 | Gateway API v1.6.3 CRDs from [charts/gateway-api-crds](charts/gateway-api-crds) |
+| `kubecost` | cost-analyzer 2.9.7 | optional ALB ingress |
+| `awx_operator` | awx-operator 3.2.1 | optional AWX instance with ALB ingress |
+| `storage_class` | — | default encrypted gp3 `StorageClass` |
+| `helm_charts` | any | none (generic escape hatch) |
+
+`load_balancer_defaults` sets the scheme, subnets, certificate, security groups
+and ALB group shared by those ingresses/NLBs; dev puts ArgoCD and AWX on one
+ALB. The community `ingress-nginx` project was retired in March 2026, so the
+maintained F5 NGINX Ingress Controller replaces it.
+
+Install order matters on a small node group: the core add-ons go first, then
+Karpenter and its NodePool, then every other add-on (Karpenter adds nodes for
+them). Charts that create Ingresses or LoadBalancer Services wait for the Load
+Balancer Controller's webhook.
+
+**Load balancers in dev** are created by Kubernetes (Ingress/Service objects
+through the Load Balancer Controller), not by the `load_balancing` stack. That
+stack remains available for load balancers outside the cluster.
+
+**Deliberate differences from Terraform:**
+
+- Synth needs no AWS credentials. Hosted zone IDs and SSO role ARNs
+  (`[[admin_role]]`, `[[network_role]]`) are resolved at deploy time by a small
+  read-only custom resource ([lookups.py](src/cognitech_cdk/constructs/lookups.py)).
+- Secrets, private keys and passwords never appear in templates or outputs. Key
+  pairs are generated by EC2 and copied into Secrets Manager inside AWS; RDS and
+  OpenSearch master passwords are generated by Secrets Manager.
+- Public resource policies are rejected. Terraform's
+  `secrets_manager_policy.json` (`Principal: "*"`) is not used; the key-pair
+  secret is readable only through IAM in this account.
+- Buckets block all public access and enforce TLS; stateful resources are
+  retained on stack deletion unless the YAML chooses `destroy`.
+- WAF managed rule groups use `override_action` and `managed_rule_group_name`,
+  and rule files may use the `{"rules": [...]}` shape.
+- Firehose creates a scoped delivery role when no role is given (Terraform
+  created an unused one).
+
+**Before deploying dev, note:**
+
+- The `ec2` role mirrors Terraform and attaches `AdministratorAccess`.
+- The certificate's DNS validation records are shared with any Terraform
+  certificate for the same domain; deleting the CDK stack can remove them.
+- EKS grants cluster-admin only to the deploying role. Add `access_entries` for
+  people who need `kubectl`.
+- ArgoCD SSO is off until you create an Identity Center SAML application for
+  `argocd.dev.kahbrigthllc.com` and fill in `sso_url` and `ca_pem_file`. Until
+  then, use the `argocd-initial-admin-secret` in the cluster.
+- Kubecost has no login, so dev does not expose it; use
+  `kubectl -n kubecost port-forward svc/kubecost-cost-analyzer 9090`.
+- Public ALBs/NLBs, Karpenter nodes, EKS, CloudWatch observability and Pod
+  Identity have hourly costs. Nothing is created until you deploy a stack.
 
 ## Naming convention
 

@@ -1,0 +1,14 @@
+# ArgoCD RBAC policy (policy.csv format).
+#
+# Subjects are matched against the "email" attribute sent by Identity Center,
+# so use the exact address the user signs in with - including Gmail addresses.
+# Matching is case-sensitive.
+#
+# Built-in roles: role:admin (full), role:readonly (view only).
+#
+#   g, <email>, <role>
+#   p, <email>, <resource>, <action>, <object>, allow
+#
+# Blank lines and comments are stripped before rendering.
+
+g, kbrigthain@gmail.com, role:admin

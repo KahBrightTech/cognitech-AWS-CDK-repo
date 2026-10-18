@@ -1,0 +1,321 @@
+"""EKS add-ons, Karpenter and Helm apps, built as nested stacks of the EKS stack."""
+
+import json
+
+import aws_cdk as cdk
+import pytest
+import yaml
+from aws_cdk import aws_certificatemanager as acm
+from aws_cdk import aws_ec2 as ec2
+from aws_cdk import aws_iam as iam
+from aws_cdk.assertions import Match, Template
+
+from cognitech_cdk.common.environment import load_environment
+from cognitech_cdk.constructs.eks import EksProps
+from cognitech_cdk.constructs.eks_addons import NATIVE_ADDONS, EksAddonsProps
+from cognitech_cdk.stacks.eks_stack import EksStack
+from cognitech_cdk.stacks.network_stack import NetworkStack
+
+NETWORK = "name: test\ncidr_block: 10.20.0.0/16\nazs: 2"
+EKS = """
+- name: main
+  role: eks-cluster
+  subnet_tier: public
+  node_groups:
+  - {name: general, role: eks-nodes, subnet_tier: public, instance_types: [t3.medium], min_size: 1, desired_size: 1, max_size: 2}
+"""
+ADDONS = """
+- cluster: main
+  addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  - name: eks-pod-identity-agent
+  - name: aws-ebs-csi-driver
+  - name: aws-efs-csi-driver
+  - name: aws-fsx-csi-driver
+  - name: aws-secrets-store-csi-driver-provider
+  - name: metrics-server
+  - name: external-dns
+    hosted_zone_ids: [Z0123456789ABC]
+  - name: cert-manager
+  - name: amazon-cloudwatch-observability
+    configuration_values: {containerLogs: {enabled: true}}
+  aws_load_balancer_controller: {enabled: true}
+  helm_charts:
+  - name: ingress-nginx
+    chart: ingress-nginx
+    repository: https://kubernetes.github.io/ingress-nginx
+    version: 4.11.2
+"""
+TYPED = """
+- cluster: main
+  addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  - name: eks-pod-identity-agent
+  - name: aws-ebs-csi-driver
+  aws_load_balancer_controller: {enabled: true}
+  storage_class: {name: gp3}
+  load_balancer_defaults:
+    certificate: dev
+    security_groups: [alb]
+    group_name: shared
+  karpenter:
+    node_role: eks-nodes
+    replicas: 1
+    security_groups: [alb]
+    node_pool: {instance_categories: [t, m], cpu_limit: 8}
+  argocd:
+    host: argocd.dev.example.com
+  nginx_ingress:
+  - name: public
+    replica_count: 1
+  gateway_api:
+    service: {}
+  kubecost: {}
+  awx_operator:
+    create_instance: true
+    host: awx.dev.example.com
+"""
+
+
+def _stacks(write_env, addons=ADDONS):
+    environment = load_environment("test", root=write_env(NETWORK))
+    env = cdk.Environment(account=environment.account_id, region=environment.region)
+    app = cdk.App()
+    network = NetworkStack(app, "test-network", environment=environment, env=env)
+    deps = cdk.Stack(app, "deps", env=env)
+    roles = {
+        "eks-cluster": iam.Role(deps, "Cluster", assumed_by=iam.ServicePrincipal("eks.amazonaws.com")),
+        "eks-nodes": iam.Role(deps, "Nodes", assumed_by=iam.ServicePrincipal("ec2.amazonaws.com")),
+    }
+    groups = {"alb": ec2.SecurityGroup(deps, "Alb", vpc=network.network.vpc)}
+    certificate = acm.Certificate(deps, "Cert", domain_name="*.dev.example.com")
+    groups["x"] = ec2.SecurityGroup(deps, "Sg", vpc=network.network.vpc)
+    eks_stack = EksStack(
+        app, "test-eks", environment=environment, env=env,
+        props=EksProps.from_dict(yaml.safe_load(EKS)), network=network.network,
+        security_groups=groups, roles=roles,
+        addons=EksAddonsProps.from_dict(yaml.safe_load(addons), base_dir=_repo_root()),
+        certificates={"dev": certificate},
+    )
+    return eks_stack, _addons(eks_stack)
+
+
+def _addons(eks_stack, cluster="main"):
+    """All add-on nested stacks of one cluster, read as a single template."""
+    resources = {}
+    for group, nested in eks_stack.nested_stacks[cluster].items():
+        if group in ("CoreAddons", "Karpenter", "Addons", "Apps"):
+            resources.update(Template.from_stack(nested).to_json()["Resources"])
+    return Template.from_json({"Resources": resources})
+
+
+def _nested_order(eks_stack, cluster="main"):
+    """Nested stack group -> the groups it depends on, from the parent template."""
+    template = Template.from_stack(eks_stack).to_json()["Resources"]
+    ids = {eks_stack.get_logical_id(stack.nested_stack_resource): group
+           for group, stack in eks_stack.nested_stacks[cluster].items()}
+    return {
+        ids[key]: {ids[d] for d in resource.get("DependsOn", []) if d in ids}
+        for key, resource in template.items() if key in ids
+    }
+
+
+def _repo_root():
+    from pathlib import Path
+    return Path(__file__).resolve().parents[2]
+
+
+def test_every_requested_native_addon_is_separate(write_env):
+    eks_stack, template = _stacks(write_env)
+    found = {
+        resource["Properties"]["AddonName"]
+        for resource in template.find_resources("AWS::EKS::Addon").values()
+    }
+    assert found == set(NATIVE_ADDONS)
+    Template.from_stack(eks_stack).resource_count_is("AWS::EKS::Addon", 0)
+    core = Template.from_stack(eks_stack.nested_stacks["main"]["CoreAddons"]).find_resources("AWS::EKS::Addon")
+    assert {r["Properties"]["AddonName"] for r in core.values()} == {
+        "vpc-cni", "coredns", "kube-proxy", "eks-pod-identity-agent",
+    }
+    assert _nested_order(eks_stack)["CoreAddons"] == {"NodeGroups"}
+
+
+def test_aws_addons_use_pod_identity_roles(write_env):
+    eks_stack, template = _stacks(write_env)
+    addons = {
+        resource["Properties"]["AddonName"]: resource
+        for resource in template.find_resources("AWS::EKS::Addon").values()
+    }
+    for name in ("aws-ebs-csi-driver", "external-dns", "amazon-cloudwatch-observability"):
+        association = addons[name]["Properties"]["PodIdentityAssociations"][0]
+        assert association["ServiceAccount"] == NATIVE_ADDONS[name].service_account
+    assert "PodIdentityAssociations" not in addons["cert-manager"]["Properties"]
+    assert json.loads(addons["amazon-cloudwatch-observability"]["Properties"]["ConfigurationValues"]) == {
+        "containerLogs": {"enabled": True}
+    }
+    template.has_resource_properties("AWS::IAM::Role", {
+        "AssumeRolePolicyDocument": {"Statement": [Match.object_like({
+            "Action": ["sts:AssumeRole", "sts:TagSession"],
+            "Principal": {"Service": "pods.eks.amazonaws.com"},
+        })]},
+    })
+    policies = json.dumps(template.find_resources("AWS::IAM::Policy"))
+    assert "hostedzone/Z0123456789ABC" in policies
+    # Pod Identity add-ons wait for the agent, which is in the CoreAddons stack.
+    assert "CoreAddons" in _nested_order(eks_stack)["Addons"]
+
+
+def test_load_balancer_controller_uses_helm_and_pod_identity(write_env):
+    template = _stacks(write_env)[1]
+    template.has_resource_properties("AWS::EKS::PodIdentityAssociation", {
+        "Namespace": "kube-system",
+        "ServiceAccount": "aws-load-balancer-controller",
+    })
+    charts = {
+        resource["Properties"]["Chart"]: resource["Properties"]
+        for resource in template.find_resources("Custom::AWSCDK-EKS-HelmChart").values()
+    }
+    assert charts["aws-load-balancer-controller"]["Version"] == "3.6.0"
+    assert charts["aws-load-balancer-controller"]["Repository"] == "https://aws.github.io/eks-charts"
+    assert charts["ingress-nginx"]["Version"] == "4.11.2"
+    assert "elasticloadbalancing:CreateLoadBalancer" in json.dumps(
+        template.find_resources("AWS::IAM::Policy")
+    )
+
+
+@pytest.mark.parametrize("text,message", [
+    ("- cluster: main\n  addons: [{name: aws-ebs-csi-driver}]\n", "eks-pod-identity-agent"),
+    ("- cluster: main\n  addons: [{name: karpenter}]\n", "not a supported native add-on"),
+    ("- cluster: main\n  addons: [{name: coredns, pod_identity: true}]\n", "does not use AWS credentials"),
+    ("- cluster: main\n  helm_charts: [{name: x, chart: x, repository: http://x, version: 1.0.0}]\n",
+     "https:// or oci://"),
+    ("- cluster: main\n  addons: [{name: external-dns, hosted_zone_ids: [bad]}]\n", "hosted zone"),
+])
+def test_invalid_config_is_rejected(text, message):
+    with pytest.raises(ValueError, match=message):
+        EksAddonsProps.from_dict(yaml.safe_load(text), base_dir=_repo_root())
+
+
+def test_unknown_cluster_fails(write_env):
+    with pytest.raises(ValueError, match="unknown reference 'other'"):
+        _stacks(write_env, ADDONS.replace("cluster: main", "cluster: other"))
+
+
+def test_empty_config_builds_nothing():
+    assert not EksAddonsProps.from_dict(None)
+
+
+def _charts(template):
+    return {
+        resource["Properties"].get("Release"): resource
+        for resource in template.find_resources("Custom::AWSCDK-EKS-HelmChart").values()
+    }
+
+
+def _values(chart):
+    """Chart values JSON with CloudFormation tokens replaced by '<token>'."""
+    values = chart["Properties"]["Values"]
+    if isinstance(values, str):
+        return values
+    return "".join(part if isinstance(part, str) else "<token>" for part in values["Fn::Join"][1])
+
+
+def test_karpenter_queue_rules_policy_and_ordering(write_env):
+    eks_stack, template = _stacks(write_env, TYPED)
+    template.has_resource_properties("AWS::SQS::Queue", {
+        "MessageRetentionPeriod": 300, "SqsManagedSseEnabled": True,
+    })
+    template.resource_count_is("AWS::Events::Rule", 5)
+    template.has_resource_properties("AWS::EKS::PodIdentityAssociation", {
+        "Namespace": "kube-system", "ServiceAccount": "karpenter",
+    })
+    policy = next(
+        r for r in template.find_resources("AWS::IAM::Policy").values()
+        if r["Properties"].get("PolicyName") == "KarpenterController"
+    )
+    document = json.dumps(policy["Properties"]["PolicyDocument"])
+    assert "Fn::Sub" in document and "kubernetes.io/cluster/${ClusterName}" in document
+    charts = _charts(template)
+    karpenter = charts["karpenter"]["Properties"]
+    assert karpenter["Repository"] == "oci://public.ecr.aws/karpenter/karpenter"
+    assert karpenter["Version"] == "1.15.0" and karpenter["Wait"] is True
+    manifests = json.dumps(template.find_resources("Custom::AWSCDK-EKS-KubernetesResource"))
+    assert "EC2NodeClass" in manifests and "al2023@latest" in manifests and "WhenEmptyOrUnderutilized" in manifests
+    order = _nested_order(eks_stack)
+    assert order == {
+        "NodeGroups": set(), "CoreAddons": {"NodeGroups"}, "Karpenter": {"CoreAddons"},
+        "Addons": {"CoreAddons", "Karpenter"}, "Apps": {"CoreAddons", "Karpenter", "Addons"},
+    }
+
+
+def test_argocd_alb_ingress_and_dependent_ordering(write_env):
+    eks_stack, template = _stacks(write_env, TYPED)
+    charts = _charts(template)
+    argocd = charts["argocd"]
+    values = _values(argocd)
+    for expected in (
+        '"server.insecure":true', '"hostname":"argocd.dev.example.com"',
+        '"alb.ingress.kubernetes.io/certificate-arn":"<token>"',
+        '"alb.ingress.kubernetes.io/group.name":"shared"',
+        '"alb.ingress.kubernetes.io/healthcheck-path":"/healthz"',
+        '"alb.ingress.kubernetes.io/manage-backend-security-group-rules":"true"',
+    ):
+        assert expected in values, expected
+    controller = next(k for k, r in template.find_resources("Custom::AWSCDK-EKS-HelmChart").items()
+                      if r["Properties"]["Release"] == "aws-load-balancer-controller")
+    assert controller in argocd["DependsOn"]
+    assert "dex.config" not in values
+
+
+def test_nginx_gateway_kubecost_awx_and_storage_class(write_env):
+    eks_stack, template = _stacks(write_env, TYPED)
+    charts = _charts(template)
+    nginx = charts["nginx-ingress-public"]["Properties"]
+    assert nginx["Repository"] == "oci://ghcr.io/nginx/charts/nginx-ingress"
+    nginx_values = _values(charts["nginx-ingress-public"])
+    assert "aws-load-balancer-nlb-target-type" in nginx_values and "aws-load-balancer-ssl-cert" in nginx_values
+    assert '"httpsPort":{"enable":true,"port":443,"targetPort":80}' in nginx_values
+    assert charts["gateway-api-crds"]["Properties"].get("ChartAssetURL")
+    gateway = charts["nginx-gateway-fabric"]
+    assert next(k for k, r in template.find_resources("Custom::AWSCDK-EKS-HelmChart").items()
+                if r["Properties"]["Release"] == "gateway-api-crds") in gateway["DependsOn"]
+    assert "StrategicMerge" in _values(gateway)
+    assert "ingress" not in _values(charts["kubecost"])
+    awx = _values(charts["awx-operator"])
+    assert "awx.dev.example.com" in awx and "ingress_annotations" in awx
+    manifests = json.dumps(template.find_resources("Custom::AWSCDK-EKS-KubernetesResource"))
+    assert "is-default-class" in manifests and "ebs.csi.aws.com" in manifests
+
+
+def test_argocd_sso_renders_dex_saml_connector(tmp_path):
+    from cognitech_cdk.constructs.eks_addons import ArgoCdSsoProps
+    (tmp_path / "cert.pem").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+    (tmp_path / "rbac.csv").write_text("# comment\ng, admin@example.com, role:admin\n")
+    sso = ArgoCdSsoProps.from_dict(
+        {"enabled": True, "sso_url": "https://portal.sso.us-east-1.amazonaws.com/saml/assertion/x",
+         "ca_pem_file": "cert.pem", "rbac_policies_file": "rbac.csv"},
+        "sso", base_dir=tmp_path,
+    )
+    assert sso.ca_data and sso.rbac_policies == "g, admin@example.com, role:admin"
+    with pytest.raises(ValueError, match="sso_url"):
+        ArgoCdSsoProps.from_dict({"enabled": True, "ca_pem_file": "cert.pem"}, "sso", base_dir=tmp_path)
+    (tmp_path / "key.pem").write_text("-----BEGIN CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\n")
+    with pytest.raises(ValueError, match="public certificate"):
+        ArgoCdSsoProps.from_dict({"ca_pem_file": "key.pem"}, "sso", base_dir=tmp_path)
+
+
+@pytest.mark.parametrize("text,message", [
+    ("- cluster: main\n  argocd: {host: a.example.com}\n", "aws_load_balancer_controller"),
+    ("- cluster: main\n  storage_class: {}\n", "aws-ebs-csi-driver"),
+    ("- cluster: main\n  addons: [{name: eks-pod-identity-agent}]\n  karpenter: {}\n", "node_role"),
+    ("- cluster: main\n  kubecost: {ingress: {}}\n", "ingress needs host"),
+    ("- cluster: main\n  addons: [{name: eks-pod-identity-agent}]\n  aws_load_balancer_controller: {enabled: true}\n"
+     "  nginx_ingress: [{name: a, ingress_class_name: x}, {name: b, ingress_class_name: x}]\n", "unique"),
+])
+def test_typed_addon_validation(text, message):
+    with pytest.raises(ValueError, match=message):
+        EksAddonsProps.from_dict(yaml.safe_load(text), base_dir=_repo_root())
