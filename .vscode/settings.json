@@ -18,7 +18,13 @@
 
   "files.exclude": {
     "**/__pycache__": true,
-    "**/.pytest_cache": true,
+    "**/.pytest_cache": true
+  },
+
+  // cdk.out stays browsable in the Explorer (handy for reading synthesized
+  // templates) but is kept out of search results - it is 50M+ of generated
+  // JSON and asset bundles that would swamp every hit.
+  "search.exclude": {
     "cdk.out": true
   }
 }
