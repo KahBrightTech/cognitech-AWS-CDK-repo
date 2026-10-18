@@ -10,7 +10,7 @@ workflow. The dropdown is therefore detected from `app.py`, never typed.
     python scripts/sync_stack_choices.py           # rewrite what changed
     python scripts/sync_stack_choices.py --check   # fail if anything is stale
 
-A workflow opts in by declaring the environment it deploys as a job-level
+A workflow opts in by declaring the environment it deploys as a workflow- or job-level
 `ENV:` and marking the lines this script owns:
 
         # BEGIN generated stack options -- scripts/sync_stack_choices.py
@@ -122,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
 
         env_name = environment_of(current)
         if env_name is None:
-            raise SystemExit(f"{path.name}: no job-level ENV, so the environment is unknown.")
+            raise SystemExit(f"{path.name}: no workflow- or job-level ENV, so the environment is unknown.")
 
         updated = render(current, cdk_stacks(env_name))
         if updated == current:

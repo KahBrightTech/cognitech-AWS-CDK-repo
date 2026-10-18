@@ -1135,6 +1135,55 @@ It creates:
 | -------- | ------- |
 | OIDC provider for `token.actions.githubusercontent.com` | lets GitHub tokens be exchanged for AWS credentials |
 | `github-oidc-cdk-deploy-<env>` | assumed by the deploy job; may only `sts:AssumeRole` the `cdk-hnb659fds-*` roles |
+| `github-oidc-cdk-preview-<env>` | trusted from `main` without a GitHub environment; AWS `ReadOnlyAccess` plus permission to assume only the bootstrap lookup role |
+
+### Preview and final deployment approval
+
+The deployment workflow has two jobs:
+
+1. `preview` runs tests, synth and `cdk diff --no-change-set` without an
+   environment approval. It uses `AWS_PREVIEW_ROLE_ARN`, not the deployment role.
+2. `apply` runs only for manual `deploy` or `destroy`, after preview succeeds.
+   It references the GitHub environment selected by `ENV` and applies the
+   synthesized assembly uploaded by preview, rather than synthesizing again.
+
+Configure **Settings → Environments → dev → Required reviewers** to gate the
+second job. Without required reviewers, merely referencing the environment does
+not require approval. Optionally prevent self-review and administrator bypass,
+and restrict deployment branches to `main`. Native required reviewers for
+private repositories require GitHub Enterprise; see
+[GitHub's protection-rule availability](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#required-reviewers).
+
+Set `ENV`, `AWS_ROLE_ARN`, `AWS_PREVIEW_ROLE_ARN` and `AWS_REGION` at the top of
+the deployment workflow. The YAML alias connects `ENV` to the apply job's
+GitHub environment. Re-run the role-setup script above to provision the preview
+role before using this split; the existing deployment trust remains
+environment-bound. Preview trust permits only `refs/heads/main`, so dispatches
+from other branches cannot authenticate for preview. Its AWS-managed
+`ReadOnlyAccess` is broad account read access, not a resource-scoped custom
+policy; it cannot assume deployment, publishing or execution roles.
+
+The preview artifact is retained for seven days. Approve within that period;
+if it expires, start a new run to generate and review a fresh diff.
+
+### Automatic stack-dropdown updates
+
+The sync workflow edits files under `.github/workflows`. The built-in
+`GITHUB_TOKEN` cannot push those edits, even with `contents: write`.
+
+Create a fine-grained PAT with access to **only this repository**, granting
+**Contents: read and write** and **Workflows: read and write**. Store it as
+repository Actions secret **`WORKFLOW_SYNC_TOKEN`** under
+**Settings → Secrets and variables → Actions**. The token's owner must have
+repository write access; organizational approval policies and branch rules
+still apply. Set an expiry and rotate the secret before it expires. Do not put
+the token in workflow YAML.
+
+PAT-authenticated pushes trigger other matching workflows. Sync only edits
+deploy workflow files, which are outside its own push-path filters, preventing
+a sync loop. If direct pushes to `main` are blocked, run
+`python scripts/sync_stack_choices.py` locally and submit the generated changes
+through your normal pull-request process.
 
 Verify:
 
@@ -1177,8 +1226,9 @@ the two forms, so the roles keep working before and after the switch. Pass
 This is also where **Required reviewers** live — add them on any environment
 that should pause for approval before deploying.
 
-The Environment needs no secrets. Creating it is the only GitHub configuration
-step.
+The deployment environment needs no AWS secrets because authentication uses OIDC.
+Configure its required reviewers to enforce approval on apply; separately add
+the repository secret `WORKFLOW_SYNC_TOKEN` for automatic dropdown updates.
 
 #### Step 4 — Put the IAM role ARN in the workflow
 

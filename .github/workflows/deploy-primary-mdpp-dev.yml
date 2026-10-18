@@ -1,15 +1,26 @@
 name: Deploy primary mdpp dev
+
+# Deployment settings. YAML aliases reuse the environment and config path below.
+env:
+  ENV: &deployment_environment dev
+  DEPLOYMENT_CONFIG_PATH: &deployment_config_path "deployments/dev/**"
+  AWS_ROLE_ARN: arn:aws:iam::533267408704:role/github-oidc-cdk-deploy-dev
+  AWS_PREVIEW_ROLE_ARN: arn:aws:iam::533267408704:role/github-oidc-cdk-preview-dev
+  AWS_REGION: us-east-1
+
+# When copying this workflow, also update its name, workflow-file push path, concurrency group,
+# and confirmation description, then run scripts/sync_stack_choices.py.
 on:
   push:
     branches: [main]
     paths:
-      - "deployments/dev/**" # this environment's config
-      - "policies/**" # external IAM trust and permissions documents
-      - "src/**" # shared constructs and stacks
-      - "app.py" # entrypoint
-      - "cdk.json" # feature flags
-      - "requirements*.txt" # pinned CDK version
-      - ".github/workflows/deploy-primary-mdpp-dev.yml" # this file
+      - *deployment_config_path 
+      - "policies/**"
+      - "src/**" 
+      - "app.py"
+      - "cdk.json"
+      - "requirements*.txt"
+      - ".github/workflows/deploy-primary-mdpp-dev.yml"
 
   workflow_dispatch:
     inputs:
@@ -27,7 +38,6 @@ on:
         required: false
         default: all
         type: choice
-        # BEGIN generated stack options -- scripts/sync_stack_choices.py
         options:
           - all
           - md-preproduction-use1-dev-network
@@ -36,8 +46,6 @@ on:
           - md-preproduction-use1-dev-storage
           - md-preproduction-use1-dev-key-pairs
           - md-preproduction-use1-dev-certificates
-          - md-preproduction-use1-dev-eks
-        # END generated stack options
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'
         required: false
@@ -53,18 +61,17 @@ permissions:
   contents: read
 
 jobs:
-  cdk:
-    name: "dev: ${{ inputs.action || 'diff' }} ${{ inputs.stacks || 'all' }}"
+  preview:
+    name: "Preview ${{ inputs.stacks || 'all' }}"
     runs-on: ubuntu-latest
-    environment: dev
-    env:
-      ENV: dev
+    outputs:
+      targets: ${{ steps.select.outputs.targets }}
     steps:
       # Fail before touching AWS if a destroy was not explicitly confirmed.
       - name: Check destroy confirmation
-        if: inputs.action == 'destroy' && inputs.confirm != 'dev'
+        if: inputs.action == 'destroy' && inputs.confirm != env.ENV
         run: |
-          echo "::error::Destroy requires the confirm box to contain exactly: dev"
+          echo "::error::Destroy requires the confirm box to contain exactly: $ENV"
           exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -82,12 +89,8 @@ jobs:
         run: pytest -q
       - name: Synthesize
         run: cdk synth --quiet
-
-      # Asks app.py what this environment builds, then turns the choice made in
-      # the form into arguments for the cdk commands below. The input is read
-      # from an env var, never interpolated into the script, so a crafted value
-      # cannot run as shell code.
       - name: Select stacks
+        id: select
         env:
           REQUESTED: ${{ inputs.stacks }}
         run: |
@@ -99,7 +102,7 @@ jobs:
           fi
 
           {
-            echo "### Stacks detected in \`dev\`"
+            echo "### Stacks detected in \`$ENV\`"
             echo
             printf -- '- `%s`\n' "${available[@]}"
             echo
@@ -110,6 +113,7 @@ jobs:
 
           if [ "$requested" = "all" ]; then
             echo "TARGETS=--all" >> "$GITHUB_ENV"
+            echo "targets=--all" >> "$GITHUB_OUTPUT"
             echo "SELECTED=all (${#available[@]} stack(s))" >> "$GITHUB_ENV"
             exit 0
           fi
@@ -117,6 +121,7 @@ jobs:
           for have in "${available[@]}"; do
             if [ "$have" = "$requested" ]; then
               echo "TARGETS=$requested" >> "$GITHUB_ENV"
+              echo "targets=$requested" >> "$GITHUB_OUTPUT"
               echo "SELECTED=$requested" >> "$GITHUB_ENV"
               exit 0
             fi
@@ -141,18 +146,19 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::533267408704:role/github-oidc-cdk-deploy-dev
-          aws-region: us-east-1
-          role-session-name: cdk-dev-${{ github.run_id }}
+          role-to-assume: ${{ env.AWS_PREVIEW_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cdk-${{ env.ENV }}-${{ github.run_id }}
 
-      # Always runs, whatever the action. On a push this is the whole job.
+      # Avoid change-set creation: preview cannot assume deployment roles.
       - name: Diff
         run: |
+          set -euo pipefail
           {
-            echo '### `cdk diff` — dev: '"$SELECTED"
+            echo '### `cdk diff` — '"$ENV: $SELECTED"
             echo
             echo '```'
-            cdk diff $TARGETS 2>&1 | tee /dev/stderr
+            cdk diff $TARGETS --no-change-set 2>&1 | tee /dev/stderr
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -166,10 +172,52 @@ jobs:
             echo '> `deploy` to apply it.'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Package reviewed assembly
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        run: tar -cf "$RUNNER_TEMP/cdk-assembly.tar" -C cdk.out .
+      - name: Save reviewed assembly
+        if: inputs.action == 'deploy' || inputs.action == 'destroy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reviewed-cdk-assembly
+          path: ${{ runner.temp }}/cdk-assembly.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  apply:
+    name: "${{ inputs.action }} ${{ inputs.stacks || 'all' }}"
+    needs: preview
+    if: github.event_name == 'workflow_dispatch' && (inputs.action == 'deploy' || inputs.action == 'destroy')
+    runs-on: ubuntu-latest
+    environment: *deployment_environment
+    env:
+      TARGETS: ${{ needs.preview.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install CDK
+        run: npm install -g aws-cdk@2
+      - name: Download reviewed assembly
+        uses: actions/download-artifact@v4
+        with:
+          name: reviewed-cdk-assembly
+          path: ${{ runner.temp }}/reviewed-assembly
+      - name: Extract reviewed assembly
+        run: |
+          mkdir -p cdk.out
+          tar -xf "$RUNNER_TEMP/reviewed-assembly/cdk-assembly.tar" -C cdk.out
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cdk-${{ env.ENV }}-${{ github.run_id }}
       - name: Deploy
         if: inputs.action == 'deploy'
-        run: cdk deploy $TARGETS --require-approval never --progress events
+        run: cdk deploy --app cdk.out $TARGETS --require-approval never --progress events
 
       - name: Destroy
         if: inputs.action == 'destroy'
-        run: cdk destroy $TARGETS --force
+        run: cdk destroy --app cdk.out $TARGETS --force

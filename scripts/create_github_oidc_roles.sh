@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Create the GitHub OIDC provider and the role the deploy workflow assumes.
+# Create the GitHub OIDC provider and the preview/deployment roles.
 #
 # Run with no arguments to be prompted for each value, with defaults discovered
 # from your AWS profile, the git remote and the deployments/ folder. Pass flags
@@ -27,7 +27,7 @@ usage() {
   cat <<'TXT'
 Usage: scripts/create_github_oidc_roles.sh [options]
 
-Creates the GitHub OIDC provider and the IAM role used by the deploy workflow.
+Creates the GitHub OIDC provider and preview/deployment IAM roles.
 With no options it prompts for each value, offering a discovered default.
 
 Options:
@@ -165,6 +165,7 @@ if [[ -n "$PROFILE" ]]; then AWS+=(--profile "$PROFILE"); fi
 PROVIDER_HOST="token.actions.githubusercontent.com"
 PROVIDER_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${PROVIDER_HOST}"
 DEPLOY_ROLE="github-oidc-cdk-deploy-${ENVIRONMENT}"
+PREVIEW_ROLE="github-oidc-cdk-preview-${ENVIRONMENT}"
 BOOTSTRAP_ROLES="arn:aws:iam::${ACCOUNT_ID}:role/cdk-${QUALIFIER}-*-role-${ACCOUNT_ID}-${REGION}"
 
 if [[ -z "$OWNER_ID" || -z "$REPO_ID" ]]; then
@@ -192,6 +193,7 @@ Qualifier   : ${QUALIFIER}
 Will create or update:
   OIDC provider  ${PROVIDER_HOST}
   IAM role       ${DEPLOY_ROLE}
+  IAM role       ${PREVIEW_ROLE} (read-only preview from main)
 
 SUMMARY
 
@@ -296,7 +298,39 @@ JSON
 )"
 echo "[ok]   ${DEPLOY_ROLE} may assume ${BOOTSTRAP_ROLES}"
 
+# Preview has no environment claim: only the repository's main branch is trusted.
+upsert_role "$PREVIEW_ROLE" \
+  "$(trust_policy "ref:refs/heads/main")" \
+  "GitHub Actions read-only CDK preview for ${ENVIRONMENT}"
+
+"${AWS[@]}" iam attach-role-policy --role-name "$PREVIEW_ROLE" \
+  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
+"${AWS[@]}" iam put-role-policy --role-name "$PREVIEW_ROLE" \
+  --policy-name preview-bootstrap-lookup-only \
+  --policy-document "$(cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::${ACCOUNT_ID}:role/cdk-${QUALIFIER}-lookup-role-${ACCOUNT_ID}-${REGION}"
+    },
+    {
+      "Effect": "Deny",
+      "Action": "sts:AssumeRole",
+      "NotResource": "arn:aws:iam::${ACCOUNT_ID}:role/cdk-${QUALIFIER}-lookup-role-${ACCOUNT_ID}-${REGION}"
+    }
+  ]
+}
+JSON
+)"
+echo "[ok]   ${PREVIEW_ROLE} has ReadOnlyAccess and may assume only the bootstrap lookup role."
+
 echo
-echo "Add these to GitHub:"
-echo "  Environment '${ENVIRONMENT}' secret  AWS_DEPLOY_ROLE_ARN = arn:aws:iam::${ACCOUNT_ID}:role/${DEPLOY_ROLE}"
-echo "  Repository variable                  AWS_REGION          = ${REGION}"
+echo "Set these at the top of the deployment workflow:"
+echo "  ENV                  = ${ENVIRONMENT}"
+echo "  AWS_ROLE_ARN         = arn:aws:iam::${ACCOUNT_ID}:role/${DEPLOY_ROLE}"
+echo "  AWS_PREVIEW_ROLE_ARN = arn:aws:iam::${ACCOUNT_ID}:role/${PREVIEW_ROLE}"
+echo "  AWS_REGION           = ${REGION}"
+echo "Configure required reviewers on GitHub environment '${ENVIRONMENT}' for deploy/destroy approval."
