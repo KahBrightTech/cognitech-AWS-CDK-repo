@@ -38,6 +38,7 @@ on:
         required: false
         default: all
         type: choice
+        # BEGIN generated stack options -- scripts/sync_stack_choices.py
         options:
           - all
           - md-preproduction-use1-dev-network
@@ -46,6 +47,8 @@ on:
           - md-preproduction-use1-dev-storage
           - md-preproduction-use1-dev-key-pairs
           - md-preproduction-use1-dev-certificates
+          - md-preproduction-use1-dev-eks
+        # END generated stack options
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'
         required: false
