@@ -81,7 +81,7 @@ TYPED = """
 """
 
 
-def _stacks(write_env, addons=ADDONS):
+def _stacks(write_env, addons=ADDONS, eks=EKS):
     environment = load_environment("test", root=write_env(NETWORK))
     env = cdk.Environment(account=environment.account_id, region=environment.region)
     app = cdk.App()
@@ -94,10 +94,12 @@ def _stacks(write_env, addons=ADDONS):
     groups = {"alb": ec2.SecurityGroup(deps, "Alb", vpc=network.network.vpc)}
     certificate = acm.Certificate(deps, "Cert", domain_name="*.dev.example.com")
     groups["x"] = ec2.SecurityGroup(deps, "Sg", vpc=network.network.vpc)
+    groups["eks-nodes"] = ec2.SecurityGroup(deps, "NodesSg", vpc=network.network.vpc)
     eks_stack = EksStack(
         app, "test-eks", environment=environment, env=env,
-        props=EksProps.from_dict(yaml.safe_load(EKS)), network=network.network,
+        props=EksProps.from_dict(yaml.safe_load(eks), base_dir=_repo_root()), network=network.network,
         security_groups=groups, roles=roles,
+        key_pairs={"key-pair": ec2.KeyPair.from_key_pair_name(deps, "KeyPair", "test-key-pair")},
         addons=EksAddonsProps.from_dict(yaml.safe_load(addons), base_dir=_repo_root()),
         certificates={"dev": certificate},
     )
@@ -127,6 +129,88 @@ def _nested_order(eks_stack, cluster="main"):
 def _repo_root():
     from pathlib import Path
     return Path(__file__).resolve().parents[2]
+
+
+def test_commented_dev_system_and_application_scheduling(write_env):
+    text = (_repo_root() / "deployments/dev/env.yaml").read_text()
+    active = yaml.safe_load(text)
+    assert "compute" not in active["eks"][0]
+    assert "eks_addons" not in active
+    compute_text = text.split("    # compute:\n", 1)[1].split("\n# Add-ons", 1)[0]
+    compute = yaml.safe_load(
+        "compute:\n" + "\n".join(line.removeprefix("    # ") for line in compute_text.splitlines())
+    )["compute"]
+    addons_text = text.split("# eks_addons:\n", 1)[1]
+    addons = yaml.safe_load("\n".join(line.removeprefix("# ") for line in addons_text.splitlines()))
+    eks = yaml.safe_load(EKS)
+    del eks[0]["node_groups"]
+    eks[0]["compute"] = compute
+    stack, template = _stacks(write_env, yaml.safe_dump(addons), yaml.safe_dump(eks))
+    system_selector = {"workload-type": "system"}
+    system_toleration = {
+        "key": "workload-type", "operator": "Equal", "value": "system", "effect": "NoSchedule",
+    }
+    nodes = Template.from_stack(stack.nested_stacks["main"]["NodeGroups"])
+    nodes.has_resource_properties("AWS::EKS::Nodegroup", {
+        "Labels": system_selector,
+        "Taints": [{"Key": "workload-type", "Value": "system", "Effect": "NO_SCHEDULE"}],
+    })
+    native = {
+        resource["Properties"]["AddonName"]: json.loads(resource["Properties"].get("ConfigurationValues", "{}"))
+        for resource in template.find_resources("AWS::EKS::Addon").values()
+    }
+
+    def assert_system(settings):
+        assert settings["nodeSelector"] == system_selector
+        assert system_toleration in settings["tolerations"]
+
+    for name in ("coredns", "metrics-server", "external-dns", "cert-manager"):
+        assert_system(native[name])
+    for name in ("aws-ebs-csi-driver", "aws-efs-csi-driver", "aws-fsx-csi-driver"):
+        assert_system(native[name]["controller"])
+        assert "nodeSelector" not in native[name]["node"]
+    assert native["aws-ebs-csi-driver"]["node"]["tolerateAllTaints"] is True
+    for name in ("aws-efs-csi-driver", "aws-fsx-csi-driver"):
+        assert native[name]["node"]["tolerations"] == [{"operator": "Exists"}]
+    for name in ("vpc-cni", "kube-proxy", "eks-pod-identity-agent"):
+        assert native[name] == {}
+    for component in ("cainjector", "webhook"):
+        assert_system(native["cert-manager"][component])
+    cloudwatch = native["amazon-cloudwatch-observability"]
+    for component in ("manager", "kubeStateMetrics"):
+        assert_system(cloudwatch[component])
+    assert cloudwatch["tolerations"] == [{"operator": "Exists"}]
+    assert "nodeSelector" not in cloudwatch
+    secrets = native["aws-secrets-store-csi-driver-provider"]
+    assert secrets["tolerations"] == [{"operator": "Exists"}]
+    assert secrets["secrets-store-csi-driver"]["linux"]["tolerations"] == [{"operator": "Exists"}]
+    assert "nodeSelector" not in secrets
+
+    charts = {
+        name: json.loads(_values(chart)) for name, chart in _charts(template).items()
+        if "Values" in chart["Properties"]
+    }
+    for name in ("karpenter", "aws-load-balancer-controller", "kubecost"):
+        assert_system(charts[name])
+    assert_system(charts["argocd"]["global"])
+    assert charts["argocd"]["redis-ha"]["enabled"] is False
+    assert_system(charts["nginx-ingress-public"]["controller"])
+    gateway = charts["nginx-gateway-fabric"]
+    assert_system(gateway["nginxGateway"])
+    assert_system(gateway["nginx"]["pod"])
+    assert_system(gateway["certGenerator"])
+    kubecost = charts["kubecost"]
+    for name in ("forecasting", "finopsagent", "grafana"):
+        assert_system(kubecost[name])
+    for name in ("server", "alertmanager"):
+        assert_system(kubecost["prometheus"][name])
+    for settings in (kubecost["networkCosts"], kubecost["prometheus"]["nodeExporter"]):
+        assert "nodeSelector" not in settings
+        assert settings["tolerations"] == [{"operator": "Exists"}]
+    awx = charts["awx-operator"]
+    assert_system(awx["operator-controller"]["spec"]["template"]["spec"])
+    for key in ("node_selector", "postgres_selector"):
+        assert yaml.safe_load(awx["AWX"]["spec"][key]) == {"karpenter.sh/nodepool": "default"}
 
 
 def test_every_requested_native_addon_is_separate(write_env):
@@ -224,8 +308,16 @@ def _values(chart):
     return "".join(part if isinstance(part, str) else "<token>" for part in values["Fn::Join"][1])
 
 
-def test_karpenter_queue_rules_policy_and_ordering(write_env):
-    eks_stack, template = _stacks(write_env, TYPED)
+@pytest.mark.parametrize("nested_compute", [False, True])
+def test_karpenter_queue_rules_policy_and_ordering(write_env, nested_compute):
+    addons = yaml.safe_load(TYPED)
+    eks = yaml.safe_load(EKS)
+    if nested_compute:
+        eks[0]["compute"] = {
+            "node_groups": eks[0].pop("node_groups"),
+            "karpenter": addons[0].pop("karpenter"),
+        }
+    eks_stack, template = _stacks(write_env, yaml.safe_dump(addons), yaml.safe_dump(eks))
     template.has_resource_properties("AWS::SQS::Queue", {
         "MessageRetentionPeriod": 300, "SqsManagedSseEnabled": True,
     })
@@ -250,6 +342,20 @@ def test_karpenter_queue_rules_policy_and_ordering(write_env):
         "NodeGroups": set(), "CoreAddons": {"NodeGroups"}, "Karpenter": {"CoreAddons"},
         "Addons": {"CoreAddons", "Karpenter"}, "Apps": {"CoreAddons", "Karpenter", "Addons"},
     }
+
+
+def test_duplicate_karpenter_configuration_is_rejected(write_env):
+    eks = yaml.safe_load(EKS)
+    eks[0]["compute"] = {"karpenter": yaml.safe_load(TYPED)[0]["karpenter"]}
+    with pytest.raises(ValueError, match="configure karpenter under compute or eks_addons, not both"):
+        _stacks(write_env, TYPED, yaml.safe_dump(eks))
+
+
+def test_compute_karpenter_requires_pod_identity_agent(write_env):
+    eks = yaml.safe_load(EKS)
+    eks[0]["compute"] = {"karpenter": yaml.safe_load(TYPED)[0]["karpenter"]}
+    with pytest.raises(ValueError, match="eks-pod-identity-agent"):
+        _stacks(write_env, "- cluster: main", yaml.safe_dump(eks))
 
 
 def test_argocd_alb_ingress_and_dependent_ordering(write_env):

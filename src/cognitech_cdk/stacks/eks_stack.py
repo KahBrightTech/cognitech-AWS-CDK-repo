@@ -9,6 +9,7 @@ back as one CloudFormation stack.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Mapping
 
 import aws_cdk as cdk
@@ -21,7 +22,7 @@ from constructs import Construct
 
 from cognitech_cdk.common.environment import Environment
 from cognitech_cdk.constructs.eks import EksCluster, EksProps, construct_id
-from cognitech_cdk.constructs.eks_addons import EksAddonsProps
+from cognitech_cdk.constructs.eks_addons import ClusterAddonsProps, EksAddonsProps
 from cognitech_cdk.constructs.network import Network
 from cognitech_cdk.stacks.base import EnvironmentStack
 from cognitech_cdk.stacks.eks_addons import EksAddons
@@ -75,7 +76,20 @@ class EksStack(EnvironmentStack):
                     f"eks_addons cluster: unknown reference '{cluster_addons.cluster}'. "
                     f"Configured: {', '.join(sorted(known)) or 'none'}."
                 )
-        by_cluster = {item.cluster: item for item in (addons.clusters if addons else ()) if item}
+        by_cluster = {item.cluster: item for item in (addons.clusters if addons is not None else ())}
+        for cluster_props in props.clusters:
+            if cluster_props.karpenter is None:
+                continue
+            cluster_addons = by_cluster.get(cluster_props.name, ClusterAddonsProps(cluster=cluster_props.name))
+            if cluster_addons.karpenter is not None:
+                raise ValueError(
+                    f"EKS cluster '{cluster_props.name}': configure karpenter under compute "
+                    "or eks_addons, not both."
+                )
+            cluster_addons = replace(cluster_addons, karpenter=cluster_props.karpenter)
+            cluster_addons.validate()
+            if cluster_addons:
+                by_cluster[cluster_props.name] = cluster_addons
 
         for cluster_props in props.clusters:
             name = cluster_props.name
@@ -110,7 +124,7 @@ class EksStack(EnvironmentStack):
             self.access_entries[name] = built.access_entries
             self._outputs(name, built)
 
-            if name in by_cluster:
+            if by_cluster.get(name):
                 self.addons[name] = EksAddons(
                     self,
                     props=by_cluster[name],

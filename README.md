@@ -745,6 +745,138 @@ Review the diff before deploying permission changes.
 See AWS's [cluster IAM role](https://docs.aws.amazon.com/eks/latest/userguide/cluster-iam-role.html)
 and [node IAM role](https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html) guidance.
 
+### EKS compute configuration
+
+Group worker capacity under `eks[].compute`. This is a YAML configuration block,
+not a separate stack:
+
+```yaml
+eks:
+- name: main
+  role: eks-cluster
+  subnet_tier: public
+  compute:
+    launch_templates:
+    - name: general
+      security_groups: [eks-nodes]
+      volume_size: 20
+      volume_type: gp3
+    node_groups:
+    - name: general
+      role: eks-nodes
+      launch_template: general
+      subnet_tier: public
+      instance_types: [t3.medium]
+      min_size: 1
+      desired_size: 1
+      max_size: 2
+      labels: {workload-type: system}
+      taints:
+      - {key: workload-type, value: system, effect: NO_SCHEDULE}
+    karpenter:
+      node_role: eks-nodes
+      replicas: 1
+      subnet_tier: public
+      security_groups: [eks-nodes]
+      values:
+        nodeSelector: {workload-type: system}
+        tolerations:
+        - {key: workload-type, operator: Equal, value: system, effect: NoSchedule}
+      node_pool:
+        instance_categories: [t, m, c]
+        capacity_types: [on-demand]
+        cpu_limit: 8
+
+eks_addons:
+- cluster: main
+  addons:
+  - name: eks-pod-identity-agent
+```
+
+Karpenter still uses the existing `Karpenter` nested stack and requires the Pod
+Identity agent in `eks_addons`. Its controller also needs schedulable worker
+capacity. A node-group taint such as the example above needs matching tolerations
+on workloads intended to use those nodes; Karpenter controller tolerations can be
+set through `compute.karpenter.values` using the chart's settings.
+
+Launch templates and managed node groups remain in the `NodeGroups` nested
+stack. The node group's `launch_template` references a template's `name`;
+alternatively, the existing `launch_template_id` / `launch_template_version`
+settings select an externally managed template. If neither is supplied, EKS
+generates its own launch template. Do not set `instance_type` in the template
+and `instance_types` in the node group at the same time.
+
+Existing `eks[].node_groups`, `eks[].launch_templates` and
+`eks_addons[].karpenter` configurations remain supported. Moving them under
+`compute` preserves resource scopes and logical IDs. Do not define the same
+compute setting in both locations; conflicting definitions are rejected.
+Fargate profiles are not implemented yet; unsupported compute keys fail validation.
+
+The dev configuration includes commented compute examples and remains
+control-plane-only until they are enabled. Resource settings and policy paths
+in the example above assume matching IAM roles and security groups already exist.
+
+#### System controllers versus application nodes
+
+The commented dev examples reserve the managed node group for system workloads
+using the label `workload-type: system` and taint
+`workload-type=system:NoSchedule`. Controllers select that label and tolerate
+the taint. The node-group API uses `NO_SCHEDULE`, while pod tolerations use
+`NoSchedule`. A toleration permits a pod to run on those nodes; it does not
+select them. The selector supplies that requirement.
+
+| Placement | Components |
+| --- | --- |
+| Managed system nodes | CoreDNS, metrics-server, external-dns, cert-manager controller/CA injector/webhook, CSI controllers, CloudWatch operator/kube-state-metrics, Load Balancer Controller, Karpenter controller |
+| Managed system nodes | Argo CD (non-HA example), NGINX ingress and Gateway Fabric control/data planes and certificate job, Kubecost services, AWX operator |
+| Both eligible node types | VPC CNI, kube-proxy, Pod Identity agent, CSI node plugins, Secrets Store CSI driver/provider, CloudWatch/Fluent Bit and other enabled node-level collectors, Kubecost network costs/node-exporter if enabled |
+| Karpenter nodes | Application pods, including AWX web/task/migration and its managed Postgres database |
+
+Do not apply a system-only selector to a node-wide DaemonSet: application nodes
+also need networking, identity, volume mounts, and monitoring. Retain existing
+OS, hardware, and compute-type restrictions; "both node types" does not mean
+installing every agent on incompatible nodes. The dev examples preserve native
+DaemonSet defaults where appropriate and use broad taint tolerations on node
+plugins that need them. Custom taints added later require another review.
+
+Managed EKS add-ons take component-specific `configuration_values`; Helm charts
+take chart-specific `values`. Toleration arrays replace, rather than append to,
+defaults. The examples keep critical default tolerations where applicable.
+Argo CD uses `global` placement for the non-HA installation; enabling Redis HA
+requires separate Redis/HAProxy placement and adequate system-node capacity.
+The AWX chart uses `operator-controller.spec.template.spec` for the operator,
+but `AWX.spec.node_selector` and `postgres_selector` are YAML **strings** for
+the operator-managed application pods.
+
+Applications can target the existing Karpenter NodePool without a custom label:
+
+```yaml
+# In a Deployment's spec.template.spec:
+nodeSelector:
+  karpenter.sh/nodepool: default
+```
+
+Do not give applications the system toleration unless they intentionally need
+system-node access. Argo CD placement affects its own controllers, not the
+applications it deploys; those applications need their own scheduling settings.
+Likewise, AWX execution pods created separately through Kubernetes container
+groups require scheduling settings in their own pod specifications.
+
+All dev compute and add-on scheduling examples remain commented out. Size the
+system node group for the enabled controllers before rollout: the sample single
+`t3.medium` is not a capacity guarantee for this full set of add-ons. Provision
+system nodes and core networking/DNS/Pod Identity before expecting Karpenter
+to provision application nodes. Adding a `NoSchedule` taint does not evict
+already-running pods.
+
+Scheduling fields were checked against AWS's Kubernetes 1.36 managed add-on
+configuration schemas and the referenced chart versions. Native add-on schemas
+are version-dependent; verify the chosen version with
+`aws eks describe-addon-configuration` before enabling or upgrading.
+The Terraform guide's general label/taint examples do not supply this full
+controller/DaemonSet split; copying its older add-on versions or using one
+blanket selector is not sufficient.
+
 ### Tenant-account stacks
 
 The rest of the Terraform `formations/Tenant-account` formation is ported as one

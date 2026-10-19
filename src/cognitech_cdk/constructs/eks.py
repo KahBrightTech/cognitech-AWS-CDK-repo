@@ -1,8 +1,8 @@
 """EKS clusters, managed node groups and in-cluster access, built from YAML.
 
 Mirrors the cluster half of the Terraform `Deploy-eks` module (the `eks`
-formation variable without its `addons`, `ingress` and Helm-based `compute`
-features, which live in `eks_addons`):
+formation variable. Compute configuration also accepts Karpenter, which is
+deployed through the existing add-on constructs):
 
     eks:
       - name: main                       # cluster key used by other stacks
@@ -18,8 +18,20 @@ features, which live in `eks_addons`):
           admin:
             principal_arns: [arn:aws:iam::111122223333:role/admin]
             policy_arns: [AmazonEKSClusterAdminPolicy]
-        # launch_templates and node_groups are optional. Omit both for a
-        # control-plane-only cluster (subnets + security groups, no workers).
+        # Omit compute for a control-plane-only cluster.
+        compute:
+          launch_templates:
+            - name: general
+              volume_size: 20
+          node_groups:
+            - name: general
+              role: eks-nodes
+              launch_template: general
+              instance_types: [t3.medium]
+              min_size: 1
+              desired_size: 1
+              max_size: 2
+          # karpenter: {...}  # requires eks-pod-identity-agent in eks_addons
         namespaces:
           - name: team-a
             resource_quota: {hard: {pods: "50"}}
@@ -61,6 +73,7 @@ from cognitech_cdk.common.schema import (
     string_map,
     strings,
 )
+from cognitech_cdk.constructs.eks_addons import KarpenterProps
 from cognitech_cdk.constructs.network import Network
 
 DEFAULT_VERSION = "1.36"
@@ -711,6 +724,7 @@ class EksClusterProps:
     access_entries: tuple[AccessEntryProps, ...] = ()
     launch_templates: tuple[LaunchTemplateProps, ...] = ()
     node_groups: tuple[NodeGroupProps, ...] = ()
+    karpenter: KarpenterProps | None = None
     namespaces: tuple[NamespaceProps, ...] = ()
     rbac: RbacProps = RbacProps()
     service_accounts: tuple[ServiceAccountProps, ...] = ()
@@ -734,10 +748,17 @@ class EksClusterProps:
             "bootstrap_self_managed_addons", "logging", "service_ipv4_cidr",
             "secrets_encryption_key_arn", "kubectl", "oidc_provider", "removal_policy",
             "tags", "access_entries", "launch_templates", "node_groups", "namespaces",
-            "rbac", "service_accounts", "pod_identity_associations",
+            "rbac", "service_accounts", "pod_identity_associations", "compute",
         }, required=("name",))
         cluster = name(data["name"], "EKS cluster name")
         label = f"EKS cluster '{cluster}'"
+        compute = mapping(
+            data.get("compute", {}), f"{label}: compute",
+            {"launch_templates", "node_groups", "karpenter"},
+        )
+        for key in ("launch_templates", "node_groups"):
+            if key in data and key in compute:
+                raise ValueError(f"{label}: configure {key} directly or under compute, not both.")
         role, role_arn = parse_role(data, label)
         groups = strings(data.get("security_groups"), f"{label}: security_groups")
         for group in groups:
@@ -813,13 +834,14 @@ class EksClusterProps:
             tags=string_map(data.get("tags"), f"{label}: tags"),
             access_entries=access_entries,
             launch_templates=items(
-                data.get("launch_templates"), f"{label}: launch_templates",
+                compute.get("launch_templates", data.get("launch_templates")), f"{label}: launch_templates",
                 lambda item: LaunchTemplateProps.from_dict(item, cluster, base_dir=base_dir),
             ),
             node_groups=items(
-                data.get("node_groups"), f"{label}: node_groups",
+                compute.get("node_groups", data.get("node_groups")), f"{label}: node_groups",
                 lambda item: NodeGroupProps.from_dict(item, cluster),
             ),
+            karpenter=KarpenterProps.from_dict(compute.get("karpenter"), cluster, base_dir=base_dir),
             namespaces=items(
                 data.get("namespaces"), f"{label}: namespaces",
                 lambda item: NamespaceProps.from_dict(item, cluster, base_dir=base_dir),

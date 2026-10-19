@@ -746,6 +746,12 @@ class ClusterAddonsProps:
                 version="3.2.1", namespace="awx", release="awx-operator", base_dir=base_dir, instance=True,
             ),
         )
+        props.validate()
+        return props
+
+    def validate(self) -> None:
+        props = self
+        cluster = self.cluster
         label = f"EKS add-ons '{cluster}'"
         names = {addon.name for addon in props.addons}
         if props.needs_pod_identity_agent and POD_IDENTITY_AGENT not in names:
@@ -765,8 +771,6 @@ class ClusterAddonsProps:
         releases += [(chart.namespace, chart.release) for chart in props.charts]
         if len(releases) != len(set(releases)):
             raise ValueError(f"{label}: duplicate Helm release in a namespace.")
-        return props
-
 
 
 @dataclass(frozen=True)

@@ -83,6 +83,53 @@ def test_direct_cluster_props_default_to_destroy():
     assert EksClusterProps(name="main").removal_policy == "destroy"
 
 
+@pytest.mark.parametrize("nested_compute", [False, True])
+def test_compute_launch_template_and_node_group(write_env, nested_compute):
+    raw = yaml.safe_load(EKS)
+    cluster = raw[0]
+    compute = {
+        "launch_templates": [{
+            "name": "general", "volume_size": 40, "security_groups": ["eks-cluster"],
+        }],
+        "node_groups": cluster.pop("node_groups"),
+    }
+    compute["node_groups"][0]["launch_template"] = "general"
+    compute["node_groups"][0]["taints"] = [{
+        "key": "dedicated", "value": "apps", "effect": "NO_SCHEDULE",
+    }]
+    if nested_compute:
+        cluster["compute"] = compute
+    else:
+        cluster.update(compute)
+    stack = _stack(write_env, yaml.safe_dump(raw))
+    nodes = Template.from_stack(stack.nested_stacks["main"]["NodeGroups"])
+    nodes.resource_count_is("AWS::EC2::LaunchTemplate", 1)
+    nodes.has_resource_properties("AWS::EC2::LaunchTemplate", {
+        "LaunchTemplateData": Match.object_like({
+            "BlockDeviceMappings": Match.array_with([Match.object_like({
+                "Ebs": Match.object_like({"VolumeSize": 40}),
+            })]),
+        }),
+    })
+    nodes.has_resource_properties("AWS::EKS::Nodegroup", {
+        "LaunchTemplate": {"Id": Match.any_value(), "Version": Match.any_value()},
+        "Labels": {"workload": "general"},
+        "Taints": [{"Key": "dedicated", "Value": "apps", "Effect": "NO_SCHEDULE"}],
+    })
+
+
+@pytest.mark.parametrize("key", ["node_groups", "launch_templates"])
+def test_duplicate_compute_configuration_is_rejected(key):
+    with pytest.raises(ValueError, match=f"configure {key} directly or under compute, not both"):
+        EksProps.from_dict([{"name": "main", key: [], "compute": {key: []}}])
+
+
+@pytest.mark.parametrize("compute", [None, [], {"fargate": {}}])
+def test_invalid_compute_configuration_is_rejected(compute):
+    with pytest.raises(ValueError, match="compute"):
+        EksProps.from_dict([{"name": "main", "compute": compute}])
+
+
 @pytest.mark.parametrize("kubernetes_groups", [None, ["cognitech-viewers"]])
 def test_node_group_and_access_entry_are_nested(write_env, kubernetes_groups):
     text = EKS
