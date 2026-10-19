@@ -69,6 +69,96 @@ def test_defaults_to_dev_when_nothing_is_set(tmp_path):
     assert _stacks(tmp_path) == _expected_stacks("dev")
 
 
+def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
+    result = _run(tmp_path, context="dev")
+    assert result.returncode == 0, result.stderr
+    resources = [
+        resource
+        for path in tmp_path.glob("*.template.json")
+        for resource in json.loads(path.read_text())["Resources"].values()
+    ]
+    entries = [
+        resource["Properties"] for resource in resources
+        if resource["Type"] == "AWS::EKS::AccessEntry"
+    ]
+    sso_prefix = "arn:aws:iam::271457809232:role/aws-reserved/sso.amazonaws.com/"
+    sso_entries = {
+        entry["PrincipalArn"].removeprefix(sso_prefix): entry
+        for entry in entries
+        if isinstance(entry["PrincipalArn"], str)
+        and entry["PrincipalArn"].startswith(sso_prefix)
+    }
+    assert set(sso_entries) == {
+        "AWSReservedSSO_AdministratorAccess_7f215b32fef26e47",
+        "AWSReservedSSO_SystemAdministrator_7845d1ed8dcf680a",
+        "AWSReservedSSO_ReadOnlyAccess_d2947b3732f4ad12",
+        "AWSReservedSSO_NetworkAdministrator_b9b78eb5953b12dd",
+    }
+    for role in (
+        "AWSReservedSSO_AdministratorAccess_7f215b32fef26e47",
+        "AWSReservedSSO_SystemAdministrator_7845d1ed8dcf680a",
+        "AWSReservedSSO_NetworkAdministrator_b9b78eb5953b12dd",
+    ):
+        entry = sso_entries[role]
+        policy = "AmazonEKSViewPolicy" if "NetworkAdministrator" in role else "AmazonEKSClusterAdminPolicy"
+        assert entry["AccessPolicies"] == [{
+            "PolicyArn": f"arn:aws:eks::aws:cluster-access-policy/{policy}",
+            "AccessScope": {"Type": "cluster"},
+        }]
+        if "NetworkAdministrator" in role:
+            assert entry["KubernetesGroups"] == ["cognitech-viewers"]
+        else:
+            assert not entry.get("KubernetesGroups")
+    readonly_entries = [
+        entry for entry in entries
+        if entry.get("KubernetesGroups") == ["cognitech-viewers", "infogrid"]
+    ]
+    assert len(readonly_entries) == 3
+    assert sso_entries["AWSReservedSSO_ReadOnlyAccess_d2947b3732f4ad12"] in readonly_entries
+    assert all(not entry.get("AccessPolicies") for entry in readonly_entries)
+    assert all(entry["Type"] == "STANDARD" for entry in readonly_entries)
+
+    objects = [
+        obj
+        for resource in resources
+        if resource["Type"] == "Custom::AWSCDK-EKS-KubernetesResource"
+        for obj in json.loads(resource["Properties"]["Manifest"])
+    ]
+    view_binding = next(
+        obj for obj in objects
+        if obj["kind"] == "ClusterRoleBinding" and obj["metadata"]["name"] == "view-binding"
+    )
+    assert view_binding["roleRef"]["name"] == "cognitech-view"
+    assert view_binding["subjects"] == [{
+        "kind": "Group", "name": "cognitech-viewers",
+        "apiGroup": "rbac.authorization.k8s.io",
+    }]
+    namespaces = {
+        obj["metadata"]["name"]: obj["metadata"]["labels"]
+        for obj in objects if obj["kind"] == "Namespace"
+    }
+    expected_namespaces = {
+        "infogrid": {"team": "infogrid-devops"},
+        "movienight": {"app": "movienight"},
+        "healthpath": {"app": "healthpath"},
+        "pulsehub": {"app": "pulsehub"},
+    }
+    assert namespaces.keys() == expected_namespaces.keys()
+    for namespace, labels in expected_namespaces.items():
+        assert labels.items() <= namespaces[namespace].items()
+    quotas = [obj for obj in objects if obj["kind"] == "ResourceQuota"]
+    assert len(quotas) == 1
+    quota = quotas[0]
+    assert quota["apiVersion"] == "v1"
+    assert quota["metadata"]["name"] == "healthpath-quota"
+    assert quota["metadata"]["namespace"] == "healthpath"
+    assert quota["metadata"]["labels"]["app"] == "healthpath"
+    assert quota["spec"] == {"hard": {
+        "requests.cpu": "4", "requests.memory": "8Gi",
+        "limits.cpu": "8", "limits.memory": "16Gi", "pods": "20",
+    }}
+
+
 def test_env_variable_selects_the_environment(tmp_path):
     result = _run(tmp_path, env_var="prod")
 

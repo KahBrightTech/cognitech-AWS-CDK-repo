@@ -834,6 +834,10 @@ stack remains available for load balancers outside the cluster.
   secret is readable only through IAM in this account.
 - Buckets block all public access and enforce TLS; stateful resources are
   retained on stack deletion unless the YAML chooses `destroy`.
+- EKS clusters are an exception: `removal_policy` defaults to `destroy`, so
+  deleting their stack also deletes the cluster. Explicit `retain` remains
+  available when needed. Deploy a policy change before destroying an existing
+  stack; local changes cannot alter a deletion already in progress.
 - WAF managed rule groups use `override_action` and `managed_rule_group_name`,
   and rule files may use the `{"rules": [...]}` shape.
 - Firehose creates a scoped delivery role when no role is given (Terraform

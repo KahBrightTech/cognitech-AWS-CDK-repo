@@ -8,7 +8,7 @@ from aws_cdk import aws_iam as iam
 from aws_cdk.assertions import Match, Template
 
 from cognitech_cdk.common.environment import load_environment
-from cognitech_cdk.constructs.eks import EksProps
+from cognitech_cdk.constructs.eks import EksClusterProps, EksProps
 from cognitech_cdk.stacks.eks_stack import EksStack
 from cognitech_cdk.stacks.network_stack import NetworkStack
 
@@ -65,6 +65,22 @@ def test_cluster_uses_configured_role_subnets_and_version(write_env):
     }))
     cluster = next(iter(template.find_resources("AWS::EKS::Cluster").values()))["Properties"]
     assert sorted(item["Type"] for item in cluster["Logging"]["ClusterLogging"]["EnabledTypes"]) == ["api", "audit"]
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [(None, "Delete"), ("destroy", "Delete"), ("retain", "Retain")],
+)
+def test_cluster_removal_policy(write_env, policy, expected):
+    text = EKS if policy is None else EKS + f"  removal_policy: {policy}\n"
+    template = Template.from_stack(_stack(write_env, text))
+    cluster = next(iter(template.find_resources("AWS::EKS::Cluster").values()))
+    assert cluster["DeletionPolicy"] == expected
+    assert cluster["UpdateReplacePolicy"] == expected
+
+
+def test_direct_cluster_props_default_to_destroy():
+    assert EksClusterProps(name="main").removal_policy == "destroy"
 
 
 def test_node_group_and_access_entry_are_nested(write_env):

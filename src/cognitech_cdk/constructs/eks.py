@@ -706,7 +706,7 @@ class EksClusterProps:
     secrets_encryption_key_arn: str | None = None
     kubectl: bool = True
     oidc_provider: bool = False
-    removal_policy: str = "retain"
+    removal_policy: str = "destroy"
     tags: Mapping[str, str] = field(default_factory=dict)
     access_entries: tuple[AccessEntryProps, ...] = ()
     launch_templates: tuple[LaunchTemplateProps, ...] = ()
@@ -771,7 +771,7 @@ class EksClusterProps:
                 raise ValueError(f"{label}: service_ipv4_cidr is not a valid CIDR.") from None
             if block.version != 4 or not 12 <= block.prefixlen <= 24 or not block.is_private:
                 raise ValueError(f"{label}: service_ipv4_cidr must be a private IPv4 /12-/24 block.")
-        removal = string(data.get("removal_policy"), f"{label}: removal_policy", default="retain")
+        removal = string(data.get("removal_policy"), f"{label}: removal_policy", default="destroy")
         if removal not in REMOVAL_POLICIES:
             raise ValueError(f"{label}: removal_policy must be retain or destroy.")
         raw_entries = data.get("access_entries")
