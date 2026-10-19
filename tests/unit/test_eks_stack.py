@@ -83,8 +83,16 @@ def test_direct_cluster_props_default_to_destroy():
     assert EksClusterProps(name="main").removal_policy == "destroy"
 
 
-def test_node_group_and_access_entry_are_nested(write_env):
-    stack = _stack(write_env)
+@pytest.mark.parametrize("kubernetes_groups", [None, ["cognitech-viewers"]])
+def test_node_group_and_access_entry_are_nested(write_env, kubernetes_groups):
+    text = EKS
+    if kubernetes_groups is not None:
+        text = text.replace(
+            "      policy_arns: [AmazonEKSClusterAdminPolicy]",
+            "      policy_arns: [AmazonEKSClusterAdminPolicy]\n"
+            f"      kubernetes_groups: {kubernetes_groups}",
+        )
+    stack = _stack(write_env, text)
     nested = stack.nested_stacks["main"]
     assert set(nested) == {"Access", "NodeGroups"}
     parent = Template.from_stack(stack)
@@ -108,6 +116,11 @@ def test_node_group_and_access_entry_are_nested(write_env):
             ])]},
         })],
     }))
+    entry = next(iter(access.find_resources("AWS::EKS::AccessEntry").values()))["Properties"]
+    if kubernetes_groups is None:
+        assert "KubernetesGroups" not in entry
+    else:
+        assert entry["KubernetesGroups"] == kubernetes_groups
     outputs = set(parent.find_outputs("*"))
     assert {"MainClusterName", "MainClusterArn", "MainGeneralNodeGroupName"} <= outputs
 

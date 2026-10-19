@@ -70,6 +70,12 @@ def test_defaults_to_dev_when_nothing_is_set(tmp_path):
 
 
 def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
+    configured_groups = {
+        principal: list(entry.kubernetes_groups)
+        for cluster in load_environment("dev").eks.clusters
+        for entry in cluster.access_entries
+        for principal in entry.principal_arns
+    }
     result = _run(tmp_path, context="dev")
     assert result.returncode == 0, result.stderr
     resources = [
@@ -105,10 +111,7 @@ def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
             "PolicyArn": f"arn:aws:eks::aws:cluster-access-policy/{policy}",
             "AccessScope": {"Type": "cluster"},
         }]
-        if "NetworkAdministrator" in role:
-            assert entry["KubernetesGroups"] == ["cognitech-viewers"]
-        else:
-            assert not entry.get("KubernetesGroups")
+        assert entry.get("KubernetesGroups", []) == configured_groups[entry["PrincipalArn"]]
     readonly_entries = [
         entry for entry in entries
         if entry.get("KubernetesGroups") == ["cognitech-viewers", "infogrid"]
