@@ -1044,7 +1044,11 @@ DaemonSet defaults where appropriate and use broad taint tolerations on node
 plugins that need them. Custom taints added later require another review.
 
 Managed EKS add-ons take component-specific `configuration_values`; Helm charts
-take chart-specific `values`. Toleration arrays replace, rather than append to,
+take chart-specific `values`. In particular, `aws_load_balancer_controller` is a
+sibling of `addons` under the cluster's `eks_addons` entry, not a `- name:` item
+inside the native add-on list. Its `enabled`, `chart_version`, and `values` fields
+belong under that sibling key.
+Toleration arrays replace, rather than append to,
 defaults. The dev configuration explicitly tolerates the system taint for
 controllers and all taints for the Pod Identity Agent; other retained tolerations
 are component-specific.

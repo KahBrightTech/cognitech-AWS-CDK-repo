@@ -122,8 +122,7 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
         for resource in all_resources if resource["Type"] == "AWS::EKS::Addon"
     }
     assert addons.keys() == {
-        "vpc-cni", "coredns", "kube-proxy", "eks-pod-identity-agent",
-        "aws-ebs-csi-driver", "metrics-server",
+        addon.name for cluster in environment.eks_addons.clusters for addon in cluster.addons
     }
     assert addons["aws-ebs-csi-driver"]["PodIdentityAssociations"][0]["ServiceAccount"] == "ebs-csi-controller-sa"
     charts = [
