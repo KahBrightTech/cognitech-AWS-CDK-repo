@@ -146,6 +146,11 @@ def test_dev_system_and_optional_application_scheduling(write_env):
     addons_text = text.split("\neks_addons:\n", 1)[1]
     assert "CriticalAddonsOnly" not in addons_text
     addons = yaml.safe_load("\n".join(line.removeprefix("# ") for line in addons_text.splitlines()))
+    # The native Secrets Store add-on is an alternative to the enabled Helm bundle.
+    addons[0]["addons"] = [
+        item for item in addons[0]["addons"]
+        if item["name"] != "aws-secrets-store-csi-driver-provider"
+    ]
     eks = yaml.safe_load(EKS)
     del eks[0]["node_groups"]
     eks[0]["compute"] = compute
@@ -186,15 +191,14 @@ def test_dev_system_and_optional_application_scheduling(write_env):
         assert_system(cloudwatch[component])
     assert cloudwatch["tolerations"] == [{"operator": "Exists"}]
     assert "nodeSelector" not in cloudwatch
-    secrets = native["aws-secrets-store-csi-driver-provider"]
-    assert secrets["tolerations"] == [{"operator": "Exists"}]
-    assert secrets["secrets-store-csi-driver"]["linux"]["tolerations"] == [{"operator": "Exists"}]
-    assert "nodeSelector" not in secrets
-
     charts = {
         name: json.loads(_values(chart)) for name, chart in _charts(template).items()
         if "Values" in chart["Properties"]
     }
+    secrets = charts["secrets-store-csi-driver-provider-aws"]
+    assert secrets["tolerations"] == [{"operator": "Exists"}]
+    assert secrets["secrets-store-csi-driver"]["linux"]["tolerations"] == [{"operator": "Exists"}]
+    assert "nodeSelector" not in secrets
     for name in ("karpenter", "aws-load-balancer-controller", "kubecost"):
         assert_system(charts[name])
     assert_system(charts["argocd"]["global"])
@@ -231,6 +235,98 @@ def test_every_requested_native_addon_is_separate(write_env):
         "vpc-cni", "coredns", "kube-proxy", "eks-pod-identity-agent",
     }
     assert _nested_order(eks_stack)["CoreAddons"] == {"NodeGroups"}
+
+
+def test_service_account_generated_pod_identity_role(write_env):
+    raw = yaml.safe_load(EKS)
+    raw[0]["namespaces"] = [{"name": "apps"}]
+    raw[0]["service_accounts"] = [{
+        "name": "reader", "namespace": "apps", "identity": "pod_identity",
+        "policy": {
+            "Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Action": "secretsmanager:GetSecretValue",
+                "Resource": "arn:aws:secretsmanager:us-east-1:111122223333:secret:example-abcdef",
+            }],
+        },
+    }]
+    stack, _ = _stacks(write_env, eks=yaml.safe_dump(raw))
+    access = Template.from_stack(stack.nested_stacks["main"]["Access"])
+    access.has_resource_properties("AWS::EKS::PodIdentityAssociation", {
+        "Namespace": "apps", "ServiceAccount": "reader", "RoleArn": Match.any_value(),
+    })
+    access.has_resource_properties("AWS::IAM::Role", {
+        "AssumeRolePolicyDocument": {"Statement": [Match.object_like({
+            "Action": ["sts:AssumeRole", "sts:TagSession"],
+            "Principal": {"Service": "pods.eks.amazonaws.com"},
+        })]},
+    })
+    association = next(iter(access.find_resources("AWS::EKS::PodIdentityAssociation").values()))
+    assert association["DependsOn"]
+    resources = json.dumps(access.find_resources("Custom::AWSCDK-EKS-KubernetesResource"))
+    assert "eks.amazonaws.com/role-arn" not in resources
+
+
+def test_secrets_store_helm_and_secret_provider_class_ordering(write_env):
+    raw = yaml.safe_load(TYPED)
+    raw[0]["secrets_store_csi"] = {}
+    raw[0]["secret_provider_classes"] = [{
+        "name": "app-secrets", "namespace": "apps",
+        "parameters": {"usePodIdentity": "true", "objects": '- objectName: example\n  objectType: secretsmanager\n'},
+    }]
+    cluster = yaml.safe_load(EKS)
+    cluster[0]["oidc_provider"] = True
+    cluster[0]["namespaces"] = [{"name": "apps"}]
+    cluster[0]["service_accounts"] = [
+        {"name": "reader", "namespace": "apps", "identity": "pod_identity"},
+        {"name": "reader-irsa", "namespace": "apps", "identity": "irsa"},
+    ]
+    stack, template = _stacks(write_env, addons=yaml.safe_dump(raw), eks=yaml.safe_dump(cluster))
+    chart = _charts(template)["secrets-store-csi-driver-provider-aws"]
+    assert chart["Properties"]["Version"] == "3.1.4"
+    assert chart["Properties"]["Wait"] is True
+    values = json.loads(_values(chart))
+    assert values["secrets-store-csi-driver"]["install"] is True
+    assert values["tolerations"] == [{"operator": "Exists"}]
+    assert values["secrets-store-csi-driver"]["linux"]["tolerations"] == [{"operator": "Exists"}]
+    resources = Template.from_stack(stack.nested_stacks["main"]["Addons"]).find_resources(
+        "Custom::AWSCDK-EKS-KubernetesResource"
+    )
+    spc = next(r for r in resources.values() if "SecretProviderClass" in r["Properties"]["Manifest"])
+    obj = json.loads(spc["Properties"]["Manifest"])[0]
+    assert obj["spec"]["provider"] == "aws"
+    assert obj["spec"]["parameters"]["usePodIdentity"] == "true"
+    assert any("SecretsStoreCsi" in dependency for dependency in spc["DependsOn"])
+    assert "Access" in _nested_order(stack)["Addons"]
+    assert obj["metadata"]["namespace"] == "apps"
+
+
+@pytest.mark.parametrize("settings, message", [
+    ({"secrets_store_csi": {}, "addons": [{"name": "aws-secrets-store-csi-driver-provider"}]},
+     "not both"),
+    ({"secret_provider_classes": [{"name": "example", "parameters": {"objects": "[]"}}]},
+     "need secrets_store_csi"),
+    ({"secrets_store_csi": {"values": {"secrets-store-csi-driver": {"install": False}}}},
+     "must stay enabled"),
+    ({"secrets_store_csi": {}, "secret_provider_classes": [{"name": "example", "parameters": {}}]},
+     "parameters.objects"),
+])
+def test_invalid_secrets_store_configuration(settings, message):
+    with pytest.raises(ValueError, match=message):
+        EksAddonsProps.from_dict([{
+            "cluster": "main", "aws_load_balancer_controller": {"enabled": False}, **settings,
+        }])
+
+
+def test_native_secrets_provider_can_create_irsa_class(write_env):
+    raw = yaml.safe_load(ADDONS)
+    raw[0]["secret_provider_classes"] = [{
+        "name": "app-secrets",
+        "parameters": {"usePodIdentity": "false", "objects": '- objectName: example\n  objectType: secretsmanager\n'},
+    }]
+    _, template = _stacks(write_env, addons=yaml.safe_dump(raw))
+    manifests = template.find_resources("Custom::AWSCDK-EKS-KubernetesResource")
+    spc = next(r for r in manifests.values() if "SecretProviderClass" in r["Properties"]["Manifest"])
+    assert any("AwsSecretsStoreCsiDriverProviderAddon" in dependency for dependency in spc["DependsOn"])
 
 
 def test_aws_addons_use_pod_identity_roles(write_env):

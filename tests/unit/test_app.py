@@ -129,7 +129,9 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
         resource["Properties"] for resource in all_resources
         if resource["Type"] == "Custom::AWSCDK-EKS-HelmChart"
     ]
-    assert [chart["Chart"] for chart in charts] == ["aws-load-balancer-controller"]
+    assert {chart["Chart"] for chart in charts} == {
+        "aws-load-balancer-controller", "secrets-store-csi-driver-provider-aws",
+    }
     subnets = [
         resource["Properties"] for resource in all_resources
         if resource["Type"] == "AWS::EC2::Subnet"

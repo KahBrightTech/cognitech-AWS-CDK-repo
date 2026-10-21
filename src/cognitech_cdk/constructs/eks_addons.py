@@ -383,6 +383,55 @@ class ChartProps:
 
 
 @dataclass(frozen=True)
+class SecretsStoreCsiProps(ChartProps):
+    @classmethod
+    def from_dict(cls, raw: Any, cluster: str, *, base_dir: Path | None) -> SecretsStoreCsiProps | None:
+        if raw is None:
+            return None
+        label = f"EKS add-ons '{cluster}', secrets_store_csi"
+        data = schema.mapping(raw, label, cls.KEYS)
+        props = cls(**cls.parse(
+            data, label, version="3.1.4", namespace="kube-system",
+            release="secrets-store-csi-driver-provider-aws", base_dir=base_dir,
+        ))
+        driver = props.values.get("secrets-store-csi-driver", {})
+        if not isinstance(driver, Mapping):
+            raise ValueError(f"{label}: values.secrets-store-csi-driver must be a mapping.")
+        if props.enabled and driver.get("install") is False:
+            raise ValueError(f"{label}: the bundled secrets-store-csi-driver must stay enabled.")
+        return props
+
+
+@dataclass(frozen=True)
+class SecretProviderClassProps:
+    name: str
+    namespace: str
+    parameters: Mapping[str, str]
+
+    @classmethod
+    def from_dict(cls, raw: Any, cluster: str) -> SecretProviderClassProps:
+        label = f"EKS add-ons '{cluster}', secret_provider_classes"
+        data = schema.mapping(raw, label, {"name", "namespace", "parameters"}, required=("name", "parameters"))
+        parameters = schema.string_map(data["parameters"], f"{label}: parameters")
+        schema.required_string(parameters.get("objects"), f"{label}: parameters.objects")
+        if "usePodIdentity" in parameters and parameters["usePodIdentity"].lower() not in ("true", "false"):
+            raise ValueError(f"{label}: usePodIdentity must be true or false.")
+        return cls(
+            name=_k8s_name(data["name"], f"{label}: name"),
+            namespace=_k8s_name(data.get("namespace"), f"{label}: namespace", "default"),
+            parameters=parameters,
+        )
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "apiVersion": "secrets-store.csi.x-k8s.io/v1",
+            "kind": "SecretProviderClass",
+            "metadata": {"name": self.name, "namespace": self.namespace},
+            "spec": {"provider": "aws", "parameters": dict(self.parameters)},
+        }
+
+
+@dataclass(frozen=True)
 class ArgoCdSsoProps:
     enabled: bool = False
     sso_url: str | None = None
@@ -674,6 +723,8 @@ class ClusterAddonsProps:
     gateway_api: GatewayApiProps | None = None
     kubecost: HostedChartProps | None = None
     awx_operator: HostedChartProps | None = None
+    secrets_store_csi: SecretsStoreCsiProps | None = None
+    secret_provider_classes: tuple[SecretProviderClassProps, ...] = ()
 
     def __bool__(self) -> bool:
         return bool(
@@ -685,7 +736,7 @@ class ClusterAddonsProps:
     def charts(self) -> tuple[ChartProps, ...]:
         """Enabled typed Helm add-ons."""
         candidates = (self.karpenter, self.argocd, *self.nginx_ingress, self.gateway_api,
-                      self.kubecost, self.awx_operator)
+                      self.kubecost, self.awx_operator, self.secrets_store_csi)
         return tuple(item for item in candidates if item is not None and item.enabled)
 
     @property
@@ -694,6 +745,10 @@ class ClusterAddonsProps:
             self.load_balancer_controller.enabled
             or any(addon.pod_identity for addon in self.addons)
             or bool(self.karpenter and self.karpenter.enabled)
+            or any(
+                item.parameters.get("usePodIdentity", "false").lower() == "true"
+                for item in self.secret_provider_classes
+            )
         )
 
     @property
@@ -710,6 +765,7 @@ class ClusterAddonsProps:
         data = schema.mapping(raw, "eks_addons entry", {
             "cluster", "addons", "aws_load_balancer_controller", "helm_charts", "load_balancer_defaults",
             "storage_class", "karpenter", "argocd", "nginx_ingress", "gateway_api", "kubecost", "awx_operator",
+            "secrets_store_csi", "secret_provider_classes",
         }, required=("cluster",))
         cluster = schema.name(data["cluster"], "eks_addons cluster")
         defaults = schema.mapping(
@@ -730,6 +786,12 @@ class ClusterAddonsProps:
                 lambda item: HelmChartProps.from_dict(item, cluster, base_dir=base_dir),
             ),
             storage_class=StorageClassProps.from_dict(data.get("storage_class"), cluster),
+            secrets_store_csi=SecretsStoreCsiProps.from_dict(data.get("secrets_store_csi"), cluster, base_dir=base_dir),
+            secret_provider_classes=schema.items(
+                data.get("secret_provider_classes"), f"EKS add-ons '{cluster}' secret_provider_classes",
+                lambda item: SecretProviderClassProps.from_dict(item, cluster),
+                key=lambda item: f"{item.namespace}/{item.name}",
+            ),
             karpenter=KarpenterProps.from_dict(data.get("karpenter"), cluster, base_dir=base_dir),
             argocd=ArgoCdProps.from_dict(data.get("argocd"), cluster, defaults, base_dir=base_dir),
             nginx_ingress=schema.items(
@@ -754,6 +816,12 @@ class ClusterAddonsProps:
         cluster = self.cluster
         label = f"EKS add-ons '{cluster}'"
         names = {addon.name for addon in props.addons}
+        secrets_helm = bool(props.secrets_store_csi and props.secrets_store_csi.enabled)
+        secrets_native = "aws-secrets-store-csi-driver-provider" in names
+        if secrets_helm and secrets_native:
+            raise ValueError(f"{label}: choose secrets_store_csi Helm or the native secrets provider add-on, not both.")
+        if props.secret_provider_classes and not (secrets_helm or secrets_native):
+            raise ValueError(f"{label}: secret_provider_classes need secrets_store_csi or the native secrets provider add-on.")
         if props.needs_pod_identity_agent and POD_IDENTITY_AGENT not in names:
             raise ValueError(f"{label}: Pod Identity roles need the {POD_IDENTITY_AGENT} add-on.")
         if props.needs_load_balancer_controller and not props.load_balancer_controller.enabled:

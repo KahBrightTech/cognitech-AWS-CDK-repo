@@ -73,6 +73,7 @@ class EksAddons:
         network: Network | None = None,
         security_groups: Mapping[str, ec2.ISecurityGroup] | None = None,
         certificates: Mapping[str, acm.ICertificate] | None = None,
+        namespace_dependencies: Sequence[IDependable] = (),
     ) -> None:
         self._stack = stack
         self._scope_for = scope_for
@@ -81,6 +82,7 @@ class EksAddons:
         self._network = network
         self._security_groups = security_groups or {}
         self._certificates = certificates or {}
+        self._namespace_dependencies = list(namespace_dependencies)
         self.addons: dict[str, eks.CfnAddon] = {}
         self.pod_identity_roles: dict[str, iam.IRole] = {}
         self.helm_charts: dict[str, eks.HelmChart] = {}
@@ -252,7 +254,7 @@ class EksAddons:
         charts: dict[str, eks.HelmChart] = {}
 
         if (props.load_balancer_controller.enabled or props.helm_charts or props.charts
-                or props.storage_class) and getattr(cluster, "kubectl_provider", None) is None:
+                or props.storage_class or props.secret_provider_classes) and getattr(cluster, "kubectl_provider", None) is None:
             raise ValueError(
                 f"{label}: Helm charts and manifests need the cluster's kubectl provider "
                 "(set kubectl: true on the cluster)."
@@ -312,6 +314,36 @@ class EksAddons:
             charts["aws-load-balancer-controller"] = chart
             ready.append(chart)
 
+        secrets = props.secrets_store_csi
+        if secrets is not None and secrets.enabled:
+            chart = self._chart(
+                self._scope_for("Addons"), "SecretsStoreCsi", cluster, secrets,
+                "secrets-store-csi-driver-provider-aws",
+                "https://aws.github.io/secrets-store-csi-driver-provider-aws",
+                {
+                    "tolerations": [{"operator": "Exists"}],
+                    "secrets-store-csi-driver": {
+                        "install": True, "linux": {"tolerations": [{"operator": "Exists"}]},
+                    },
+                },
+                capacity, wait=True,
+            )
+            charts[secrets.release] = chart
+            ready.append(chart)
+        if props.secret_provider_classes:
+            manifests = eks.KubernetesManifest(
+                self._scope_for("Addons"), "SecretProviderClasses", cluster=cluster,
+                manifest=[item.manifest() for item in props.secret_provider_classes],
+                overwrite=True,
+            )
+            provider = (
+                charts[secrets.release] if secrets is not None and secrets.enabled
+                else addons["aws-secrets-store-csi-driver-provider"]
+            )
+            manifests.node.add_dependency(provider)
+            self._after(manifests, self._namespace_dependencies)
+            ready.append(manifests)
+
         if props.argocd is not None and props.argocd.enabled:
             charts["argocd"] = self._chart(
                 self._scope_for("Apps"), "ArgoCd", cluster, props.argocd, "argo-cd", "https://argoproj.github.io/argo-helm",
@@ -366,6 +398,7 @@ class EksAddons:
     def _chart(
         self, scope: Construct, logical: str, cluster: eks.ICluster, props: Any, chart: str,
         repository: str, values: dict[str, Any], dependencies: list[IDependable],
+        *, wait: bool = False,
     ) -> eks.HelmChart:
         merged = _merge(values, dict(props.values))
         resource = eks.HelmChart(
@@ -378,7 +411,7 @@ class EksAddons:
             create_namespace=True,
             version=props.chart_version,
             values=merged,
-            wait=False,
+            wait=wait,
             timeout=cdk.Duration.minutes(15),
         )
         self._after(resource, dependencies)

@@ -663,16 +663,34 @@ class ServiceAccountProps:
     namespace: str = "default"
     labels: Mapping[str, str] = field(default_factory=dict)
     annotations: Mapping[str, str] = field(default_factory=dict)
+    identity: str | None = None
+    managed_policies: tuple[str, ...] = ()
+    policy: Mapping[str, Any] | None = None
 
     @classmethod
-    def from_dict(cls, raw: Any, cluster: str) -> ServiceAccountProps:
+    def from_dict(cls, raw: Any, cluster: str, *, base_dir: Path | None = None) -> ServiceAccountProps:
         label = f"EKS cluster '{cluster}', service account"
-        data = mapping(raw, label, {"name", "namespace", "labels", "annotations"}, required=("name",))
+        data = mapping(raw, label, {
+            "name", "namespace", "labels", "annotations", "identity", "managed_policies", "policy",
+        }, required=("name",))
+        identity = _enum(data.get("identity"), f"{label}: identity", ("POD_IDENTITY", "IRSA"))
+        policies = strings(data.get("managed_policies"), f"{label}: managed_policies")
+        policy = load_document(data.get("policy"), f"{label}: policy", base_dir=base_dir)
+        if policy is not None and (not isinstance(policy, Mapping) or not policy.get("Statement")):
+            raise ValueError(f"{label}: policy must be an IAM policy document with Statement.")
+        annotations = string_map(data.get("annotations"), f"{label}: annotations")
+        if identity is None and (policies or policy is not None):
+            raise ValueError(f"{label}: policy and managed_policies need identity.")
+        if identity is not None and "eks.amazonaws.com/role-arn" in annotations:
+            raise ValueError(f"{label}: identity generates its role; remove the role-arn annotation.")
         return cls(
             name=_k8s_name(data["name"], f"{label} name"),
             namespace=_k8s_name(data.get("namespace") or "default", f"{label} namespace", K8S_LABEL),
             labels=_labels(data.get("labels"), f"{label}: labels"),
-            annotations=string_map(data.get("annotations"), f"{label}: annotations"),
+            annotations=annotations,
+            identity=identity,
+            managed_policies=policies,
+            policy=json_compatible(policy, f"{label}: policy"),
         )
 
 
@@ -849,7 +867,7 @@ class EksClusterProps:
             rbac=RbacProps.from_dict(data.get("rbac"), cluster),
             service_accounts=items(
                 data.get("service_accounts"), f"{label}: service_accounts",
-                lambda item: ServiceAccountProps.from_dict(item, cluster),
+                lambda item: ServiceAccountProps.from_dict(item, cluster, base_dir=base_dir),
                 key=lambda item: f"{item.namespace}/{item.name}",
             ),
             pod_identity_associations=items(
@@ -862,6 +880,15 @@ class EksClusterProps:
         return props
 
     def _validate(self, label: str) -> None:
+        associated = {(item.namespace, item.service_account) for item in self.pod_identity_associations}
+        for account in self.service_accounts:
+            where = f"{label}: service account {account.namespace}/{account.name}"
+            if account.identity == "IRSA" and not self.oidc_provider:
+                raise ValueError(f"{where}: IRSA needs oidc_provider: true.")
+            if (account.namespace, account.name) in associated and (
+                account.identity is not None or "eks.amazonaws.com/role-arn" in account.annotations
+            ):
+                raise ValueError(f"{where}: configure one identity method, not a separate pod_identity_associations entry.")
         principals: set[str] = set()
         for entry in self.access_entries:
             for principal in (*entry.principal_arns, *(f"role:{role}" for role in entry.roles)):
@@ -1012,6 +1039,7 @@ class EksCluster(Construct):
             group.name: self._add_node_group(group, roles, security_groups, key_pairs)
             for group in props.node_groups
         }
+        self.service_account_roles = self._add_service_account_roles()
         self.manifests = self._add_manifests()
         self.pod_identity_associations = [
             eks.CfnPodIdentityAssociation(
@@ -1027,6 +1055,18 @@ class EksCluster(Construct):
             )
             for item in props.pod_identity_associations
         ]
+        for account in props.service_accounts:
+            if account.identity == "POD_IDENTITY":
+                association = eks.CfnPodIdentityAssociation(
+                    self._access_scope(),
+                    f"ServiceAccountPodIdentity{construct_id(account.namespace)}{construct_id(account.name)}",
+                    cluster_name=self.cluster.cluster_name,
+                    namespace=account.namespace,
+                    service_account=account.name,
+                    role_arn=self.service_account_roles[(account.namespace, account.name)].role_arn,
+                )
+                association.node.add_dependency(self.manifests["service_accounts"])
+                self.pod_identity_associations.append(association)
 
     # --- cluster ---------------------------------------------------------
 
@@ -1047,6 +1087,15 @@ class EksCluster(Construct):
 
     def _add_access_entries(self, roles: Mapping[str, iam.IRole]) -> dict[str, list[eks.CfnAccessEntry]]:
         entries: dict[str, list[eks.CfnAccessEntry]] = {}
+        node_principals = {
+            group.role_arn for group in self.props.node_groups if group.role_arn is not None
+        }
+        node_principals.update(
+            role.role_arn for role in _references(
+                tuple(group.role for group in self.props.node_groups if group.role is not None),
+                roles, f"EKS cluster '{self.props.name}': node group roles",
+            )
+        )
         for entry in self.props.access_entries:
             principals = [
                 *entry.principal_arns,
@@ -1054,6 +1103,13 @@ class EksCluster(Construct):
                     entry.roles, roles, f"EKS cluster '{self.props.name}', access entry '{entry.name}': roles"
                 )),
             ]
+            if node_principals.intersection(principals):
+                raise ValueError(
+                    f"EKS cluster '{self.props.name}', access entry '{entry.name}': "
+                    "managed node group roles must not have STANDARD access entries. "
+                    "Remove the node role from access_entries; EKS manages node authentication. "
+                    "A STANDARD entry overrides the node mapping and prevents nodes from joining."
+                )
             scope = (
                 eks.CfnAccessEntry.AccessScopeProperty(type="namespace", namespaces=list(entry.namespaces))
                 if entry.namespaces else eks.CfnAccessEntry.AccessScopeProperty(type="cluster")
@@ -1253,6 +1309,46 @@ class EksCluster(Construct):
 
     # --- in-cluster objects ------------------------------------------------
 
+    def _add_service_account_roles(self) -> dict[tuple[str, str], iam.Role]:
+        roles: dict[tuple[str, str], iam.Role] = {}
+        for account in self.props.service_accounts:
+            if account.identity is None:
+                continue
+            if account.identity == "IRSA":
+                issuer = self.cluster.open_id_connect_provider.open_id_connect_provider_issuer
+                # The issuer in the condition keys is only known at deployment time.
+                conditions = cdk.CfnJson(
+                    self._access_scope(),
+                    f"ServiceAccountTrust{construct_id(account.namespace)}{construct_id(account.name)}",
+                    value={
+                        f"{issuer}:aud": "sts.amazonaws.com",
+                        f"{issuer}:sub": f"system:serviceaccount:{account.namespace}:{account.name}",
+                    },
+                )
+                principal: iam.IPrincipal = iam.OpenIdConnectPrincipal(
+                    self.cluster.open_id_connect_provider,
+                    conditions={"StringEquals": conditions.value},
+                )
+            else:
+                principal = iam.ServicePrincipal("pods.eks.amazonaws.com").with_session_tags()
+            role = iam.Role(
+                self._access_scope(),
+                f"ServiceAccountRole{construct_id(account.namespace)}{construct_id(account.name)}",
+                assumed_by=principal,
+                managed_policies=[
+                    iam.ManagedPolicy.from_aws_managed_policy_name(policy)
+                    for policy in account.managed_policies
+                ],
+            )
+            if account.policy is not None:
+                role.attach_inline_policy(iam.Policy(
+                    self._access_scope(),
+                    f"ServiceAccountPolicy{construct_id(account.namespace)}{construct_id(account.name)}",
+                    document=iam.PolicyDocument.from_json(dict(account.policy)),
+                ))
+            roles[(account.namespace, account.name)] = role
+        return roles
+
     def _manifest(self, logical: str, documents: list[dict[str, Any]]) -> eks.KubernetesManifest:
         return eks.KubernetesManifest(
             self._access_scope(), logical, cluster=self.cluster,
@@ -1294,6 +1390,10 @@ class EksCluster(Construct):
                     metadata["labels"] = dict(account.labels)
                 if account.annotations:
                     metadata["annotations"] = dict(account.annotations)
+                if account.identity == "IRSA":
+                    metadata.setdefault("annotations", {})["eks.amazonaws.com/role-arn"] = (
+                        self.service_account_roles[(account.namespace, account.name)].role_arn
+                    )
                 accounts.append({"apiVersion": "v1", "kind": "ServiceAccount", "metadata": metadata})
             manifests["service_accounts"] = self._manifest("ServiceAccounts", accounts)
         if props.rbac:

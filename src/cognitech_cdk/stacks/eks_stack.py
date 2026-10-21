@@ -93,6 +93,12 @@ class EksStack(EnvironmentStack):
 
         for cluster_props in props.clusters:
             name = cluster_props.name
+            if any(account.identity == "POD_IDENTITY" for account in cluster_props.service_accounts):
+                configured = by_cluster.get(name)
+                if configured is None or not any(
+                    addon.name == "eks-pod-identity-agent" for addon in configured.addons
+                ):
+                    raise ValueError(f"EKS cluster '{name}': service account Pod Identity needs the eks-pod-identity-agent add-on.")
             nested = self.nested_stacks.setdefault(name, {})
 
             def scope_for(group: str, name: str = name, nested: dict = nested) -> cdk.NestedStack:
@@ -135,6 +141,9 @@ class EksStack(EnvironmentStack):
                     network=network,
                     security_groups=security_groups,
                     certificates=certificates,
+                    namespace_dependencies=[
+                        built.manifests["namespaces"]
+                    ] if "namespaces" in built.manifests else (),
                 )
 
     def _outputs(self, name: str, built: EksCluster) -> None:

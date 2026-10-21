@@ -815,10 +815,12 @@ Fargate profiles are not implemented yet; unsupported compute keys fail validati
 The dev configuration enables two `t3.large` managed system nodes (minimum two,
 maximum three) in public subnets, with the `workload-type=system:NoSchedule`
 taint. Core add-ons are enabled: VPC CNI, CoreDNS, kube-proxy, Pod Identity Agent,
-EBS CSI, metrics-server, and the AWS Load Balancer Controller, plus the default
-encrypted gp3 storage class. Controllers select and tolerate the system nodes;
-node-wide agents retain placement on all worker pools. Karpenter and the remaining
-add-ons/applications stay commented. Until application capacity is added, ordinary
+EBS CSI, metrics-server, external-dns, cert-manager, CloudWatch observability,
+and the AWS Load Balancer Controller, plus the default encrypted gp3 storage
+class. Secrets Store CSI and its AWS provider are enabled through Helm.
+Controllers select and tolerate the system nodes; node-wide agents retain
+placement on all worker pools. Karpenter and optional applications stay
+commented. Until application capacity is added, ordinary
 workloads need a matching system-taint toleration to schedule on these nodes.
 The maximum size is a scaling bound, not automatic demand-based scaling;
 Karpenter and Cluster Autoscaler are not enabled.
@@ -1022,6 +1024,18 @@ evaluated explicitly rather than used as the default deployment workflow.
 
 #### System controllers versus application nodes
 
+Do not include managed node-group IAM roles in `access_entries`. Those entries
+are `STANDARD` user/workload identities; EKS manages worker-node authentication
+separately. A `STANDARD` entry for a node role takes precedence over its
+`aws-auth` mapping and can prevent the instances from joining the cluster.
+Synthesis rejects configured managed node roles used in these entries.
+
+Core add-ons wait for the `NodeGroups` nested stack to finish. If add-ons are
+absent, check the parent CloudFormation stack and node-group health, then
+`kubectl get nodes`; running EC2 instances alone do not mean the nodes joined.
+A later CDK run reporting "no changes" does not prove an earlier CloudFormation
+update has completed.
+
 The dev configuration reserves the managed node group for system workloads
 using the label `workload-type: system` and taint
 `workload-type=system:NoSchedule`. Controllers select that label and tolerate
@@ -1149,6 +1163,167 @@ After deployment, inspect the EBS node plugin and its placement:
 ```bash
 kubectl get daemonset ebs-csi-node -n kube-system
 kubectl get pods -n kube-system -l app=ebs-csi-node -o wide
+```
+
+#### Secrets Store CSI, AWS provider and SecretProviderClass
+
+`SecretProviderClass` is a namespaced Kubernetes custom resource, not a Helm
+chart. The Secrets Store CSI driver mounts external secrets into pods, and the
+AWS provider retrieves them from Secrets Manager or SSM Parameter Store using
+the consuming pod's service-account identity.
+
+Dev installs the AWS provider chart **3.1.4**, including its CSI driver dependency:
+
+```yaml
+eks_addons:
+- cluster: main
+  secrets_store_csi:
+    chart_version: 3.1.4
+    values:
+      tolerations: [{operator: Exists}]
+      secrets-store-csi-driver:
+        install: true
+        linux:
+          tolerations: [{operator: Exists}]
+```
+
+Both components are node-wide DaemonSets, so they tolerate system-node taints
+without a system-only selector. Existing OS/compute restrictions still apply;
+this is not support for Fargate. Helm waits for readiness, and configured
+SecretProviderClasses depend on the chart and configured namespace manifests.
+The alternative native `aws-secrets-store-csi-driver-provider` add-on must not
+be enabled alongside this Helm installation; duplicate installation is rejected.
+
+Configure classes under the same `eks_addons` entry:
+
+```yaml
+  secret_provider_classes:
+  - name: healthpath-secrets
+    namespace: healthpath
+    parameters:
+      region: us-east-1
+      usePodIdentity: "true"
+      objects: |
+        - objectName: "arn:aws:secretsmanager:us-east-1:111122223333:secret:example-ABCDEF"
+          objectType: secretsmanager
+```
+
+Replace the example ARN with a real secret ARN. `parameters` are serialized as
+strings; `objects` is a YAML string describing the requested AWS objects.
+Use `usePodIdentity: "true"` with Pod Identity, or `"false"` with IRSA.
+The class and consuming pod must be in the same namespace. Creating a class
+does not create an AWS secret, grant permissions, or mount it into a pod.
+Dev leaves workload identities and classes commented until real ARNs are supplied.
+
+#### Service accounts: Pod Identity versus OIDC/IRSA
+
+Configure service accounts under `eks[].service_accounts`. Without `identity`,
+this creates only a Kubernetes ServiceAccount, preserving the existing labels
+and annotations support. Selecting `identity` creates a dedicated IAM role:
+
+| Identity | Role trust | How the pod selects the IAM role |
+| --- | --- | --- |
+| `pod_identity` | `pods.eks.amazonaws.com`, with `sts:AssumeRole` and `sts:TagSession` | EKS Pod Identity association for the cluster, namespace and service-account name |
+| `irsa` | Cluster OIDC provider, with `sts:AssumeRoleWithWebIdentity` and exact `aud`/`sub` conditions | Generated `eks.amazonaws.com/role-arn` ServiceAccount annotation |
+
+Example Pod Identity service account:
+
+```yaml
+eks:
+- name: main
+  # Other cluster settings...
+  service_accounts:
+  - name: healthpath-secrets
+    namespace: healthpath
+    identity: pod_identity
+    policy:
+      Version: "2012-10-17"
+      Statement:
+      - Effect: Allow
+        Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+        Resource: arn:aws:secretsmanager:us-east-1:111122223333:secret:example-ABCDEF
+```
+
+The namespace must exist (or be declared in `eks[].namespaces`). Pod Identity
+requires the `eks-pod-identity-agent` add-on and node-role permissions such as
+`eks-auth:AssumeRoleForPodIdentity` provided by `AmazonEKSWorkerNodePolicy`.
+The generated association depends on the service-account manifest.
+
+To use OIDC federation instead, change that account to:
+
+```yaml
+  oidc_provider: true
+  service_accounts:
+  - name: healthpath-secrets
+    namespace: healthpath
+    identity: irsa
+    policy:
+      Version: "2012-10-17"
+      Statement:
+      - Effect: Allow
+        Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+        Resource: arn:aws:secretsmanager:us-east-1:111122223333:secret:example-ABCDEF
+```
+
+The role trust is restricted to audience `sts.amazonaws.com` and subject
+`system:serviceaccount:healthpath:healthpath-secrets` on this cluster's provider.
+IRSA does not use the Pod Identity Agent. Set the SecretProviderClass parameter
+`usePodIdentity` to `"false"` for this account. Choose one identity method per
+account; do not also supply a manual role-ARN annotation or a separate
+`pod_identity_associations` entry for an account with generated identity.
+The existing standalone associations remain supported for externally managed
+roles and service accounts.
+
+`policy` accepts an inline IAM policy document or a repository-relative YAML/JSON
+file. `managed_policies` optionally accepts AWS-managed policy names (including
+paths such as `service-role/...`). Generated roles receive no application
+permissions unless configured. Scope permissions to real resource ARNs; add
+`ssm:GetParameters` for Parameter Store or `kms:Decrypt` on the appropriate key
+for secrets encrypted with a customer-managed KMS key, as needed.
+
+The **AWS Load Balancer Controller remains on EKS Pod Identity**, not OIDC/IRSA.
+Its generated role trusts `pods.eks.amazonaws.com`; the Helm-created service
+account is linked through an EKS association. Enabling the cluster OIDC provider
+does not automatically change the controller's authentication method.
+
+An application must select the service account and explicitly mount the CSI
+volume in its pod specification:
+
+```yaml
+spec:
+  serviceAccountName: healthpath-secrets
+  # Needed only while running this application on dev's tainted system nodes.
+  tolerations:
+  - {key: workload-type, operator: Equal, value: system, effect: NoSchedule}
+  containers:
+  - name: app
+    image: your-application-image
+    volumeMounts:
+    - name: secrets
+      mountPath: /mnt/secrets
+      readOnly: true
+  volumes:
+  - name: secrets
+    csi:
+      driver: secrets-store.csi.k8s.io
+      readOnly: true
+      volumeAttributes:
+        secretProviderClass: healthpath-secrets
+```
+
+For a Deployment, this is `spec.template.spec`. The example mounts files only;
+it does not enable synchronization into Kubernetes Secrets or automatic
+rotation. Do not put secret values in the environment YAML or IAM policies.
+
+After deployment:
+
+```bash
+kubectl get daemonsets -n kube-system
+kubectl get secretproviderclasses -A
+kubectl get serviceaccount healthpath-secrets -n healthpath -o yaml
+aws eks list-pod-identity-associations \
+  --cluster-name md-preproduction-use1-dev-main-eks-cluster \
+  --profile admin-mdpp --region us-east-1
 ```
 
 ### Tenant-account stacks
