@@ -92,8 +92,8 @@ def test_dev_public_endpoint_keeps_kubectl_providers_outside_vpc(tmp_path):
 
 
 def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
-    configured_groups = {
-        principal: list(entry.kubernetes_groups)
+    configured_entries = {
+        principal: entry
         for cluster in load_environment("dev").eks.clusters
         for entry in cluster.access_entries
         for principal in entry.principal_arns
@@ -109,39 +109,36 @@ def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
         resource["Properties"] for resource in resources
         if resource["Type"] == "AWS::EKS::AccessEntry"
     ]
-    sso_prefix = "arn:aws:iam::271457809232:role/aws-reserved/sso.amazonaws.com/"
-    sso_entries = {
-        entry["PrincipalArn"].removeprefix(sso_prefix): entry
+    principal_entries = {
+        entry["PrincipalArn"]: entry
         for entry in entries
         if isinstance(entry["PrincipalArn"], str)
-        and entry["PrincipalArn"].startswith(sso_prefix)
     }
-    assert set(sso_entries) == {
-        "AWSReservedSSO_AdministratorAccess_7f215b32fef26e47",
-        "AWSReservedSSO_SystemAdministrator_7845d1ed8dcf680a",
-        "AWSReservedSSO_ReadOnlyAccess_d2947b3732f4ad12",
-        "AWSReservedSSO_NetworkAdministrator_b9b78eb5953b12dd",
-    }
-    for role in (
-        "AWSReservedSSO_AdministratorAccess_7f215b32fef26e47",
-        "AWSReservedSSO_SystemAdministrator_7845d1ed8dcf680a",
-        "AWSReservedSSO_NetworkAdministrator_b9b78eb5953b12dd",
-    ):
-        entry = sso_entries[role]
-        policy = "AmazonEKSViewPolicy" if "NetworkAdministrator" in role else "AmazonEKSClusterAdminPolicy"
-        assert entry["AccessPolicies"] == [{
-            "PolicyArn": f"arn:aws:eks::aws:cluster-access-policy/{policy}",
-            "AccessScope": {"Type": "cluster"},
-        }]
-        assert entry.get("KubernetesGroups", []) == configured_groups[entry["PrincipalArn"]]
-    readonly_entries = [
-        entry for entry in entries
-        if entry.get("KubernetesGroups") == ["cognitech-viewers", "infogrid"]
-    ]
-    assert len(readonly_entries) == 3
-    assert sso_entries["AWSReservedSSO_ReadOnlyAccess_d2947b3732f4ad12"] in readonly_entries
-    assert all(not entry.get("AccessPolicies") for entry in readonly_entries)
-    assert all(entry["Type"] == "STANDARD" for entry in readonly_entries)
+    assert configured_entries
+    assert principal_entries.keys() == configured_entries.keys()
+    assert len(principal_entries) == sum(
+        isinstance(entry["PrincipalArn"], str) for entry in entries
+    )
+    for principal, configured in configured_entries.items():
+        entry = principal_entries[principal]
+        assert entry["Type"] == "STANDARD"
+        assert entry.get("KubernetesGroups", []) == list(configured.kubernetes_groups)
+        scope = (
+            {"Type": "namespace", "Namespaces": list(configured.namespaces)}
+            if configured.namespaces else {"Type": "cluster"}
+        )
+        assert entry.get("AccessPolicies", []) == [
+            {
+                "PolicyArn": policy if policy.startswith("arn:") else {
+                    "Fn::Join": ["", [
+                        "arn:", {"Ref": "AWS::Partition"},
+                        f":eks::aws:cluster-access-policy/{policy}",
+                    ]],
+                },
+                "AccessScope": scope,
+            }
+            for policy in configured.policy_arns
+        ]
 
     objects = [
         obj
