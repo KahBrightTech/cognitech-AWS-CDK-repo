@@ -42,6 +42,18 @@ def _stacks(outdir: Path) -> set[str]:
     }
 
 
+def _manifest_objects(resource: dict) -> list[dict]:
+    manifest = resource["Properties"]["Manifest"]
+    if isinstance(manifest, dict):
+        # IRSA role annotations turn the manifest string into a CloudFormation join.
+        separator, parts = manifest["Fn::Join"]
+        manifest = separator.join(
+            part if isinstance(part, str) else json.dumps(json.dumps(part))[1:-1]
+            for part in parts
+        )
+    return json.loads(manifest)
+
+
 STACKS = (
     ("security_groups", "security"), ("iam", "iam"), ("transit_gateway", "transit-gateway"),
     ("storage", "storage"), ("key_pairs", "key-pairs"), ("secrets", "secrets"), ("ssm", "ssm"),
@@ -141,13 +153,87 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
     manifests = [
         obj for resource in all_resources
         if resource["Type"] == "Custom::AWSCDK-EKS-KubernetesResource"
-        for obj in json.loads(resource["Properties"]["Manifest"])
+        for obj in _manifest_objects(resource)
     ]
     storage = next(obj for obj in manifests if obj["kind"] == "StorageClass")
     assert storage["metadata"]["name"] == "gp3"
     assert storage["metadata"]["annotations"]["storageclass.kubernetes.io/is-default-class"] == "true"
     assert storage["parameters"]["encrypted"] == "true"
     assert not any(obj["kind"] in {"NodePool", "EC2NodeClass"} for obj in manifests)
+    account = next(
+        obj for obj in manifests
+        if obj["kind"] == "ServiceAccount" and obj["metadata"]["name"] == "healthpath-secrets"
+    )
+    assert account["metadata"]["name"] == "healthpath-secrets"
+    assert account["metadata"]["namespace"] == "healthpath"
+    assert "eks.amazonaws.com/role-arn" not in account["metadata"].get("annotations", {})
+    associations = [
+        resource for resource in all_resources
+        if resource["Type"] == "AWS::EKS::PodIdentityAssociation"
+        and resource["Properties"]["Namespace"] == "healthpath"
+        and resource["Properties"]["ServiceAccount"] == "healthpath-secrets"
+    ]
+    assert len(associations) == 1
+    association = associations[0]
+    assert association["Properties"]["Namespace"] == "healthpath"
+    assert association["Properties"]["ServiceAccount"] == "healthpath-secrets"
+    assert association["DependsOn"]
+    role_id = association["Properties"]["RoleArn"]["Fn::GetAtt"][0]
+    access_resources = next(
+        json.loads(path.read_text())["Resources"]
+        for path in tmp_path.glob("*.nested.template.json")
+        if role_id in json.loads(path.read_text())["Resources"]
+    )
+    assert access_resources[role_id]["Properties"]["AssumeRolePolicyDocument"]["Statement"] == [{
+        "Action": ["sts:AssumeRole", "sts:TagSession"],
+        "Effect": "Allow",
+        "Principal": {"Service": "pods.eks.amazonaws.com"},
+    }]
+    policies = [
+        resource["Properties"]["PolicyDocument"]["Statement"]
+        for resource in access_resources.values()
+        if resource["Type"] == "AWS::IAM::Policy"
+        and {"Ref": role_id} in resource["Properties"].get("Roles", [])
+    ]
+    assert policies == [[{
+        "Effect": "Allow",
+        "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+        "Resource": "arn:aws:secretsmanager:us-east-1:533267408704:secret:md-preproduction-use1-dev-*",
+    }]]
+    s3_account = next(
+        obj for obj in manifests
+        if obj["kind"] == "ServiceAccount" and obj["metadata"]["name"] == "infogrid-s3"
+    )
+    assert s3_account["metadata"]["namespace"] == "infogrid"
+    s3_role_id = json.loads(
+        s3_account["metadata"]["annotations"]["eks.amazonaws.com/role-arn"]
+    )["Fn::GetAtt"][0]
+    trust = access_resources[s3_role_id]["Properties"]["AssumeRolePolicyDocument"]
+    assert trust["Statement"][0]["Action"] == "sts:AssumeRoleWithWebIdentity"
+    assert "Federated" in trust["Statement"][0]["Principal"]
+    assert "StringEquals" in trust["Statement"][0]["Condition"]
+    assert "system:serviceaccount:infogrid:infogrid-s3" in json.dumps(access_resources)
+    s3_policies = [
+        resource["Properties"]["PolicyDocument"]["Statement"]
+        for resource in access_resources.values()
+        if resource["Type"] == "AWS::IAM::Policy"
+        and {"Ref": s3_role_id} in resource["Properties"].get("Roles", [])
+    ]
+    assert s3_policies == [[
+        {
+            "Effect": "Allow", "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::md-preproduction-use1-dev-app-bucket",
+        },
+        {
+            "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+            "Resource": "arn:aws:s3:::md-preproduction-use1-dev-app-bucket/*",
+        },
+    ]]
+    assert not any(
+        resource["Properties"]["ServiceAccount"] == "infogrid-s3"
+        for resource in all_resources
+        if resource["Type"] == "AWS::EKS::PodIdentityAssociation"
+    )
 
 
 def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
@@ -203,7 +289,7 @@ def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
         obj
         for resource in resources
         if resource["Type"] == "Custom::AWSCDK-EKS-KubernetesResource"
-        for obj in json.loads(resource["Properties"]["Manifest"])
+        for obj in _manifest_objects(resource)
     ]
     view_binding = next(
         obj for obj in objects

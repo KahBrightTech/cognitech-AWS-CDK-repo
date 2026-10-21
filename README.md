@@ -1213,7 +1213,9 @@ strings; `objects` is a YAML string describing the requested AWS objects.
 Use `usePodIdentity: "true"` with Pod Identity, or `"false"` with IRSA.
 The class and consuming pod must be in the same namespace. Creating a class
 does not create an AWS secret, grant permissions, or mount it into a pod.
-Dev leaves workload identities and classes commented until real ARNs are supplied.
+Dev enables the `healthpath-secrets` service account and Pod Identity association
+described below. SecretProviderClass examples remain commented until specific
+secrets and mount configuration are supplied.
 
 #### Service accounts: Pod Identity versus OIDC/IRSA
 
@@ -1249,6 +1251,32 @@ requires the `eks-pod-identity-agent` add-on and node-role permissions such as
 `eks-auth:AssumeRoleForPodIdentity` provided by `AmazonEKSWorkerNodePolicy`.
 The generated association depends on the service-account manifest.
 
+Dev creates `healthpath/healthpath-secrets`, a dedicated IAM role, and its Pod
+Identity association. Its policy is loaded using
+`policy: policies/healthpath-secrets.yaml` from
+[the external policy file](policies/healthpath-secrets.yaml).
+The role allows only `secretsmanager:GetSecretValue` and
+`secretsmanager:DescribeSecret` for
+`arn:aws:secretsmanager:us-east-1:533267408704:secret:md-preproduction-use1-dev-*`.
+This includes all secrets matching that prefix, not only Healthpath secrets;
+narrow the resource pattern if the application needs fewer secrets. No S3 or
+secret-write permissions are granted.
+
+Select the account in the Healthpath workload's pod template:
+
+```yaml
+spec:
+  template:
+    spec:
+      serviceAccountName: healthpath-secrets
+```
+
+The workload must run in the `healthpath` namespace. Pod Identity supplies AWS
+credentials to supported AWS SDKs; it does not create secrets, mount them, or
+inject their values as environment variables. Secrets encrypted with a
+customer-managed KMS key also require appropriately scoped `kms:Decrypt`
+permissions and a compatible key policy.
+
 To use OIDC federation instead, change that account to:
 
 ```yaml
@@ -1275,7 +1303,29 @@ The existing standalone associations remain supported for externally managed
 roles and service accounts.
 
 `policy` accepts an inline IAM policy document or a repository-relative YAML/JSON
-file. `managed_policies` optionally accepts AWS-managed policy names (including
+file. Dev also creates `infogrid/infogrid-s3` using OIDC/IRSA with an external
+policy:
+
+```yaml
+  oidc_provider: true
+  service_accounts:
+  - name: infogrid-s3
+    namespace: infogrid
+    identity: irsa
+    policy: policies/infogrid-s3.yaml
+```
+
+The path is relative to the repository root, not the deployment directory.
+[The S3 policy](policies/infogrid-s3.yaml) allows `s3:ListBucket` on
+`md-preproduction-use1-dev-app-bucket` and `s3:GetObject`/`s3:PutObject` on its
+objects. No object prefix restriction or delete permission is configured.
+Use `serviceAccountName: infogrid-s3` in pod templates in the `infogrid`
+namespace. Its role trust is limited to that service account and the cluster's
+OIDC provider; no Pod Identity association is created for this account.
+Customer-managed KMS encryption may require additional key permissions and a
+compatible key policy.
+
+`managed_policies` optionally accepts AWS-managed policy names (including
 paths such as `service-role/...`). Generated roles receive no application
 permissions unless configured. Scope permissions to real resource ARNs; add
 `ssm:GetParameters` for Parameter Store or `kms:Decrypt` on the appropriate key
