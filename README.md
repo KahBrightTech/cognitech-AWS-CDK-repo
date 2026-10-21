@@ -812,32 +812,217 @@ Existing `eks[].node_groups`, `eks[].launch_templates` and
 compute setting in both locations; conflicting definitions are rejected.
 Fargate profiles are not implemented yet; unsupported compute keys fail validation.
 
-The dev configuration includes commented compute examples and remains
-control-plane-only until they are enabled. Resource settings and policy paths
+The dev configuration enables two `t3.large` managed system nodes (minimum two,
+maximum three) in public subnets, with the `workload-type=system:NoSchedule`
+taint. Core add-ons are enabled: VPC CNI, CoreDNS, kube-proxy, Pod Identity Agent,
+EBS CSI, metrics-server, and the AWS Load Balancer Controller, plus the default
+encrypted gp3 storage class. Controllers select and tolerate the system nodes;
+node-wide agents retain placement on all worker pools. Karpenter and the remaining
+add-ons/applications stay commented. Until application capacity is added, ordinary
+workloads need a matching system-taint toleration to schedule on these nodes.
+The maximum size is a scaling bound, not automatic demand-based scaling;
+Karpenter and Cluster Autoscaler are not enabled.
+Resource settings and policy paths
 in the example above assume matching IAM roles and security groups already exist.
 
 #### Public-subnet development connectivity
 
-Dev explicitly enables the public Kubernetes API endpoint and disables its
-private endpoint (`endpoint_public_access: true`, `endpoint_private_access: false`).
-The kubectl handler and framework Lambdas run outside the VPC; a synthesis test
-checks that both have no `VpcConfig`. Cluster and worker subnet selection remains
-independent of this provider placement.
+**A public subnet does not automatically give every resource internet access.**
+It is called public because its route table has a route to an Internet Gateway.
+For ordinary IPv4 internet access through that gateway, a resource also needs
+a public IPv4 address or an appropriate address-translation path.
 
-A VPC-attached Lambda does not receive a public IP, even in a public subnet.
-An Internet Gateway route alone cannot give it outbound access to Lambda/AWS APIs
-or the CloudFormation response URL. Private-endpoint configurations need properly
-connected private subnets, with NAT or the required service endpoints and routes.
-Public API access still requires IAM authentication and Kubernetes authorization.
-The outside-VPC provider has no fixed outbound IP; introducing public endpoint
-CIDR restrictions requires a different, explicitly validated provider network setup.
+| Resource in a public subnet | Public IPv4 address | Direct internet access through the Internet Gateway |
+| --- | --- | --- |
+| EC2 instance with an assigned public IPv4 address | Yes | Possible, subject to routes, security groups, and network ACLs |
+| EC2 instance with only a private IPv4 address | No | No |
+| VPC-attached Lambda network interface | No | No |
 
-This setting is for the development test environment, does not change prod, and
-does not repair a previously failed CloudFormation deletion.
+**VPC-attached Lambda network interfaces receive private IP addresses, not public
+IPs.** Enabling automatic public IP assignment on the subnet does not change
+this Lambda behavior. An Internet Gateway does not supply arbitrary
+private-address resources with the source NAT provided by a NAT gateway.
+
+For example, this is not a working IPv4 internet path:
+
+```text
+Lambda attached to a public subnet, private IP 10.20.0.25
+  -> default route to Internet Gateway
+  -> public AWS API
+     BLOCKED: no public IPv4 mapping for the Lambda network interface
+```
+
+The usual internet-egress arrangement for a VPC-attached Lambda is:
+
+```text
+Lambda in a private subnet
+  -> private-subnet default route to NAT gateway
+  -> NAT gateway in a public subnet, using its Elastic IP
+  -> public-subnet default route to Internet Gateway
+  -> public AWS endpoints / CloudFormation response URL
+```
+
+This explanation concerns the IPv4 setup used here. IPv6 egress has different
+requirements and is not configured by these examples.
+
+##### Cluster subnets and API endpoint access are different settings
+
+`subnet_tier: public` selects subnets for the EKS cluster's VPC configuration;
+node groups have their own subnet selection. This does not mean the managed
+public Kubernetes API endpoint is another private resource beside the Lambda
+in those subnets. API endpoint access is configured separately:
+
+| API access settings | How clients connect |
+| --- | --- |
+| Public enabled, private disabled | Clients, including worker nodes, use the public Kubernetes API endpoint |
+| Public and private enabled | Clients with the appropriate VPC connectivity can use the private API path; external clients use the public endpoint |
+| Public disabled, private enabled | Clients need connectivity to the private API endpoint, for example from the VPC or a connected network |
+
+A Lambda attached to your VPC **can reach the private Kubernetes API without
+NAT**, provided DNS, routing, network ACLs, and security groups permit it.
+Being in a public subnet does not prevent private VPC communication. By contrast,
+reaching the API's public IPv4 addresses requires a suitable outbound path; a
+public-subnet Internet Gateway route alone is insufficient for Lambda.
+
+The Kubernetes API endpoint is not an application's ALB, Ingress, or Service.
+Changing its public/private access settings does not expose applications or
+move worker nodes. Public API access still requires IAM authentication and
+Kubernetes authorization, and any configured public endpoint CIDR restrictions
+must permit the client's source address.
+
+##### Why CDK creates kubectl-provider Lambdas
+
+CloudFormation directly manages AWS resources such as EKS clusters, managed node
+groups, access entries, and launch templates. Kubernetes namespaces, RBAC
+objects, and Helm releases are not ordinary native CloudFormation resources.
+CDK manages these through custom resources and provider Lambdas:
+
+```text
+CloudFormation custom-resource request
+  -> framework Lambda
+  -> kubectl/Helm handler Lambda
+  -> Kubernetes API
+  -> framework sends SUCCESS or FAILED to the CloudFormation response URL
+```
+
+Reaching the cluster is therefore only part of the network requirement:
+
+| Connection | Why it matters |
+| --- | --- |
+| Framework to the AWS Lambda API | Invokes the kubectl/Helm handler |
+| Handler to AWS APIs such as EKS and STS | Discovers the cluster and obtains credentials as required by the operation |
+| Handler to the Kubernetes API | Creates or deletes Kubernetes resources and Helm releases |
+| Framework to the CloudFormation presigned S3 response URL | Reports that the custom-resource operation finished |
+| Handler to chart/image registries, when used | Retrieves Helm charts or credentials needed by the selected deployment |
+
+Private Kubernetes endpoint access does not automatically provide these other
+connections. A VPC-only design must provide NAT or the required service
+endpoints, DNS, routes, and endpoint policies. In particular, the EKS service
+interface endpoint serves the **AWS EKS management API**, not the cluster's
+Kubernetes API. Service endpoints also do not provide general internet access
+to public Helm repositories. An S3 endpoint policy must allow the actual
+CloudFormation response bucket, not just your application's buckets.
+
+Terraform's Kubernetes and Helm providers usually perform the equivalent work
+on the machine running Terraform, such as WSL or a CI runner. They still need
+network access, but do not normally create these CDK provider Lambdas. Native
+EKS access entries alone do not require kubectl. Setting `kubectl: false` avoids
+the kubectl provider only when the configuration no longer includes features
+that need it, such as CDK-managed Kubernetes manifests and Helm releases.
+
+##### Networking model used by dev
+
+Dev explicitly enables the public Kubernetes API endpoint and disables the
+private endpoint:
+
+```yaml
+eks:
+- name: main
+  subnet_tier: public
+  endpoint_public_access: true
+  endpoint_private_access: false
+```
+
+For this configuration, the synthesized kubectl handler and framework Lambdas
+have **no `VpcConfig`**. They are not attached to your VPC; Lambda's AWS-managed
+networking supplies default outbound internet connectivity:
+
+```text
+Kubectl-provider Lambdas, not attached to the customer VPC
+  -> public AWS APIs and the CloudFormation response URL
+  -> public Kubernetes API, with authentication and authorization
+```
+
+This does not give the Lambdas public inbound endpoints or allow anonymous
+invocation. IAM still controls Lambda invocation, and Kubernetes access
+permissions still control cluster operations. The Lambdas have no security
+groups or subnet attachments in your customer VPC. Public-subnet worker nodes
+independently need connectivity to the public API, normally through public IPs
+and an Internet Gateway in this test setup.
+
+The outside-VPC provider has no fixed outbound IP. Strict public API CIDR
+allowlists require a different, explicitly validated provider network setup,
+such as private subnets with NAT Elastic IPs, or private API connectivity.
+Enabling private endpoint access can cause CDK to select provider subnets
+automatically; do not assume the input settings alone prove Lambda placement.
+
+Before deployment, inspect both generated Lambda resources in the EKS template
+under `cdk.out/`. Neither provider should contain `VpcConfig` for this dev model.
+The regression test
+`test_dev_public_endpoint_keeps_kubectl_providers_outside_vpc` checks the public-only
+endpoint and both provider functions' network configurations. After deployment,
+use **Lambda console -> Function -> Configuration -> VPC**; each should show
+no VPC configured. You can also inspect a deployed function:
+
+```bash
+aws lambda get-function-configuration \
+  --function-name <provider-function-name> \
+  --profile admin-mdpp \
+  --region us-east-1 \
+  --query '{Function:FunctionName,VPC:VpcConfig}' \
+  --no-cli-pager
+```
+
+This model is for the development test environment and does not change prod.
+
+##### Why a network failure can make deletion take an hour
+
+CloudFormation must receive a completion response from a custom resource. If
+the provider cannot invoke its handler or deliver the response, the resource
+can remain in progress until its service timeout expires, commonly one hour.
+Retries can produce multiple long-running Lambda invocations. A Lambda platform
+log showing execution success is not proof that CloudFormation received the
+custom-resource response.
+
+In the failed dev deployment, the deployed template attached both provider
+Lambdas to public subnets with Internet Gateway routes. That placement did not
+itself supply internet egress. Namespace creation stalled, and namespace deletion
+later failed with a missing-response error. The available logs did not identify
+the exact outbound call that stalled, so do not interpret this as proof that
+private Kubernetes API connectivity itself failed.
+
+For future deployments:
+
+- Verify the actual provider networking in synthesized templates.
+- Keep the cluster, provider, and provider permissions available until all
+  Kubernetes custom resources have finished cleanup. CDK's generated
+  dependencies establish creation order and reverse deletion order.
+- Delete through the owning stack rather than deleting the cluster or provider
+  independently while a CloudFormation operation is running.
+- Inspect provider logs for the first creation failure, not just the later
+  rollback timeout. A generic suggestion about Python `cfn-response` is not
+  evidence that CDK's provider needs that module added manually.
+- Treat shorter timeouts as faster failure reporting, not a connectivity fix.
+
+Changing endpoint settings does **not** repair an existing `DELETE_FAILED`
+stack or restore a missing cluster. Recovery of orphaned custom resources is a
+separate operation; retaining resources or force-deleting a stack must be
+evaluated explicitly rather than used as the default deployment workflow.
+
 
 #### System controllers versus application nodes
 
-The commented dev examples reserve the managed node group for system workloads
+The dev configuration reserves the managed node group for system workloads
 using the label `workload-type: system` and taint
 `workload-type=system:NoSchedule`. Controllers select that label and tolerate
 the taint. The node-group API uses `NO_SCHEDULE`, while pod tolerations use
@@ -860,7 +1045,9 @@ plugins that need them. Custom taints added later require another review.
 
 Managed EKS add-ons take component-specific `configuration_values`; Helm charts
 take chart-specific `values`. Toleration arrays replace, rather than append to,
-defaults. The examples keep critical default tolerations where applicable.
+defaults. The dev configuration explicitly tolerates the system taint for
+controllers and all taints for the Pod Identity Agent; other retained tolerations
+are component-specific.
 Argo CD uses `global` placement for the non-HA installation; enabling Redis HA
 requires separate Redis/HAProxy placement and adequate system-node capacity.
 The AWX chart uses `operator-controller.spec.template.spec` for the operator,
@@ -881,9 +1068,11 @@ applications it deploys; those applications need their own scheduling settings.
 Likewise, AWX execution pods created separately through Kubernetes container
 groups require scheduling settings in their own pod specifications.
 
-All dev compute and add-on scheduling examples remain commented out. Size the
-system node group for the enabled controllers before rollout: the sample single
-`t3.medium` is not a capacity guarantee for this full set of add-ons. Provision
+Dev enables two `t3.large` system nodes and the core add-ons; Karpenter and the
+optional add-ons/applications remain commented out. The table above describes
+placement when those optional components are enabled, not what is currently
+deployed. Size the system node group for the enabled controllers before rollout;
+two nodes are not a capacity guarantee for the full optional suite. Provision
 system nodes and core networking/DNS/Pod Identity before expecting Karpenter
 to provision application nodes. Adding a `NoSchedule` taint does not evict
 already-running pods.
@@ -895,6 +1084,68 @@ are version-dependent; verify the chosen version with
 The Terraform guide's general label/taint examples do not supply this full
 controller/DaemonSet split; copying its older add-on versions or using one
 blanket selector is not sufficient.
+
+#### EBS CSI controller versus node-plugin DaemonSet
+
+The EBS CSI driver has two components with separate pod placement settings:
+
+| Component | Kubernetes workload | Responsibility |
+| --- | --- | --- |
+| Controller | Deployment | Coordinates EBS volume creation/deletion and attachment/detachment through AWS APIs |
+| Node plugin (`ebs-csi-node`) | DaemonSet | Prepares the filesystem when needed and mounts/unmounts volumes on the worker node so application pods can use them |
+
+A DaemonSet normally places one copy of its pod on each eligible node, not one
+copy inside every application pod. Attaching an EBS volume to an EC2 instance
+does not by itself make the filesystem available at an application's mount path.
+For a dynamically provisioned volume, the flow is:
+
+```text
+Application pod requests storage through a PersistentVolumeClaim
+  -> Controller coordinates EBS volume creation and attachment
+  -> Node plugin mounts the volume on the application's worker node
+  -> Application accesses files at its configured mount path
+```
+
+The dev configuration separates placement for these components:
+
+```yaml
+- name: aws-ebs-csi-driver
+  configuration_values:
+    controller:
+      nodeSelector: {workload-type: system}
+      tolerations:
+      - {operator: Exists, effect: NoExecute, tolerationSeconds: 300}
+      - {key: workload-type, operator: Equal, value: system, effect: NoSchedule}
+    node:
+      tolerateAllTaints: true
+```
+
+- `controller.nodeSelector` requires the controller pods to use system-labeled
+  nodes. Its system toleration permits placement despite their
+  `workload-type=system:NoSchedule` taint.
+- The controller's `NoExecute` toleration allows it to remain for up to 300 seconds
+  after a matching `NoExecute` taint appears; it does not replace the system
+  `NoSchedule` toleration.
+- `node.tolerateAllTaints: true` gives the node-plugin DaemonSet broad tolerations,
+  effectively including `operator: Exists` without a key or effect restriction.
+  No system-only selector is set for this component, so it can serve both system
+  and future application nodes, subject to its other eligibility rules.
+
+Settings under `node` do not apply to `controller`, or vice versa. The broad
+node-plugin toleration does not let application pods bypass node taints, create
+worker nodes, or make EBS available on unsupported compute such as Fargate.
+Being a DaemonSet alone does not bypass arbitrary custom taints.
+
+The Pod Identity Agent is a separate DaemonSet. Dev explicitly configures it
+with `configuration_values.tolerations: [{operator: Exists}]` and no system-only
+selector so identity services are available across eligible worker nodes too.
+
+After deployment, inspect the EBS node plugin and its placement:
+
+```bash
+kubectl get daemonset ebs-csi-node -n kube-system
+kubectl get pods -n kube-system -l app=ebs-csi-node -o wide
+```
 
 ### Tenant-account stacks
 
@@ -932,8 +1183,8 @@ exports/imports and deploys producers first.
 **Dev mirrors Terraform md-preproduction Dev**: the `ec2`, `default` and
 `source-replication` roles/policies and `ec2` instance profile; the app, audit
 and software buckets; the `key-pair` key pair; and the `*.dev.kahbrigthllc.com`
-certificate. It also adds an EKS 1.36 cluster (`main`, one `t3.medium` node in
-public subnets, scaling to two) and its add-ons. Names keep this repo's `dev`
+certificate. It also adds an EKS 1.36 cluster (`main`, two `t3.large` system nodes in
+public subnets, with a maximum of three) and its core add-ons. Names keep this repo's `dev`
 segment, so nothing collides with Terraform's `development` resources in the
 same account.
 

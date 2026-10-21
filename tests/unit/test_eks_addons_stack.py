@@ -131,16 +131,20 @@ def _repo_root():
     return Path(__file__).resolve().parents[2]
 
 
-def test_commented_dev_system_and_application_scheduling(write_env):
+def test_dev_system_and_optional_application_scheduling(write_env):
     text = (_repo_root() / "deployments/dev/env.yaml").read_text()
     active = yaml.safe_load(text)
-    assert "compute" not in active["eks"][0]
-    assert "eks_addons" not in active
-    compute_text = text.split("    # compute:\n", 1)[1].split("\n# Add-ons", 1)[0]
+    assert active["eks"][0]["compute"]["node_groups"][0]["desired_size"] == 2
+    assert "karpenter" not in active["eks"][0]["compute"]
+    compute_text = text.split("    compute:\n", 1)[1].split("\neks_addons:\n", 1)[0]
     compute = yaml.safe_load(
-        "compute:\n" + "\n".join(line.removeprefix("    # ") for line in compute_text.splitlines())
+        "compute:\n" + "\n".join(
+            line.removeprefix("    # ") if line.startswith("    # ") else line.removeprefix("    ")
+            for line in compute_text.splitlines()
+        )
     )["compute"]
-    addons_text = text.split("# eks_addons:\n", 1)[1]
+    addons_text = text.split("\neks_addons:\n", 1)[1]
+    assert "CriticalAddonsOnly" not in addons_text
     addons = yaml.safe_load("\n".join(line.removeprefix("# ") for line in addons_text.splitlines()))
     eks = yaml.safe_load(EKS)
     del eks[0]["node_groups"]
@@ -172,8 +176,9 @@ def test_commented_dev_system_and_application_scheduling(write_env):
     assert native["aws-ebs-csi-driver"]["node"]["tolerateAllTaints"] is True
     for name in ("aws-efs-csi-driver", "aws-fsx-csi-driver"):
         assert native[name]["node"]["tolerations"] == [{"operator": "Exists"}]
-    for name in ("vpc-cni", "kube-proxy", "eks-pod-identity-agent"):
+    for name in ("vpc-cni", "kube-proxy"):
         assert native[name] == {}
+    assert native["eks-pod-identity-agent"] == {"tolerations": [{"operator": "Exists"}]}
     for component in ("cainjector", "webhook"):
         assert_system(native["cert-manager"][component])
     cloudwatch = native["amazon-cloudwatch-observability"]

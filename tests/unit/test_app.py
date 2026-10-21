@@ -69,7 +69,7 @@ def test_defaults_to_dev_when_nothing_is_set(tmp_path):
     assert _stacks(tmp_path) == _expected_stacks("dev")
 
 
-def test_dev_public_endpoint_keeps_kubectl_providers_outside_vpc(tmp_path):
+def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
     result = _run(tmp_path, context="dev")
     assert result.returncode == 0, result.stderr
     environment = load_environment("dev")
@@ -89,6 +89,64 @@ def test_dev_public_endpoint_keeps_kubectl_providers_outside_vpc(tmp_path):
     assert {props["Handler"] for props in providers.values()} == {"index.handler", "framework.onEvent"}
     for logical_id, props in providers.items():
         assert "VpcConfig" not in props, f"{logical_id} must not be attached to public subnets"
+
+    all_resources = [
+        resource
+        for path in tmp_path.glob("*.template.json")
+        for resource in json.loads(path.read_text())["Resources"].values()
+    ]
+    nodes = [
+        resource["Properties"] for resource in all_resources
+        if resource["Type"] == "AWS::EKS::Nodegroup"
+    ]
+    assert len(nodes) == 1
+    assert nodes[0]["InstanceTypes"] == ["t3.large"]
+    assert nodes[0]["ScalingConfig"] == {"MinSize": 2, "DesiredSize": 2, "MaxSize": 3}
+    assert nodes[0]["Labels"] == {"workload-type": "system"}
+    assert nodes[0]["Taints"] == [
+        {"Key": "workload-type", "Value": "system", "Effect": "NO_SCHEDULE"}
+    ]
+    assert "LaunchTemplate" in nodes[0]
+    templates = [
+        resource["Properties"]["LaunchTemplateData"] for resource in all_resources
+        if resource["Type"] == "AWS::EC2::LaunchTemplate"
+    ]
+    assert len(templates) == 1
+    assert len(templates[0]["SecurityGroupIds"]) == 2
+    disk = templates[0]["BlockDeviceMappings"][0]["Ebs"]
+    assert disk["VolumeSize"] == 20
+    assert disk["VolumeType"] == "gp3"
+    assert disk["Encrypted"] is True
+    addons = {
+        resource["Properties"]["AddonName"]: resource["Properties"]
+        for resource in all_resources if resource["Type"] == "AWS::EKS::Addon"
+    }
+    assert addons.keys() == {
+        "vpc-cni", "coredns", "kube-proxy", "eks-pod-identity-agent",
+        "aws-ebs-csi-driver", "metrics-server",
+    }
+    assert addons["aws-ebs-csi-driver"]["PodIdentityAssociations"][0]["ServiceAccount"] == "ebs-csi-controller-sa"
+    charts = [
+        resource["Properties"] for resource in all_resources
+        if resource["Type"] == "Custom::AWSCDK-EKS-HelmChart"
+    ]
+    assert [chart["Chart"] for chart in charts] == ["aws-load-balancer-controller"]
+    subnets = [
+        resource["Properties"] for resource in all_resources
+        if resource["Type"] == "AWS::EC2::Subnet"
+    ]
+    assert len(subnets) == 3
+    assert all(subnet["MapPublicIpOnLaunch"] is True for subnet in subnets)
+    manifests = [
+        obj for resource in all_resources
+        if resource["Type"] == "Custom::AWSCDK-EKS-KubernetesResource"
+        for obj in json.loads(resource["Properties"]["Manifest"])
+    ]
+    storage = next(obj for obj in manifests if obj["kind"] == "StorageClass")
+    assert storage["metadata"]["name"] == "gp3"
+    assert storage["metadata"]["annotations"]["storageclass.kubernetes.io/is-default-class"] == "true"
+    assert storage["parameters"]["encrypted"] == "true"
+    assert not any(obj["kind"] in {"NodePool", "EC2NodeClass"} for obj in manifests)
 
 
 def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
