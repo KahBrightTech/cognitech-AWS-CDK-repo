@@ -816,6 +816,25 @@ The dev configuration includes commented compute examples and remains
 control-plane-only until they are enabled. Resource settings and policy paths
 in the example above assume matching IAM roles and security groups already exist.
 
+#### Public-subnet development connectivity
+
+Dev explicitly enables the public Kubernetes API endpoint and disables its
+private endpoint (`endpoint_public_access: true`, `endpoint_private_access: false`).
+The kubectl handler and framework Lambdas run outside the VPC; a synthesis test
+checks that both have no `VpcConfig`. Cluster and worker subnet selection remains
+independent of this provider placement.
+
+A VPC-attached Lambda does not receive a public IP, even in a public subnet.
+An Internet Gateway route alone cannot give it outbound access to Lambda/AWS APIs
+or the CloudFormation response URL. Private-endpoint configurations need properly
+connected private subnets, with NAT or the required service endpoints and routes.
+Public API access still requires IAM authentication and Kubernetes authorization.
+The outside-VPC provider has no fixed outbound IP; introducing public endpoint
+CIDR restrictions requires a different, explicitly validated provider network setup.
+
+This setting is for the development test environment, does not change prod, and
+does not repair a previously failed CloudFormation deletion.
+
 #### System controllers versus application nodes
 
 The commented dev examples reserve the managed node group for system workloads

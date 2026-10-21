@@ -69,6 +69,28 @@ def test_defaults_to_dev_when_nothing_is_set(tmp_path):
     assert _stacks(tmp_path) == _expected_stacks("dev")
 
 
+def test_dev_public_endpoint_keeps_kubectl_providers_outside_vpc(tmp_path):
+    result = _run(tmp_path, context="dev")
+    assert result.returncode == 0, result.stderr
+    environment = load_environment("dev")
+    stack_name = environment.common.name(environment.network.name, "eks")
+    resources = json.loads((tmp_path / f"{stack_name}.template.json").read_text())["Resources"]
+    clusters = [resource for resource in resources.values() if resource["Type"] == "AWS::EKS::Cluster"]
+    assert len(clusters) == 1
+    config = clusters[0]["Properties"]["ResourcesVpcConfig"]
+    assert config["EndpointPublicAccess"] is True
+    assert config["EndpointPrivateAccess"] is False
+    providers = {
+        logical_id: resource["Properties"]
+        for logical_id, resource in resources.items()
+        if resource["Type"] == "AWS::Lambda::Function" and "KubectlProvider" in logical_id
+    }
+    assert len(providers) == 2
+    assert {props["Handler"] for props in providers.values()} == {"index.handler", "framework.onEvent"}
+    for logical_id, props in providers.items():
+        assert "VpcConfig" not in props, f"{logical_id} must not be attached to public subnets"
+
+
 def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
     configured_groups = {
         principal: list(entry.kubernetes_groups)
