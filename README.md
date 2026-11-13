@@ -2112,13 +2112,15 @@ correct — shared construct code changes them all.
 was about to do.
 
 To deploy everything except EKS, select **action: deploy**, **stacks: all**,
-and enter **exclude: eks**. This also skips the cluster's nested access entries,
+and choose **exclude: md-preproduction-use1-dev-eks** from the dropdown.
+This also skips the cluster's nested access entries,
 node groups, add-ons, Karpenter and Helm applications. All configuration and
 synthesized stacks remain available for a later run.
 
-`exclude` accepts comma- or whitespace-separated full stack names or unambiguous
-suffixes, such as `eks,certificates`. Future stacks are discovered from the
-synthesized assembly without maintaining another list. Leave it blank to preserve
+`exclude` is a single-choice dropdown: **none** (the default) or one stack.
+GitHub Actions does not support multi-select dropdowns. The existing sync workflow
+updates both the stack and exclusion dropdowns from `cdk list`, including future
+stacks, without maintaining another list. Choose **none** to preserve
 the existing `all` behavior; exclusions are only accepted with `stacks: all`.
 Unknown/ambiguous names and excluding every stack fail before AWS authentication.
 The run summary lists selected and excluded stacks, and apply uses exactly the

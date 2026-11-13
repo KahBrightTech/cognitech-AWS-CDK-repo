@@ -39,7 +39,10 @@ def select_stacks(
         return matches[0]
 
     requested = requested.strip() or "all"
-    tokens = [token for token in re.split(r"[,\s]+", excluded.strip()) if token]
+    tokens = (
+        [] if excluded.strip() == "none"
+        else [token for token in re.split(r"[,\s]+", excluded.strip()) if token]
+    )
     if tokens and requested != "all":
         raise ValueError("exclude can only be used with stacks=all.")
     omitted = list(dict.fromkeys(resolve(token, allow_suffix=True) for token in tokens))

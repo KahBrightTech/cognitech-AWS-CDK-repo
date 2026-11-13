@@ -57,9 +57,9 @@ jobs:
 """
 
 
-def _options(text: str) -> list[str]:
+def _options(text: str, begin=sync.BEGIN, end=sync.END) -> list[str]:
     """The stack names between the generated markers."""
-    inside = text.split(sync.BEGIN)[1].split(sync.END)[0]
+    inside = text.split(begin)[1].split(end)[0]
     return [
         line.strip().removeprefix("- ")
         for line in inside.splitlines()
@@ -104,6 +104,35 @@ def test_render_is_stable_when_nothing_changed():
 def test_render_refuses_a_file_without_markers():
     with pytest.raises(ValueError):
         sync.render("on: push\n", ["one"])
+
+
+def test_render_updates_both_dropdowns_for_new_stacks():
+    workflow = WORKFLOW.replace("jobs:\n", """\
+      exclude:
+        description: Skip one stack
+        type: choice
+        default: none
+        # BEGIN generated exclude options -- scripts/sync_stack_choices.py
+        options:
+          - none
+          - stale-exclusion
+        # END generated exclude options
+jobs:
+""")
+    updated = sync.render(workflow, ["one", "new-stack"])
+    assert _options(updated) == ["all", "one", "new-stack"]
+    assert _options(updated, sync.EXCLUDE_BEGIN, sync.EXCLUDE_END) == ["none", "one", "new-stack"]
+    assert sync.render(updated, ["one", "new-stack"]) == updated
+    inputs = yaml.safe_load(updated)[True]["workflow_dispatch"]["inputs"]
+    assert inputs["exclude"]["description"] == "Skip one stack"
+    assert inputs["exclude"]["type"] == "choice"
+    assert inputs["exclude"]["default"] == "none"
+
+
+@pytest.mark.parametrize("marker", [sync.EXCLUDE_BEGIN, sync.EXCLUDE_END])
+def test_render_refuses_incomplete_exclusion_markers(marker):
+    with pytest.raises(ValueError, match="generated exclude options"):
+        sync.render(WORKFLOW + f"# {marker.removeprefix('# ')}\n", ["one"])
 
 
 def _selection_manifest():
@@ -165,8 +194,11 @@ def test_ambiguous_suffix_requires_a_full_name():
 
 @pytest.mark.parametrize("requested, excluded, expected", [
     ("", "", "--all"),
+    ("all", "none", "--all"),
+    ("acme-dev-eks", "none", "acme-dev-eks"),
     ("acme-dev-eks", "", "acme-dev-eks"),
     ("all", "eks, storage", "acme-dev-network acme-dev-security --exclusively"),
+    ("all", "acme-dev-eks", "acme-dev-network acme-dev-security acme-dev-storage --exclusively"),
 ])
 def test_workflow_selection_exports_reviewed_targets(tmp_path, requested, excluded, expected):
     workflow = yaml.safe_load((WORKFLOWS / "deploy-primary-mdpp-dev.yml").read_text())
@@ -175,7 +207,7 @@ def test_workflow_selection_exports_reviewed_targets(tmp_path, requested, exclud
         "REQUESTED": "${{ inputs.stacks }}", "EXCLUDED": "${{ inputs.exclude }}",
         "ACTION": "${{ inputs.action }}",
     }
-    assert workflow[True]["workflow_dispatch"]["inputs"]["exclude"]["default"] == ""
+    assert workflow[True]["workflow_dispatch"]["inputs"]["exclude"]["default"] == "none"
     outdir = tmp_path / "cdk.out"
     outdir.mkdir()
     (outdir / "manifest.json").write_text(json.dumps(_selection_manifest()))
@@ -196,11 +228,13 @@ def test_workflow_selection_exports_reviewed_targets(tmp_path, requested, exclud
     assert result.returncode == 0, result.stdout + result.stderr
     assert output.read_text() == f"targets={expected}\n"
     assert environment_file.read_text().splitlines()[0] == f"TARGETS={expected}"
-    if excluded:
+    if excluded == "eks, storage":
         assert summary.read_text() == (
             "### Selected stacks\n\n- `acme-dev-network`\n- `acme-dev-security`\n"
             "\n### Excluded stacks\n\n- `acme-dev-eks`\n- `acme-dev-storage`\n"
         )
+    elif excluded == "none":
+        assert "Excluded stacks" not in summary.read_text()
 
 
 def test_exclude_eks_from_real_dev_assembly_preserves_foundations(tmp_path):
@@ -413,6 +447,13 @@ def test_committed_dropdown_matches_the_app(path, tmp_path):
 
     options = _options(text)
     assert options[0] == sync.ALL, "the first choice must be 'all'"
-    assert set(options[1:]) == _built_stacks(env_name, tmp_path), (
+    built = _built_stacks(env_name, tmp_path)
+    assert set(options[1:]) == built, (
         f"{path.name} is out of date. Run: python scripts/sync_stack_choices.py"
     )
+    if sync.EXCLUDE_BEGIN in text:
+        excluded_options = _options(text, sync.EXCLUDE_BEGIN, sync.EXCLUDE_END)
+        assert excluded_options[0] == sync.NONE
+        assert set(excluded_options[1:]) == built, (
+            f"{path.name} exclusion dropdown is out of date. Run: python scripts/sync_stack_choices.py"
+        )

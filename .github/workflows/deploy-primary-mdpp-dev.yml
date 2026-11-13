@@ -53,10 +53,21 @@ on:
           - md-preproduction-use1-dev-eks
         # END generated stack options
       exclude:
-        description: 'With stacks=all, skip names/suffixes separated by commas (e.g. eks,rds)'
+        description: stacks to exclude
         required: false
-        default: ""
-        type: string
+        default: none
+        type: choice
+        # BEGIN generated exclude options -- scripts/sync_stack_choices.py
+        options:
+          - none
+          - md-preproduction-use1-dev-network
+          - md-preproduction-use1-dev-security
+          - md-preproduction-use1-dev-iam
+          - md-preproduction-use1-dev-storage
+          - md-preproduction-use1-dev-key-pairs
+          - md-preproduction-use1-dev-certificates
+          - md-preproduction-use1-dev-eks
+        # END generated exclude options
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'
         required: false

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep the stack dropdown in each deploy workflow in sync with the app.
+"""Keep the stack and exclusion dropdowns in sync with the app.
 
 GitHub builds the "Run workflow" form from the YAML on the default branch,
 before any runner exists, so a `choice` input cannot be filled in while the job
@@ -20,6 +20,7 @@ A workflow opts in by declaring the environment it deploys as a workflow- or job
         # END generated stack options
 
 Workflows without those markers are left alone.
+An optional generated exclude options block uses the same stacks, preceded by `none`.
 """
 
 from __future__ import annotations
@@ -39,9 +40,12 @@ WORKFLOW_GLOB = "deploy-*.yml"
 
 BEGIN = "# BEGIN generated stack options"
 END = "# END generated stack options"
+EXCLUDE_BEGIN = "# BEGIN generated exclude options"
+EXCLUDE_END = "# END generated exclude options"
 
 # The first choice is not a stack: it means "everything this environment builds".
 ALL = "all"
+NONE = "none"
 
 
 def environment_of(text: str) -> str | None:
@@ -81,23 +85,30 @@ def cdk_stacks(env_name: str) -> list[str]:
     return stacks
 
 
-def render(text: str, stacks: list[str]) -> str:
-    """Return `text` with the generated block replaced by `stacks`."""
+def _render_options(text: str, choices: list[str], begin: str, end: str) -> str:
     lines = text.splitlines(keepends=True)
 
-    begins = [i for i, line in enumerate(lines) if line.strip().startswith(BEGIN)]
-    ends = [i for i, line in enumerate(lines) if line.strip().startswith(END)]
+    begins = [i for i, line in enumerate(lines) if line.strip().startswith(begin)]
+    ends = [i for i, line in enumerate(lines) if line.strip().startswith(end)]
     if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
-        raise ValueError(f"expected exactly one {BEGIN} ... {END} block")
+        raise ValueError(f"expected exactly one {begin} ... {end} block")
 
     start, stop = begins[0], ends[0]
     indent = " " * (len(lines[start]) - len(lines[start].lstrip()))
 
     block = [lines[start], f"{indent}options:\n"]
-    block += [f"{indent}  - {name}\n" for name in [ALL, *stacks]]
+    block += [f"{indent}  - {name}\n" for name in choices]
     block.append(lines[stop])
 
     return "".join(lines[:start] + block + lines[stop + 1 :])
+
+
+def render(text: str, stacks: list[str]) -> str:
+    """Update both dropdowns, preserving workflows without an exclusion block."""
+    updated = _render_options(text, [ALL, *stacks], BEGIN, END)
+    if EXCLUDE_BEGIN in text or EXCLUDE_END in text:
+        updated = _render_options(updated, [NONE, *stacks], EXCLUDE_BEGIN, EXCLUDE_END)
+    return updated
 
 
 def main(argv: list[str] | None = None) -> int:
