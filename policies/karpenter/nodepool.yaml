@@ -1,0 +1,27 @@
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: "[[node_pool_name]]"
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: "[[node_class_name]]"
+      requirements:
+      - key: karpenter.k8s.aws/instance-category
+        operator: In
+        values: "[[instance_categories]]"
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values: "[[capacity_types]]"
+      - key: kubernetes.io/arch
+        operator: In
+        values: "[[architectures]]"
+      expireAfter: 720h
+  limits:
+    cpu: "[[cpu_limit]]"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m

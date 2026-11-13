@@ -27,7 +27,7 @@ from constructs import Construct, IDependable
 
 from cognitech_cdk.common import schema
 from cognitech_cdk.common.config import merge_config as _merge
-from cognitech_cdk.common.documents import render
+from cognitech_cdk.common.documents import placeholders, render
 from cognitech_cdk.constructs.eks import construct_id
 from cognitech_cdk.constructs.eks_addons import (
     CORE_ADDONS,
@@ -553,13 +553,42 @@ class EksAddons:
         chart.node.add_dependency(association)
         self._after(chart, list(core))
 
-        pool = props.node_pool
-        group_ids = [{"id": cluster.cluster_security_group_id}] + [
-            {"id": group} for group in self._group_ids(props.security_groups, label)
-        ]
-        manifests = eks.KubernetesManifest(
-            scope, "KarpenterNodePool", cluster=cluster, overwrite=True,
-            manifest=[
+        if props.node_class_manifest is not None:
+            values: dict[str, Any] = {
+                "account_id": self._stack.account,
+                "account_name": self._stack.config.common.account_name,
+                "region": self._stack.region,
+                "region_prefix": self._stack.config.common.region_prefix,
+                "partition": self._stack.partition,
+                "environment": self._stack.config.name,
+                "cluster_name": cluster.cluster_name,
+                "cluster_security_group_id": cluster.cluster_security_group_id,
+                "node_role_name": node_role.role_name,
+                "node_role_arn": node_role.role_arn,
+                "node_name": self._stack.resource_name(name, "karpenter-node"),
+                "tags": {
+                    **self._stack.config.common.tags,
+                    "Name": self._stack.resource_name(name, "karpenter-node"),
+                },
+            }
+            needed = placeholders([props.node_class_manifest, props.node_pool_manifest, dict(props.variables)])
+            if needed & {"subnet_ids", "subnet_selector_terms"}:
+                values["subnet_ids"] = self._subnets(props.subnet_tier, label)
+                values["subnet_selector_terms"] = [{"id": subnet} for subnet in values["subnet_ids"]]
+            if needed & {"security_group_ids", "security_group_selector_terms"}:
+                values["security_group_ids"] = [
+                    cluster.cluster_security_group_id, *self._group_ids(props.security_groups, label),
+                ]
+                values["security_group_selector_terms"] = [
+                    {"id": group} for group in values["security_group_ids"]
+                ]
+            manifest = props.render_manifests(values, label)
+        else:
+            pool = props.node_pool
+            group_ids = [{"id": cluster.cluster_security_group_id}] + [
+                {"id": group} for group in self._group_ids(props.security_groups, label)
+            ]
+            manifest = [
                 {
                     "apiVersion": "karpenter.k8s.aws/v1",
                     "kind": "EC2NodeClass",
@@ -598,7 +627,10 @@ class EksAddons:
                         },
                     },
                 },
-            ],
+            ]
+        manifests = eks.KubernetesManifest(
+            scope, "KarpenterNodePool", cluster=cluster, overwrite=True,
+            manifest=manifest,
         )
         manifests.node.add_dependency(chart)
         self._stack.output(f"{construct_id(name)}KarpenterQueueName", queue.queue_name, f"{name}-karpenter-queue-name")

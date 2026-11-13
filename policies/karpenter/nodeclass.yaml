@@ -1,0 +1,16 @@
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: "[[node_class_name]]"
+spec:
+  role: "[[node_role_name]]"
+  amiSelectorTerms:
+  - alias: al2023@latest
+  subnetSelectorTerms:
+  - tags:
+      Name: "[[account_name]]-[[region_prefix]]-[[environment]]-public-*"
+  securityGroupSelectorTerms: "[[security_group_selector_terms]]"
+  metadataOptions:
+    httpTokens: required
+    httpPutResponseHopLimit: 2
+  tags: "[[tags]]"

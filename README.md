@@ -881,6 +881,105 @@ capacity. A node-group taint such as the example above needs matching toleration
 on workloads intended to use those nodes; Karpenter controller tolerations can be
 set through `compute.karpenter.values` using the chart's settings.
 
+#### Native Karpenter YAML templates
+
+Dev keeps the NodeClass and NodePool specifications in separate native Kubernetes
+YAML files, referenced under `eks[].compute.karpenter`:
+
+```yaml
+node_role: eks-nodes
+subnet_tier: public
+security_groups: [eks-nodes]
+node_class_manifest: policies/karpenter/nodeclass.yaml
+node_pool_manifest: policies/karpenter/nodepool.yaml
+variables:
+  node_class_name: default
+  node_pool_name: default
+  instance_categories: [t, m, c]
+  capacity_types: [on-demand]
+  architectures: [amd64]
+  cpu_limit: "8"
+```
+
+Paths remain repository-root relative. Both files must be provided together;
+each contains one document: an `EC2NodeClass` (`karpenter.k8s.aws/v1`) or
+`NodePool` (`karpenter.sh/v1`). The NodePool's `spec.template.spec.nodeClassRef`
+must reference the NodeClass's name, group and kind. They stay in the existing
+Karpenter nested stack and are applied after its Helm chart installs the CRDs.
+
+Templates use the shared `[[variable]]` syntax. Quote whole-value placeholders:
+`subnetSelectorTerms: "[[subnet_selector_terms]]"` inserts a native list,
+not a string. Lists, mappings, numbers and booleans retain their types.
+Custom `variables` can contain built-in placeholders and are resolved before
+the manifests; they cannot reference other custom variables or override built-ins.
+Unknown placeholders fail explicitly.
+
+| Built-in | Value |
+| --- | --- |
+| `node_role_name`, `node_role_arn` | IAM role selected by `node_role` |
+| `subnet_ids`, `subnet_selector_terms` | IDs / `{id: ...}` terms for `subnet_tier` |
+| `security_group_ids`, `security_group_selector_terms` | Cluster SG plus configured `security_groups` |
+| `cluster_name`, `cluster_security_group_id` | Cluster identifiers |
+| `account_id`, `region`, `partition`, `environment` | Effective deployment values |
+| `account_name`, `region_prefix` | Effective `common` naming values |
+| `tags`, `node_name` | Common tags plus the generated node Name / that Name |
+
+For tag- or ID-based subnet selectors and name-, tag- or ID-based security-group
+selectors, replace the corresponding template fields with custom variables:
+
+```yaml
+# nodeclass.yaml spec
+subnetSelectorTerms: "[[subnet_terms]]"
+securityGroupSelectorTerms: "[[group_terms]]"
+```
+
+```yaml
+# compute.karpenter.variables in env.yaml
+subnet_terms:
+- tags:
+    karpenter.sh/discovery: "[[cluster_name]]"
+group_terms:
+- name: "apps-*"
+- id: sg-0123456789abcdef0
+```
+
+Karpenter ORs separate selector terms; selectors within a term are ANDed. Tag
+selectors require matching tags already present on the AWS resources—this
+configuration does not add discovery tags automatically. Dev defines its subnet
+search directly in `nodeclass.yaml`:
+
+```yaml
+subnetSelectorTerms:
+- tags:
+    Name: "[[account_name]]-[[region_prefix]]-[[environment]]-public-*"
+```
+
+This matches primary, secondary, tertiary and any future subnets with the same
+public-subnet Name pattern. Account name, region prefix and environment resolve
+from the selected deployment, so copying the template does not retain dev's
+subnet names. Matching Name tags must still exist in the destination deployment.
+Security groups still use generated ID selectors.
+To select generated subnet IDs instead, replace that YAML field with
+`subnetSelectorTerms: "[[subnet_selector_terms]]"`.
+
+IAM has no selector terms: set exactly one of `spec.role` or
+`spec.instanceProfile`. Dev uses `role: "[[node_role_name]]"`. To use an existing
+profile, replace `role` with `instanceProfile: "[[profile_name]]"` and add
+`profile_name` to `variables`. Keep `node_role` pointing to that profile's role
+for controller IAM permissions and EKS node access; the profile must already
+exist. A `role` in the template must match `node_role`.
+
+Other native spec options—AMI selectors, block devices, kubelet settings,
+taints, requirements, limits, weights and disruption budgets—can be placed
+directly in the two YAML files or supplied as typed variables. Basic document,
+identity, selector and reference shapes are checked during synthesis; Karpenter's
+CRDs validate the remaining native options during deployment.
+
+The existing inline `node_pool` settings remain backward compatible, as does
+configuration under `eks_addons[].karpenter`. Without manifest files, the original
+generated default NodeClass and NodePool are unchanged. Do not combine
+`node_pool_manifest` with the old simplified `node_pool` settings.
+
 Launch templates and managed node groups remain in the `NodeGroups` nested
 stack. The node group's `launch_template` references a template's `name`;
 alternatively, the existing `launch_template_id` / `launch_template_version`
@@ -1563,7 +1662,7 @@ Helm-based add-ons have typed settings in `eks_addons`:
 | Key | Chart | AWS resources created |
 | --- | --- | --- |
 | `aws_load_balancer_controller` | aws-load-balancer-controller 3.6.0 | Pod Identity role with [AWS's policy](policies/aws-load-balancer-controller-v3.6.0.json) |
-| `karpenter` | karpenter 1.15.0 (`oci://public.ecr.aws`) | controller role ([official policy](policies/karpenter-controller-v1.15.0.json)), interruption SQS queue, 5 EventBridge rules, `EC2NodeClass` + `NodePool` |
+| `karpenter` | karpenter 1.15.0 (`oci://public.ecr.aws`) | controller role ([controller policy](policies/karpenter/karpenter-controller-v1.15.0.json)), interruption SQS queue, 5 EventBridge rules, `EC2NodeClass` + `NodePool` |
 | `argocd` | argo-cd 10.10.5 | ALB ingress; optional Identity Center SAML via Dex |
 | `nginx_ingress` | F5 NGINX Ingress Controller 2.8.0 | NLB with TLS at the load balancer |
 | `gateway_api` | NGINX Gateway Fabric 2.8.0 | Gateway API v1.6.3 CRDs from [charts/gateway-api-crds](charts/gateway-api-crds) |

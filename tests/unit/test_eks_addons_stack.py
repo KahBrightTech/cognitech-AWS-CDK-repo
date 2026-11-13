@@ -12,7 +12,7 @@ from aws_cdk.assertions import Match, Template
 
 from cognitech_cdk.common.environment import load_environment
 from cognitech_cdk.constructs.eks import EksProps
-from cognitech_cdk.constructs.eks_addons import NATIVE_ADDONS, EksAddonsProps
+from cognitech_cdk.constructs.eks_addons import NATIVE_ADDONS, EksAddonsProps, KarpenterProps
 from cognitech_cdk.stacks.eks_stack import EksStack
 from cognitech_cdk.stacks.network_stack import NetworkStack
 
@@ -469,6 +469,143 @@ def test_karpenter_queue_rules_policy_and_ordering(write_env, nested_compute):
         "NodeGroups": set(), "CoreAddons": {"NodeGroups"}, "Karpenter": {"CoreAddons"},
         "Addons": {"CoreAddons", "Karpenter"}, "Apps": {"CoreAddons", "Karpenter", "Addons"},
     }
+
+
+def _native_karpenter():
+    folder = "policies/karpenter"
+    return {
+        "node_role": "eks-nodes", "replicas": 1, "security_groups": ["alb"],
+        "node_class_manifest": f"{folder}/nodeclass.yaml",
+        "node_pool_manifest": f"{folder}/nodepool.yaml",
+        "variables": {
+            "node_class_name": "default", "node_pool_name": "default",
+            "instance_categories": ["t", "m"], "capacity_types": ["on-demand"],
+            "architectures": ["amd64"], "cpu_limit": "8",
+        },
+    }
+
+
+def _karpenter_objects(template):
+    value = next(
+        resource["Properties"]["Manifest"]
+        for resource in template.find_resources("Custom::AWSCDK-EKS-KubernetesResource").values()
+        if "EC2NodeClass" in str(resource["Properties"]["Manifest"])
+    )
+    if not isinstance(value, str):
+        separator, parts = value["Fn::Join"]
+        value = separator.join(part if isinstance(part, str) else "<token>" for part in parts)
+    return json.loads(value)
+
+
+def test_native_karpenter_files_change_only_subnet_selection_and_preserve_order(write_env):
+    legacy_stack, legacy = _stacks(write_env, TYPED)
+    addons = yaml.safe_load(TYPED)
+    addons[0]["karpenter"] = _native_karpenter()
+    native_stack, native = _stacks(write_env, yaml.safe_dump(addons))
+    expected = _karpenter_objects(legacy)
+    expected[0]["spec"]["subnetSelectorTerms"] = [
+        {"tags": {"Name": "int-production-use1-test-public-*"}},
+    ]
+    assert _karpenter_objects(native) == expected
+    assert _nested_order(native_stack) == _nested_order(legacy_stack)
+
+
+def test_native_selectors_variables_profile_and_extra_options(write_env):
+    config = _native_karpenter()
+    node_class = yaml.safe_load((_repo_root() / config["node_class_manifest"]).read_text())
+    node_pool = yaml.safe_load((_repo_root() / config["node_pool_manifest"]).read_text())
+    spec = node_class["spec"]
+    del spec["role"]
+    spec["instanceProfile"] = "[[profile_name]]"
+    spec["subnetSelectorTerms"] = "[[subnet_terms]]"
+    spec["securityGroupSelectorTerms"] = "[[group_terms]]"
+    spec["blockDeviceMappings"] = [{
+        "deviceName": "/dev/xvda", "ebs": {"volumeSize": "40Gi", "encrypted": True},
+    }]
+    node_pool["spec"]["weight"] = 20
+    node_pool["spec"]["limits"]["memory"] = "32Gi"
+    node_pool["spec"]["template"]["spec"]["taints"] = [{
+        "key": "workload", "value": "apps", "effect": "NoSchedule",
+    }]
+    config.update({
+        "node_class_manifest": node_class, "node_pool_manifest": node_pool,
+        # Unused generated selectors must not require local private subnets or groups.
+        "subnet_tier": "private", "security_groups": ["not-a-local-group"],
+    })
+    config["variables"].update({
+        "node_class_name": "apps", "node_pool_name": "apps",
+        "profile_name": "existing-node-profile",
+        "subnet_terms": [{"tags": {"karpenter.sh/discovery": "[[cluster_name]]"}}, {"id": "subnet-12345678"}],
+        "group_terms": [{"name": "apps-*"}, {"tags": {"Environment": "[[environment]]"}}],
+    })
+    addons = yaml.safe_load(TYPED)
+    addons[0]["karpenter"] = config
+    _, template = _stacks(write_env, yaml.safe_dump(addons))
+    node_class, node_pool = _karpenter_objects(template)
+    assert node_class["metadata"]["name"] == node_pool["metadata"]["name"] == "apps"
+    assert node_class["spec"]["instanceProfile"] == "existing-node-profile"
+    assert "role" not in node_class["spec"]
+    assert node_class["spec"]["subnetSelectorTerms"] == [
+        {"tags": {"karpenter.sh/discovery": "<token>"}}, {"id": "subnet-12345678"},
+    ]
+    assert node_class["spec"]["securityGroupSelectorTerms"] == [
+        {"name": "apps-*"}, {"tags": {"Environment": "test"}},
+    ]
+    assert node_class["spec"]["blockDeviceMappings"] == spec["blockDeviceMappings"]
+    assert node_pool["spec"]["template"]["spec"]["nodeClassRef"]["name"] == "apps"
+    assert node_pool["spec"]["weight"] == 20
+    assert node_pool["spec"]["limits"] == {"cpu": "8", "memory": "32Gi"}
+    assert node_pool["spec"]["template"]["spec"]["taints"][0]["effect"] == "NoSchedule"
+
+
+@pytest.mark.parametrize("updates, message", [
+    ({"node_pool_manifest": None}, "provide both"),
+    ({"node_pool": {"cpu_limit": 8}}, "not both"),
+    ({"variables": {"node_role_name": "different-role"}}, "built-in placeholder"),
+    ({"variables": {"custom": "[[missing]]"}}, "unresolved placeholders"),
+    ({"node_class_manifest": {"spec": "[[missing]]"}}, "unresolved placeholders"),
+    ({"node_class_manifest": "missing-nodeclass.yaml"}, "cannot read file"),
+    ({"node_pool_manifest": "../outside.yaml"}, "remain under the repository root"),
+])
+def test_invalid_karpenter_templates_fail_explicitly(updates, message):
+    with pytest.raises(ValueError, match=message):
+        KarpenterProps.from_dict({**_native_karpenter(), **updates}, "main", base_dir=_repo_root())
+
+
+@pytest.mark.parametrize("change, message", [
+    ("wrong-kind", "expected kind EC2NodeClass"),
+    ("both-identities", "exactly one of role or instanceProfile"),
+    ("different-role", "must match the configured node_role"),
+    ("missing-selectors", "subnetSelectorTerms must be a nonempty list"),
+    ("wrong-reference", "must reference this EC2NodeClass"),
+    ("namespace", "cluster-scoped"),
+])
+def test_invalid_rendered_nodeclass_and_nodepool_are_rejected(change, message):
+    config = _native_karpenter()
+    node_class = yaml.safe_load((_repo_root() / config["node_class_manifest"]).read_text())
+    node_pool = yaml.safe_load((_repo_root() / config["node_pool_manifest"]).read_text())
+    if change == "wrong-kind":
+        node_class["kind"] = "NodePool"
+    elif change == "both-identities":
+        node_class["spec"]["instanceProfile"] = "existing-profile"
+    elif change == "different-role":
+        node_class["spec"]["role"] = "different-role"
+    elif change == "missing-selectors":
+        node_class["spec"]["subnetSelectorTerms"] = []
+    elif change == "wrong-reference":
+        node_pool["spec"]["template"]["spec"]["nodeClassRef"]["name"] = "other-class"
+    elif change == "namespace":
+        node_class["metadata"]["namespace"] = "default"
+    config.update({"node_class_manifest": node_class, "node_pool_manifest": node_pool})
+    props = KarpenterProps.from_dict(config, "main", base_dir=_repo_root())
+    with pytest.raises(ValueError, match=message):
+        props.render_manifests({
+            "account_name": "int-production", "region_prefix": "use1", "environment": "test",
+            "node_role_name": "existing-role",
+            "subnet_selector_terms": [{"id": "subnet-12345678"}],
+            "security_group_selector_terms": [{"id": "sg-12345678"}],
+            "tags": {"Environment": "test"},
+        }, "karpenter")
 
 
 def test_duplicate_karpenter_configuration_is_rejected(write_env):

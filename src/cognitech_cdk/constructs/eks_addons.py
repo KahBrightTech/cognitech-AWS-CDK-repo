@@ -43,7 +43,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from cognitech_cdk.common import schema
-from cognitech_cdk.common.documents import json_compatible, load_document, load_text, repository_path
+from cognitech_cdk.common.documents import (
+    PLACEHOLDER, json_compatible, load_document, load_text, placeholders, render, repository_path,
+)
 
 POD_IDENTITY_AGENT = "eks-pod-identity-agent"
 RESOLVE_CONFLICTS = ("OVERWRITE", "NONE", "PRESERVE")
@@ -53,7 +55,7 @@ K8S_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 HELM_REPOSITORY = re.compile(r"(https://|oci://)[^\s]+")
 DEFAULT_LBC_POLICY = "policies/aws-load-balancer-controller-v3.6.0.json"
 DEFAULT_LBC_CHART = "3.6.0"
-DEFAULT_KARPENTER_POLICY = "policies/karpenter-controller-v1.15.0.json"
+DEFAULT_KARPENTER_POLICY = "policies/karpenter/karpenter-controller-v1.15.0.json"
 DEFAULT_GATEWAY_CRDS = "charts/gateway-api-crds"
 DEFAULT_SSL_POLICY = "ELBSecurityPolicy-TLS13-1-2-2021-06"
 HOST = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
@@ -64,6 +66,12 @@ ARCHITECTURES = ("amd64", "arm64")
 SSL_POLICY = re.compile(r"ELBSecurityPolicy-[A-Za-z0-9-]+")
 CERT_ARN = re.compile(r"arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[A-Za-z0-9-]+")
 DURATION = re.compile(r"[0-9]+(s|m|h)|Never")
+KARPENTER_VARIABLES = frozenset({
+    "account_id", "account_name", "region", "region_prefix", "partition", "environment", "cluster_name",
+    "cluster_security_group_id", "node_role_name", "node_role_arn",
+    "subnet_ids", "subnet_selector_terms", "security_group_ids",
+    "security_group_selector_terms", "tags", "node_name",
+})
 
 
 @dataclass(frozen=True)
@@ -597,6 +605,61 @@ class KarpenterProps(ChartProps):
     policy: Mapping[str, Any] = field(default_factory=dict)
     node_pool: KarpenterNodePoolProps = KarpenterNodePoolProps()
     create_node_access_entry: bool = False
+    node_class_manifest: Mapping[str, Any] | None = None
+    node_pool_manifest: Mapping[str, Any] | None = None
+    variables: Mapping[str, Any] = field(default_factory=dict)
+
+    def render_manifests(self, values: Mapping[str, Any], label: str) -> list[dict[str, Any]]:
+        variables = render(dict(self.variables), values, f"{label}: variables")
+        context = {**values, **variables}
+        documents = []
+        for document, kind, version in (
+            (self.node_class_manifest, "EC2NodeClass", "karpenter.k8s.aws/v1"),
+            (self.node_pool_manifest, "NodePool", "karpenter.sh/v1"),
+        ):
+            where = f"{label}: {kind} manifest"
+            resolved = render(document, context, where)
+            data = schema.mapping(
+                resolved, where, {"apiVersion", "kind", "metadata", "spec"},
+                required=("apiVersion", "kind", "metadata", "spec"),
+            )
+            if data["kind"] != kind or data["apiVersion"] != version:
+                raise ValueError(f"{where}: expected kind {kind} with apiVersion {version}.")
+            metadata = data["metadata"]
+            if not isinstance(metadata, Mapping):
+                raise ValueError(f"{where}: metadata must be a mapping.")
+            _k8s_name(metadata.get("name"), f"{where}: metadata.name")
+            if "namespace" in metadata:
+                raise ValueError(f"{where}: {kind} is cluster-scoped; do not set metadata.namespace.")
+            if not isinstance(data["spec"], Mapping):
+                raise ValueError(f"{where}: spec must be a mapping.")
+            documents.append(dict(data))
+
+        node_class, node_pool = documents
+        spec = node_class["spec"]
+        role = spec.get("role")
+        profile = spec.get("instanceProfile")
+        if (role is not None) == (profile is not None):
+            raise ValueError(f"{label}: EC2NodeClass must set exactly one of role or instanceProfile.")
+        schema.required_string(role if role is not None else profile, f"{label}: EC2NodeClass IAM identity")
+        if role is not None and role != values["node_role_name"]:
+            raise ValueError(f"{label}: EC2NodeClass role must match the configured node_role.")
+        for key in ("amiSelectorTerms", "subnetSelectorTerms", "securityGroupSelectorTerms"):
+            terms = spec.get(key)
+            if not isinstance(terms, list) or not terms or any(
+                not isinstance(term, Mapping) or not term for term in terms
+            ):
+                raise ValueError(f"{label}: EC2NodeClass {key} must be a nonempty list of mappings.")
+        template = node_pool["spec"].get("template")
+        pool_spec = template.get("spec") if isinstance(template, Mapping) else None
+        reference = pool_spec.get("nodeClassRef") if isinstance(pool_spec, Mapping) else None
+        expected = {
+            "group": "karpenter.k8s.aws", "kind": "EC2NodeClass",
+            "name": node_class["metadata"]["name"],
+        }
+        if reference != expected:
+            raise ValueError(f"{label}: NodePool template.spec.nodeClassRef must reference this EC2NodeClass.")
+        return documents
 
     @classmethod
     def from_dict(cls, raw: Any, cluster: str, *, base_dir: Path | None) -> KarpenterProps | None:
@@ -605,11 +668,33 @@ class KarpenterProps(ChartProps):
         label = f"EKS add-ons '{cluster}', karpenter"
         data = schema.mapping(raw, label, {
             *cls.KEYS, "node_role", "replicas", "subnet_tier", "security_groups", "policy",
-            "node_pool", "create_node_access_entry",
+            "node_pool", "create_node_access_entry", "node_class_manifest", "node_pool_manifest", "variables",
         }, required=("node_role",))
         policy = load_document(data.get("policy", DEFAULT_KARPENTER_POLICY), f"{label}: policy", base_dir=base_dir)
         if not isinstance(policy, Mapping) or not policy.get("Statement"):
             raise ValueError(f"{label}: policy must be an IAM policy document.")
+        documents = {}
+        for key in ("node_class_manifest", "node_pool_manifest"):
+            if data.get(key) is not None:
+                documents[key] = _values(data[key], f"{label}: {key}", base_dir=base_dir)
+        if documents and len(documents) != 2:
+            raise ValueError(f"{label}: provide both node_class_manifest and node_pool_manifest.")
+        if documents and data.get("node_pool") is not None:
+            raise ValueError(f"{label}: use node_pool_manifest or legacy node_pool settings, not both.")
+        variables = data.get("variables", {})
+        if not isinstance(variables, Mapping):
+            raise ValueError(f"{label}: variables must be a mapping.")
+        for key in variables:
+            if not isinstance(key, str) or not PLACEHOLDER.fullmatch(f"[[{key}]]"):
+                raise ValueError(f"{label}: variables contains an invalid placeholder name '{key}'.")
+            if key in KARPENTER_VARIABLES:
+                raise ValueError(f"{label}: variable '{key}' is a built-in placeholder.")
+        if variables and not documents:
+            raise ValueError(f"{label}: variables requires node_class_manifest and node_pool_manifest.")
+        unknown = placeholders(dict(variables)) - KARPENTER_VARIABLES
+        unknown |= placeholders(documents) - KARPENTER_VARIABLES - set(variables)
+        if unknown:
+            raise ValueError(f"{label}: unresolved placeholders: {', '.join(sorted(unknown))}.")
         return cls(
             **ChartProps.parse(data, label, version="1.15.0", namespace="kube-system", release="karpenter", base_dir=base_dir),
             node_role=schema.name(data["node_role"], f"{label}: node_role"),
@@ -624,6 +709,8 @@ class KarpenterProps(ChartProps):
             create_node_access_entry=schema.boolean(
                 data.get("create_node_access_entry"), f"{label}: create_node_access_entry"
             ),
+            **documents,
+            variables=json_compatible(variables, f"{label}: variables"),
         )
 
 

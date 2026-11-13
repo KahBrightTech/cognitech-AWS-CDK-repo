@@ -161,6 +161,10 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
     assert storage["metadata"]["annotations"]["storageclass.kubernetes.io/is-default-class"] == "true"
     assert storage["parameters"]["encrypted"] == "true"
     assert {obj["kind"] for obj in manifests} >= {"NodePool", "EC2NodeClass"}
+    node_class = next(obj for obj in manifests if obj["kind"] == "EC2NodeClass")
+    assert node_class["spec"]["subnetSelectorTerms"] == [
+        {"tags": {"Name": "md-preproduction-use1-dev-public-*"}},
+    ]
     account = next(
         obj for obj in manifests
         if obj["kind"] == "ServiceAccount" and obj["metadata"]["name"] == "healthpath-secrets"
