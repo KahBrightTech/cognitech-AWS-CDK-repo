@@ -34,7 +34,7 @@ mainSteps:
 
 
 def _template(write_env, raw, *, secrets=None, buckets=None, base_dir=None) -> tuple[SsmStack, Template]:
-    environment = load_environment("test", root=write_env(NETWORK))
+    environment = load_environment("uat", root=write_env(NETWORK, name="uat"))
     app = cdk.App()
     env = cdk.Environment(account=environment.account_id, region=environment.region)
     secret_map = None

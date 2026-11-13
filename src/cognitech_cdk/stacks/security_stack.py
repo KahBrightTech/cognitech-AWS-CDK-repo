@@ -35,6 +35,7 @@ class SecurityStack(cdk.Stack):
             common=environment.common,
             props=environment.security_groups,
             vpc=vpc,
+            environment_name=environment.name,
         )
 
         # One export per group, so a later stack can import an id without

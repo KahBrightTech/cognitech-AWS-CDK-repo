@@ -33,7 +33,7 @@ class RdsStack(EnvironmentStack):
             self,
             "Rds",
             common=environment.common,
-            prefix=environment.network.name,
+            prefix=environment.name,
             props=props,
             network=network,
             security_groups=security_groups,

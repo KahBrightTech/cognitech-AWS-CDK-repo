@@ -1,5 +1,7 @@
 """EKS clusters, access entries, node groups and launch templates."""
 
+from pathlib import Path
+
 import aws_cdk as cdk
 import pytest
 import yaml
@@ -35,7 +37,7 @@ EKS = """
 """
 
 
-def _stack(write_env, text=EKS):
+def _stack(write_env, text=EKS, *, principal_aliases=None):
     environment = load_environment("test", root=write_env(NETWORK))
     env = cdk.Environment(account=environment.account_id, region=environment.region)
     app = cdk.App()
@@ -48,7 +50,7 @@ def _stack(write_env, text=EKS):
     groups = {"eks-cluster": ec2.SecurityGroup(deps, "Sg", vpc=network.network.vpc)}
     return EksStack(
         app, "test-eks", environment=environment, env=env,
-        props=EksProps.from_dict(yaml.safe_load(text)),
+        props=EksProps.from_dict(yaml.safe_load(text), principal_aliases=principal_aliases),
         network=network.network, security_groups=groups, roles=roles,
     )
 
@@ -273,6 +275,44 @@ def test_node_group_and_access_entry_are_nested(write_env, kubernetes_groups):
         assert entry["KubernetesGroups"] == kubernetes_groups
     outputs = set(parent.find_outputs("*"))
     assert {"MainClusterName", "MainClusterArn", "MainGeneralNodeGroupName"} <= outputs
+
+
+def test_dev_system_administrator_is_namespace_scoped(write_env):
+    active = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "deployments/md-preprod/dev/env.yaml").read_text()
+    )
+    raw = yaml.safe_load(EKS)
+    raw[0]["access_entries"] = active["eks"][0]["access_entries"]
+    base = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "deployments/md-preprod/base.yaml").read_text()
+    )
+    stack = _stack(write_env, yaml.safe_dump(raw), principal_aliases=base["eks_access_principals"])
+    access = Template.from_stack(stack.nested_stacks["main"]["Access"])
+    system_role = (
+        "arn:aws:iam::533267408704:role/aws-reserved/sso.amazonaws.com/"
+        "AWSReservedSSO_SystemAdministrator_434e88f55ae46456"
+    )
+    entries = [
+        resource["Properties"]
+        for resource in access.find_resources("AWS::EKS::AccessEntry").values()
+        if resource["Properties"]["PrincipalArn"] == system_role
+    ]
+    assert len(entries) == 1
+    assert entries[0]["AccessPolicies"] == [{
+        "PolicyArn": "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy",
+        "AccessScope": {"Type": "namespace", "Namespaces": ["infogrid", "healthpath"]},
+    }]
+    assert "KubernetesGroups" not in entries[0]
+    access.has_resource_properties("AWS::EKS::AccessEntry", {
+        "PrincipalArn": (
+            "arn:aws:iam::533267408704:role/aws-reserved/sso.amazonaws.com/"
+            "AWSReservedSSO_AdministratorAccess_bc8f841762d141f5"
+        ),
+        "AccessPolicies": [{
+            "PolicyArn": "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy",
+            "AccessScope": {"Type": "cluster"},
+        }],
+    })
 
 
 @pytest.mark.parametrize("change,expected", [

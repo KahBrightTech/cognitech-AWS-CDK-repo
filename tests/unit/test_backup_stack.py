@@ -55,7 +55,7 @@ def _with(**changes):
 
 
 def _stack(write_env, raw) -> tuple[BackupStack, Template]:
-    environment = load_environment("test", root=write_env(NETWORK))
+    environment = load_environment("uat", root=write_env(NETWORK, name="uat"))
     app = cdk.App()
     stack = BackupStack(
         app, "backup", environment=environment, props=BackupProps.from_dict(raw),

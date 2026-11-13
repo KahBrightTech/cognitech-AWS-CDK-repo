@@ -12,7 +12,7 @@ def _template(environment, outdir=None) -> Template:
     app = cdk.App(outdir=str(outdir) if outdir else None)
     stack = NetworkStack(
         app,
-        environment.common.name(environment.network.name, "network"),
+        environment.common.name(environment.name, "network"),
         environment=environment,
         env=cdk.Environment(account=environment.account_id, region=environment.region),
     )
@@ -20,7 +20,7 @@ def _template(environment, outdir=None) -> Template:
 
 
 def _synth(write_env, network: str) -> Template:
-    return _template(load_environment("test", root=write_env(network)))
+    return _template(load_environment("uat", root=write_env(network, name="uat")))
 
 
 def _names(template: Template, resource_type: str) -> set[str]:
@@ -303,6 +303,20 @@ def test_common_tags_reach_every_resource(write_env):
 
 
 # --- the shipped environments ---------------------------------------------
+
+
+def test_environment_folder_name_overrides_network_name_for_resource_naming(write_env):
+    environment = load_environment("qa", root=write_env(PUBLIC_ONLY, name="qa"))
+    template = _template(environment)
+    assert environment.network.name == "uat"
+    assert _names(template, "AWS::EC2::VPC") == {"int-production-use1-qa-vpc"}
+    assert _names(template, "AWS::EC2::InternetGateway") == {"int-production-use1-qa-igw"}
+    assert _names(template, "AWS::EC2::Subnet") == {
+        "int-production-use1-qa-public-primary", "int-production-use1-qa-public-secondary",
+    }
+    assert template.find_outputs("VpcId")["VpcId"]["Export"]["Name"] == (
+        "int-production-use1-qa-network-vpc-id"
+    )
 
 
 @pytest.mark.parametrize("env_name", list_environments())

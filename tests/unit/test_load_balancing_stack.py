@@ -139,7 +139,7 @@ nlb_listeners:
 
 def _environment(write_env):
     return load_environment(
-        "test", root=write_env(NETWORK, security_groups=SECURITY_GROUPS)
+        "uat", root=write_env(NETWORK, security_groups=SECURITY_GROUPS, name="uat")
     )
 
 

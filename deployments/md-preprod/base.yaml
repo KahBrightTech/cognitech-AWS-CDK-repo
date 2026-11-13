@@ -1,0 +1,19 @@
+account_id: "533267408704"
+region: us-east-1
+common:
+  account_name: md-preproduction
+  region_prefix: use1
+  global: false
+  account_name_abr: mdpreprod
+  environment_abr: dev
+  tags:
+    Build-method: aws-cdk
+    Environment: development
+    ManagedBy: aws-cdk/cognitech-AWS-CDK-repo
+    Owner: kbrigthain@gmail.com
+    Compliance: FedRAMP
+eks_access_principals:
+  admin: arn:aws:iam::533267408704:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_bc8f841762d141f5
+  system-admin: arn:aws:iam::533267408704:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_SystemAdministrator_434e88f55ae46456
+  readonly: arn:aws:iam::533267408704:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_ReadOnlyAccess_c8f66f34ed2a5abd
+  audit: arn:aws:iam::533267408704:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_NetworkAdministrator_7527e53ceb2ffa92

@@ -39,6 +39,7 @@ class TransitGatewayStack(EnvironmentStack):
             "TransitGateway",
             common=environment.common,
             network_name=environment.network.name,
+            environment_name=environment.name,
             props=props,
             network=network,
         )

@@ -26,6 +26,7 @@ from aws_cdk import aws_sqs as sqs
 from constructs import Construct, IDependable
 
 from cognitech_cdk.common import schema
+from cognitech_cdk.common.config import merge_config as _merge
 from cognitech_cdk.common.documents import render
 from cognitech_cdk.constructs.eks import construct_id
 from cognitech_cdk.constructs.eks_addons import (
@@ -745,14 +746,3 @@ class EksAddons:
         )
         chart.node.add_dependency(crds)
         return chart
-
-
-def _merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
-    """Deep-merge user chart values over generated ones."""
-    result = dict(base)
-    for key, value in override.items():
-        if isinstance(value, Mapping) and isinstance(result.get(key), Mapping):
-            result[key] = _merge(dict(result[key]), value)
-        else:
-            result[key] = value
-    return result

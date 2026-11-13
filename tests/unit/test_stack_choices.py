@@ -18,21 +18,25 @@ from pathlib import Path
 import pytest
 import yaml
 
+from cognitech_cdk.common.environment import list_environments, load_environment
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 SCRIPT = REPO_ROOT / "scripts" / "sync_stack_choices.py"
+SELECTION_SCRIPT = REPO_ROOT / "scripts" / "select_stacks.py"
 
 DEPLOY_WORKFLOWS = sorted(WORKFLOWS.glob("deploy-*.yml"))
 
 
-def _load_script():
-    spec = importlib.util.spec_from_file_location("sync_stack_choices", SCRIPT)
+def _load_script(path=SCRIPT):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 sync = _load_script()
+selection = _load_script(SELECTION_SCRIPT)
 
 
 WORKFLOW = """\
@@ -102,6 +106,116 @@ def test_render_refuses_a_file_without_markers():
         sync.render("on: push\n", ["one"])
 
 
+def _selection_manifest():
+    return {"artifacts": {
+        "acme-dev-network": {"type": "aws:cloudformation:stack", "properties": {}},
+        "acme-dev-security": {
+            "type": "aws:cloudformation:stack", "properties": {},
+            "dependencies": ["acme-dev-network"],
+        },
+        "acme-dev-storage": {"type": "aws:cloudformation:stack", "properties": {}},
+        "acme-dev-eks": {
+            "type": "aws:cloudformation:stack", "properties": {},
+            "dependencies": ["eks.assets"],
+        },
+        "eks.assets": {
+            "type": "cdk:asset-manifest", "properties": {},
+            "dependencies": ["acme-dev-security"],
+        },
+    }}
+
+
+@pytest.mark.parametrize("excluded", ["eks", "acme-dev-eks", " eks, eks \n"])
+def test_exclude_resolves_full_names_suffixes_and_duplicates(excluded):
+    selected, omitted = selection.select_stacks(_selection_manifest(), "all", excluded)
+    assert selected == ["acme-dev-network", "acme-dev-security", "acme-dev-storage"]
+    assert omitted == ["acme-dev-eks"]
+
+
+@pytest.mark.parametrize("requested, excluded, action, message", [
+    ("all", "exk", "deploy", "unknown"),
+    ("all", "--all", "deploy", "Invalid stack name"),
+    ("all", "network security storage eks", "deploy", "no stacks"),
+    ("acme-dev-eks", "storage", "deploy", "only be used with stacks=all"),
+    ("all", "network", "deploy", "crosses the exclusion boundary"),
+    ("all", "network,security", "diff", "crosses the exclusion boundary"),
+    ("all", "eks", "destroy", "crosses the exclusion boundary"),
+])
+def test_invalid_or_dependency_crossing_exclusions_fail(requested, excluded, action, message):
+    with pytest.raises(ValueError, match=message):
+        selection.select_stacks(_selection_manifest(), requested, excluded, action)
+
+
+def test_destroy_can_exclude_prerequisites_and_delete_their_dependents():
+    selected, omitted = selection.select_stacks(
+        _selection_manifest(), "all", "network,security,storage", "destroy",
+    )
+    assert selected == ["acme-dev-eks"]
+    assert omitted == ["acme-dev-network", "acme-dev-security", "acme-dev-storage"]
+
+
+def test_ambiguous_suffix_requires_a_full_name():
+    manifest = _selection_manifest()
+    manifest["artifacts"]["acme-qa-eks"] = {
+        "type": "aws:cloudformation:stack", "properties": {},
+    }
+    with pytest.raises(ValueError, match="ambiguous"):
+        selection.select_stacks(manifest, "all", "eks")
+
+
+@pytest.mark.parametrize("requested, excluded, expected", [
+    ("", "", "--all"),
+    ("acme-dev-eks", "", "acme-dev-eks"),
+    ("all", "eks, storage", "acme-dev-network acme-dev-security --exclusively"),
+])
+def test_workflow_selection_exports_reviewed_targets(tmp_path, requested, excluded, expected):
+    workflow = yaml.safe_load((WORKFLOWS / "deploy-primary-mdpp-dev.yml").read_text())
+    step = next(step for step in workflow["jobs"]["preview"]["steps"] if step.get("id") == "select")
+    assert step["env"] == {
+        "REQUESTED": "${{ inputs.stacks }}", "EXCLUDED": "${{ inputs.exclude }}",
+        "ACTION": "${{ inputs.action }}",
+    }
+    assert workflow[True]["workflow_dispatch"]["inputs"]["exclude"]["default"] == ""
+    outdir = tmp_path / "cdk.out"
+    outdir.mkdir()
+    (outdir / "manifest.json").write_text(json.dumps(_selection_manifest()))
+    output = tmp_path / "output"
+    environment_file = tmp_path / "environment"
+    summary = tmp_path / "summary"
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"].replace("scripts/select_stacks.py", str(SELECTION_SCRIPT))],
+        cwd=tmp_path,
+        env={
+            **os.environ, "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+            "REQUESTED": requested, "EXCLUDED": excluded, "ACTION": "deploy",
+            "GITHUB_OUTPUT": str(output), "GITHUB_ENV": str(environment_file),
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output.read_text() == f"targets={expected}\n"
+    assert environment_file.read_text().splitlines()[0] == f"TARGETS={expected}"
+    if excluded:
+        assert summary.read_text() == (
+            "### Selected stacks\n\n- `acme-dev-network`\n- `acme-dev-security`\n"
+            "\n### Excluded stacks\n\n- `acme-dev-eks`\n- `acme-dev-storage`\n"
+        )
+
+
+def test_exclude_eks_from_real_dev_assembly_preserves_foundations(tmp_path):
+    built = _built_stacks("md-preprod/dev", tmp_path)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    selected, omitted = selection.select_stacks(manifest, "all", "eks", "deploy")
+    eks = "md-preproduction-use1-dev-eks"
+    assert omitted == [eks]
+    assert set(selected) == built - {eks}
+    assert len(selected) == 6
+    assert list(tmp_path.glob("*.nested.template.json"))  # apps stay configured for later
+    with pytest.raises(ValueError, match="crosses the exclusion boundary"):
+        selection.select_stacks(manifest, "all", "network", "deploy")
+
+
 def test_environment_comes_from_the_job_env():
     assert sync.environment_of(WORKFLOW) == "dev"
 
@@ -128,7 +242,10 @@ def test_dev_workflow_uses_central_deployment_settings():
     assert settings["DEPLOYMENT_CONFIG_PATH"] == f"deployments/{settings['ENV']}/**"
     assert paths[0] == settings["DEPLOYMENT_CONFIG_PATH"]
     job = workflow["jobs"]["apply"]
-    assert job["environment"] == settings["ENV"] == "dev"
+    assert settings["ENV"] == "md-preprod/dev"
+    assert settings["DEPLOYMENT_BASE_PATH"] in paths
+    assert settings["DEPLOYMENT_BASE_PATH"] == "deployments/md-preprod/base.yaml"
+    assert job["environment"] == settings["GITHUB_ENVIRONMENT"] == "dev"
     assert "ENV" not in job.get("env", {})
     steps = {step["name"]: step for step in job["steps"] if "name" in step}
     credentials = steps["Configure AWS credentials"]["with"]
@@ -137,13 +254,19 @@ def test_dev_workflow_uses_central_deployment_settings():
     preview = workflow["jobs"]["preview"]
     preview_steps = {step["name"]: step for step in preview["steps"] if "name" in step}
     assert preview_steps["Check destroy confirmation"]["if"] == (
-        "inputs.action == 'destroy' && inputs.confirm != env.ENV"
+        "inputs.action == 'destroy' && inputs.confirm != env.GITHUB_ENVIRONMENT"
     )
     assert "environment" not in preview
     assert preview_steps["Configure AWS credentials"]["with"]["role-to-assume"] == (
         "${{ env.AWS_PREVIEW_ROLE_ARN }}"
     )
     assert "--no-change-set" in preview_steps["Diff"]["run"]
+    assert preview_steps["Read deployment settings"]["id"] == "deployment"
+    assert job["env"]["AWS_REGION"] == "${{ needs.preview.outputs.aws_region }}"
+    assert credentials["allowed-account-ids"] == "${{ env.AWS_ACCOUNT_ID }}"
+    assert preview_steps["Configure AWS credentials"]["with"]["allowed-account-ids"] == (
+        "${{ steps.deployment.outputs.account_id }}"
+    )
     assert job["needs"] == "preview"
     assert job["if"] == (
         "github.event_name == 'workflow_dispatch' && "
@@ -154,6 +277,55 @@ def test_dev_workflow_uses_central_deployment_settings():
     assert "--app cdk.out" in steps["Destroy"]["run"]
     assert steps["Download reviewed assembly"]["with"]["name"] == (
         preview_steps["Save reviewed assembly"]["with"]["name"]
+    )
+
+
+def test_workflow_reads_merged_deployment_settings(tmp_path):
+    workflow = yaml.safe_load((WORKFLOWS / "deploy-primary-mdpp-dev.yml").read_text())
+    step = next(
+        step for step in workflow["jobs"]["preview"]["steps"]
+        if step.get("id") == "deployment"
+    )
+    output = tmp_path / "output"
+    environment_file = tmp_path / "environment"
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ, **workflow["env"], **step["env"],
+            "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+            "GITHUB_OUTPUT": str(output), "GITHUB_ENV": str(environment_file),
+        },
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    deployment = load_environment(workflow["env"]["ENV"])
+    assert output.read_text().splitlines() == [
+        f"aws_region={deployment.region}", f"account_id={deployment.account_id}",
+    ]
+    assert environment_file.read_text() == f"AWS_REGION={deployment.region}\n"
+
+
+def test_pr_workflow_discovers_legacy_and_grouped_deployments(tmp_path):
+    workflow = yaml.safe_load((WORKFLOWS / "pr.yml").read_text())
+    discover = workflow["jobs"]["discover"]
+    step = next(step for step in discover["steps"] if step.get("id") == "discover")
+    output = tmp_path / "output"
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ, **step["env"],
+            "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(output.read_text().removeprefix("environments=")) == list_environments()
+    assert workflow["jobs"]["check"]["needs"] == "discover"
+    assert workflow["jobs"]["check"]["strategy"]["matrix"]["environment"] == (
+        "${{ fromJSON(needs.discover.outputs.environments) }}"
     )
 
 

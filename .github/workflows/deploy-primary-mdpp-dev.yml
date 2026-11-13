@@ -1,12 +1,13 @@
 name: Deploy primary mdpp dev
 
-# Deployment settings. YAML aliases reuse the environment and config path below.
+# Keep the deployment selector separate from the existing GitHub/OIDC environment.
 env:
-  ENV: &deployment_environment dev
-  DEPLOYMENT_CONFIG_PATH: &deployment_config_path "deployments/dev/**"
+  ENV: md-preprod/dev
+  GITHUB_ENVIRONMENT: &deployment_environment dev
+  DEPLOYMENT_CONFIG_PATH: &deployment_config_path "deployments/md-preprod/dev/**"
+  DEPLOYMENT_BASE_PATH: &deployment_base_path "deployments/md-preprod/base.yaml"
   AWS_ROLE_ARN: arn:aws:iam::533267408704:role/github-oidc-cdk-deploy-dev
   AWS_PREVIEW_ROLE_ARN: arn:aws:iam::533267408704:role/github-oidc-cdk-preview-dev
-  AWS_REGION: us-east-1
 
 # When copying this workflow, also update its name, workflow-file push path, concurrency group,
 # and confirmation description, then run scripts/sync_stack_choices.py.
@@ -15,9 +16,11 @@ on:
     branches: [main]
     paths:
       - *deployment_config_path 
+      - *deployment_base_path
       - "policies/**"
       - "src/**" 
       - "app.py"
+      - "scripts/select_stacks.py"
       - "cdk.json"
       - "requirements*.txt"
       - ".github/workflows/deploy-primary-mdpp-dev.yml"
@@ -49,6 +52,11 @@ on:
           - md-preproduction-use1-dev-certificates
           - md-preproduction-use1-dev-eks
         # END generated stack options
+      exclude:
+        description: 'With stacks=all, skip names/suffixes separated by commas (e.g. eks,rds)'
+        required: false
+        default: ""
+        type: string
       confirm:
         description: 'Type "dev" to allow destroy (ignored otherwise)'
         required: false
@@ -69,12 +77,14 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.select.outputs.targets }}
+      aws_region: ${{ steps.deployment.outputs.aws_region }}
+      account_id: ${{ steps.deployment.outputs.account_id }}
     steps:
       # Fail before touching AWS if a destroy was not explicitly confirmed.
       - name: Check destroy confirmation
-        if: inputs.action == 'destroy' && inputs.confirm != env.ENV
+        if: inputs.action == 'destroy' && inputs.confirm != env.GITHUB_ENVIRONMENT
         run: |
-          echo "::error::Destroy requires the confirm box to contain exactly: $ENV"
+          echo "::error::Destroy requires the confirm box to contain exactly: $GITHUB_ENVIRONMENT"
           exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -90,51 +100,32 @@ jobs:
           npm install -g aws-cdk@2
       - name: Run tests
         run: pytest -q
+      - name: Read deployment settings
+        id: deployment
+        env:
+          PYTHONPATH: src
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from cognitech_cdk.common.environment import load_environment
+
+          deployment = load_environment(os.environ["ENV"])
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              print(f"aws_region={deployment.region}", file=output)
+              print(f"account_id={deployment.account_id}", file=output)
+          with Path(os.environ["GITHUB_ENV"]).open("a") as output:
+              print(f"AWS_REGION={deployment.region}", file=output)
+          PY
       - name: Synthesize
         run: cdk synth --quiet
       - name: Select stacks
         id: select
         env:
           REQUESTED: ${{ inputs.stacks }}
-        run: |
-          set -euo pipefail
-          mapfile -t available < <(cdk list | sed '/^$/d')
-          if [ "${#available[@]}" -eq 0 ]; then
-            echo "::error::cdk list returned no stacks for ENV=$ENV"
-            exit 1
-          fi
-
-          {
-            echo "### Stacks detected in \`$ENV\`"
-            echo
-            printf -- '- `%s`\n' "${available[@]}"
-            echo
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          requested="${REQUESTED:-all}"
-          [ -n "${requested// /}" ] || requested=all
-
-          if [ "$requested" = "all" ]; then
-            echo "TARGETS=--all" >> "$GITHUB_ENV"
-            echo "targets=--all" >> "$GITHUB_OUTPUT"
-            echo "SELECTED=all (${#available[@]} stack(s))" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          for have in "${available[@]}"; do
-            if [ "$have" = "$requested" ]; then
-              echo "TARGETS=$requested" >> "$GITHUB_ENV"
-              echo "targets=$requested" >> "$GITHUB_OUTPUT"
-              echo "SELECTED=$requested" >> "$GITHUB_ENV"
-              exit 0
-            fi
-          done
-
-          # Only reachable if the dropdown is older than the app.
-          echo "::error::'$requested' is not a stack in this environment, so the" \
-               "list in the form is out of date. Run the sync-stack-choices" \
-               "workflow. Available: ${available[*]}"
-          exit 1
+          EXCLUDED: ${{ inputs.exclude }}
+          ACTION: ${{ inputs.action }}
+        run: python scripts/select_stacks.py
 
       - name: Show OIDC claims
         run: |
@@ -151,7 +142,8 @@ jobs:
         with:
           role-to-assume: ${{ env.AWS_PREVIEW_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: cdk-${{ env.ENV }}-${{ github.run_id }}
+          allowed-account-ids: ${{ steps.deployment.outputs.account_id }}
+          role-session-name: cdk-${{ env.GITHUB_ENVIRONMENT }}-${{ github.run_id }}
 
       # Avoid change-set creation: preview cannot assume deployment roles.
       - name: Diff
@@ -195,6 +187,8 @@ jobs:
     environment: *deployment_environment
     env:
       TARGETS: ${{ needs.preview.outputs.targets }}
+      AWS_REGION: ${{ needs.preview.outputs.aws_region }}
+      AWS_ACCOUNT_ID: ${{ needs.preview.outputs.account_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -216,7 +210,8 @@ jobs:
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: cdk-${{ env.ENV }}-${{ github.run_id }}
+          allowed-account-ids: ${{ env.AWS_ACCOUNT_ID }}
+          role-session-name: cdk-${{ env.GITHUB_ENVIRONMENT }}-${{ github.run_id }}
       - name: Deploy
         if: inputs.action == 'deploy'
         run: cdk deploy --app cdk.out $TARGETS --require-approval never --progress events

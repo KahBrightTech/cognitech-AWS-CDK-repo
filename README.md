@@ -79,7 +79,7 @@ nvm install 22 && nvm use 22 && npm install -g aws-cdk@2
 template — no AWS account or credentials needed. 37 tests cover naming, tagging,
 AZ counts and the NAT-gateway rules.
 
-**`cdk ls --context env=dev`** reads `deployments/dev/env.yaml` and prints the
+**`cdk ls --context env=dev`** reads the merged `md-preprod/dev` configuration and prints the
 stack names it would create. It is the fastest way to confirm a config change is
 valid, and it also needs no credentials:
 
@@ -99,7 +99,7 @@ pyproject.toml                          pytest config (puts src/ on the path)
 src/cognitech_cdk/
   common/
     config.py                           Common: naming + tags, mirrors the Terraform object
-    environment.py                      reads deployments/<env>/env.yaml
+    environment.py                      loads legacy or account-grouped YAML with defaults
     schema.py                           shared YAML validators
     documents.py                        repo-relative YAML/JSON files and [[placeholders]]
   constructs/
@@ -116,8 +116,10 @@ src/cognitech_cdk/
     <family>_stack.py                   one stack per Tenant-account family (see below)
 
 deployments/
-  dev/env.yaml                          one folder per environment
-  prod/env.yaml
+  md-preprod/
+    base.yaml                           account-level defaults
+    dev/env.yaml                        environment-specific overrides and resources
+  prod/env.yaml                         legacy layout remains supported
 
 tests/unit/
 .github/workflows/
@@ -170,7 +172,16 @@ security group stays closed and you would re-open it by hand.
 
 ## Configuring an environment
 
-One file per environment: `deployments/<env>/env.yaml`.
+Both deployment layouts are supported:
+
+- Legacy: `deployments/<environment>/env.yaml` is self-contained.
+- Account-grouped: `deployments/<account>/base.yaml` supplies defaults for
+  `deployments/<account>/<environment>/env.yaml`. The base file is optional
+  when an environment supplies all required values itself.
+
+Dev now uses `deployments/md-preprod/base.yaml` and
+`deployments/md-preprod/dev/env.yaml`; prod remains unchanged.
+The following is an example of a complete legacy configuration:
 
 ```yaml
 account_id: "111122223333"
@@ -203,6 +214,46 @@ security_groups:             # optional, see below
     source: eks-nodes
     protocol: all
 ```
+
+### Account defaults and overrides
+
+Put shared `account_id`, `region`, `common` and tags in the account's
+`base.yaml`. Dev's base includes its existing development defaults. Other
+environments in the same account should override environment-specific values:
+
+```yaml
+# deployments/md-preprod/qa/env.yaml
+common:
+  environment_abr: qa
+  tags:
+    Environment: quality-assurance
+network:
+  name: qa
+  cidr_block: 10.40.0.0/16
+  azs: 2
+```
+
+Merge order is **account base, then environment**. Mappings merge recursively,
+so overriding `common.tags.Environment` keeps the other inherited tags.
+Scalars, lists and explicit `null` replace the corresponding default; lists
+are not concatenated or merged by name. For example, `s3_buckets: []` clears
+inherited buckets. An empty mapping does not clear inherited mapping keys.
+Required fields and tags are validated after merging.
+
+Select this example with `ENV=md-preprod/qa` or
+`--context env=md-preprod/qa`. Short names such as `ENV=dev` still work when
+exactly one deployment has that environment name. If multiple accounts have
+`dev`, a short selection fails and lists the qualified choices rather than
+guessing. Discovery returns canonical names such as `md-preprod/dev` and
+legacy names such as `prod`.
+
+The account folder itself is not included in resource names. Generated AWS
+names use `common.account_name`, `common.region_prefix` and the actual environment
+folder name (`dev`, `qa`, `prod`), not `network.name` or `environment_abr`. Relative
+references to policies, manifests and application code remain **repository
+root relative**, not base-file or environment-file relative. Overrides do
+not interpolate variables into literal ARNs or names; update those literals
+when changing their account or region.
 
 ### `common`
 
@@ -388,7 +439,7 @@ security_groups:
 - name: eks-cluster
   description: EKS control plane
   ingress:
-  - description: API server from the nodes
+  - description: Inbound traffic from eks nodes on tcp port 443(HTTPS) to eks cluster
     source: eks-nodes
     ports: 443
 
@@ -397,20 +448,20 @@ security_groups:
   tags:
     kubernetes.io/cluster/dev: owned
   ingress:
-  - description: Node to node, all ports
+  - description: Inbound traffic from eks nodes on all protocols and ports to eks nodes
     source: eks-nodes          # a group may reference itself
     protocol: all
-  - description: Control plane to kubelet
+  - description: Inbound traffic from eks cluster on tcp port 10250(kubelet) to eks nodes
     source: eks-cluster
     ports: 10250
-  - description: Ingress controller to the NodePort range
+  - description: Inbound traffic from alb on tcp ports 30000-32767(NodePort) to eks nodes
     source: alb
     ports: 30000-32767
 
 - name: alb
   description: Public load balancer in front of the cluster
   ingress:
-  - description: HTTPS from anywhere
+  - description: Inbound traffic from 0.0.0.0/0 on tcp port 443(HTTPS) to alb
     source: 0.0.0.0/0
     ports: 443
 ```
@@ -422,14 +473,44 @@ only way out:
 - name: database
   description: Postgres, no route to the internet
   ingress:
-  - description: Postgres from the nodes
+  - description: Inbound traffic from eks nodes on tcp port 5432(PostgreSQL) to database
     source: eks-nodes
     ports: 5432
   egress:
-  - description: Replication to the secondary
+  - description: Outbound traffic to 10.20.0.0/16 on tcp port 5432(PostgreSQL)
     destination: 10.20.0.0/16
     ports: 5432
 ```
+
+Rule descriptions follow the same canonical format in dev YAML and AWS.
+AWS descriptions are derived from the rule's direction, peer, protocol and ports,
+without appending free-form purpose text. Ingress includes the destination group;
+egress names its destination directly:
+
+```text
+Inbound traffic from eks nodes on tcp port 443(HTTPS) to eks cluster
+Inbound traffic from eks cluster on tcp port 10250(kubelet) to eks nodes
+Outbound traffic to 10.20.0.0/16 on tcp port 5432(PostgreSQL)
+```
+
+Configured group keys are displayed with spaces; existing AWS IDs and CIDRs
+remain unchanged. Known TCP ports use service labels: `80(HTTP)`, `443(HTTPS)`,
+`5432(PostgreSQL)` and `10250(kubelet)`. The Kubernetes NodePort TCP range uses
+`ports 30000-32767(NodePort)`; other ports/ranges have no guessed service label.
+All-traffic rules say `all protocols and ports`; ICMP rules say `all types and codes`.
+The default allow-all IPv4 egress
+description follows the same outbound format. CDK's deny-all placeholder is
+unchanged when outbound is disabled. Generated descriptions must fit AWS's
+255-character limit; an oversized description fails with a request to shorten
+the configured group names rather than silently truncating it.
+
+Dev's configured group names include the environment, for example
+`md-preproduction-use1-dev-eks-cluster-sg`. Group references in YAML remain
+short keys such as `eks-cluster`, not physical names.
+Dev also defines `md-preproduction-use1-dev-nlb-sg` with public TCP 80/443
+ingress and allows TCP 30000-32767 from that group into `eks-nodes`.
+This default group is not attached to a load balancer yet; the existing
+load balancer configuration is unchanged.
 
 Mistakes are caught when the config is read, before anything is built: a group
 name that is not defined, a repeated group or rule, a port outside 0–65535, a
@@ -664,7 +745,8 @@ path in the error. Only local relative paths are accepted, not absolute paths
 or URLs. File contents cannot recursively include other policy files.
 
 Commit the referenced files with the configuration so CI can read them.
-The existing dev workflow watches both `deployments/dev/` and root-level
+The existing dev workflow watches `deployments/md-preprod/dev/`, its account
+`base.yaml` and root-level
 `policies/`. If you keep shared policies elsewhere, add their paths to
 that workflow's push filters too.
 
@@ -819,11 +901,13 @@ EBS CSI, metrics-server, external-dns, cert-manager, CloudWatch observability,
 and the AWS Load Balancer Controller, plus the default encrypted gp3 storage
 class. Secrets Store CSI and its AWS provider are enabled through Helm.
 Controllers select and tolerate the system nodes; node-wide agents retain
-placement on all worker pools. Karpenter and optional applications stay
-commented. Until application capacity is added, ordinary
-workloads need a matching system-taint toleration to schedule on these nodes.
+placement on all worker pools. Karpenter provisions application nodes, including
+AWX and its managed Postgres database. Argo CD, F5 NGINX Ingress Controller,
+Kubecost and the AWX operator are enabled on system nodes; Gateway Fabric
+remains commented. Argo CD and AWX use the shared public ALB and the
+`*.dev.titancoretech.net` certificate. Kubecost remains private.
 The maximum size is a scaling bound, not automatic demand-based scaling;
-Karpenter and Cluster Autoscaler are not enabled.
+Karpenter scales its separate application NodePool; Cluster Autoscaler is not enabled.
 Resource settings and policy paths
 in the example above assume matching IAM roles and security groups already exist.
 
@@ -1021,6 +1105,56 @@ stack or restore a missing cluster. Recovery of orphaned custom resources is a
 separate operation; retaining resources or force-deleting a stack must be
 evaluated explicitly rather than used as the default deployment workflow.
 
+
+#### Namespace-scoped EKS access
+
+Set `namespaces` on an `access_entries` entry to scope its EKS access policies
+to those namespaces; omitting it grants cluster scope. Dev grants the
+SystemAdministrator role `AmazonEKSAdminPolicy` in `infogrid` and `healthpath`
+only, while AdministratorAccess retains `AmazonEKSClusterAdminPolicy` at
+cluster scope. SystemAdministrator has no Kubernetes group grants.
+
+EKS access policies and Kubernetes RBAC grants are additive. Namespace scope
+does not restrict permissions granted separately through a ClusterRoleBinding.
+Deploy the EKS stack to apply access changes.
+If the previous shared `admin` entry is already deployed, moving
+SystemAdministrator to `system-admin` changes its CloudFormation logical ID.
+Remove that principal from the old entry and deploy before adding the new
+entry and deploying again; otherwise creation can fail because an access
+entry for that principal already exists.
+
+#### Account-level EKS principal ARN references
+
+Account-specific IAM principal ARNs are shared in the account base file:
+
+```yaml
+# deployments/md-preprod/base.yaml
+eks_access_principals:
+  admin: arn:aws:iam::533267408704:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_bc8f841762d141f5
+  system-admin: arn:aws:iam::533267408704:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_SystemAdministrator_434e88f55ae46456
+```
+
+Access entries keep their existing structure in the environment file. Their
+`principal_arns` list references names from that mapping:
+
+```yaml
+# Under eks[].access_entries in the environment file
+system-admin:
+  principal_arns: [system-admin]
+  policy_arn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy
+  namespaces: [infogrid, healthpath]
+```
+
+EKS access policy ARNs (`policy_arn`/`policy_arns`), local role references,
+namespace scopes and Kubernetes groups remain environment-specific. Defining a principal reference
+does not create an access entry or grant access by itself. Unknown references
+and invalid principal ARNs fail configuration loading.
+
+Existing literal IAM role/user ARNs remain supported, with or without a base
+file; a `principal_arns` list may mix literals and references. Each account
+can define the same reference names with its own SSO role ARNs. Environments
+may override the shared mapping or use literal principal ARNs directly.
+Dev's effective principals, policies and scopes are unchanged.
 
 #### System controllers versus application nodes
 
@@ -1482,7 +1616,7 @@ stack remains available for load balancers outside the cluster.
 - EKS grants cluster-admin only to the deploying role. Add `access_entries` for
   people who need `kubectl`.
 - ArgoCD SSO is off until you create an Identity Center SAML application for
-  `argocd.dev.kahbrigthllc.com` and fill in `sso_url` and `ca_pem_file`. Until
+  `argocd.dev.titancoretech.net` and fill in `sso_url` and `ca_pem_file`. Until
   then, use the `argocd-initial-admin-secret` in the cluster.
 - Kubecost has no login, so dev does not expose it; use
   `kubectl -n kubecost port-forward svc/kubecost-cost-analyzer 9090`.
@@ -1491,24 +1625,37 @@ stack remains available for load balancers outside the cluster.
 
 ## Naming convention
 
-`Common.name(*parts)` builds `{account_name}-{region_prefix}-{parts...}`, matching
-the Terraform modules:
+`Common.name(*parts)` builds `{account_name}-{region_prefix}-{parts...}`.
+Deployment stacks pass the actual environment folder name as the first part:
+`{account_name}-{region_prefix}-{environment}-{resource...}`. Grouped selection
+`md-preprod/dev` uses `dev`; prod uses `prod` even when `network.name` is `prd`.
 
 | Resource         | Pattern                                                   | Example                                            |
 | ---------------- | --------------------------------------------------------- | -------------------------------------------------- |
-| VPC              | `{account}-{region}-{vpc}-vpc`                          | `int-production-use1-dev-vpc`                    |
-| Internet gateway | `{account}-{region}-{vpc}-igw`                          | `int-production-use1-dev-igw`                    |
-| Subnet           | `{account}-{region}-{vpc}-{subnet}-{type}-{ordinal}`    | `int-production-use1-dev-edge-public-primary`    |
-| Route table      | `{account}-{region}-{vpc}-{subnet}-{ordinal}-{type}-rt` | `int-production-use1-dev-edge-primary-public-rt` |
-| NAT gateway      | `{account}-{region}-{vpc}-{subnet}-ngw-{ordinal}`       | `int-production-use1-dev-edge-ngw-primary`       |
-| Elastic IP       | `{account}-{region}-{vpc}-{subnet}-eip-{ordinal}`       | `int-production-use1-dev-edge-eip-primary`       |
-| Security group   | `{account}-{region}-{name}-sg`                          | `int-production-use1-eks-nodes-sg`               |
+| VPC              | `{account}-{region}-{environment}-vpc`                          | `int-production-use1-dev-vpc`                    |
+| Internet gateway | `{account}-{region}-{environment}-igw`                          | `int-production-use1-dev-igw`                    |
+| Subnet           | `{account}-{region}-{environment}-{subnet}-{type}-{ordinal}`    | `int-production-use1-dev-edge-public-primary`    |
+| Route table      | `{account}-{region}-{environment}-{subnet}-{ordinal}-{type}-rt` | `int-production-use1-dev-edge-primary-public-rt` |
+| NAT gateway      | `{account}-{region}-{environment}-{subnet}-ngw-{ordinal}`       | `int-production-use1-dev-edge-ngw-primary`       |
+| Elastic IP       | `{account}-{region}-{environment}-{subnet}-eip-{ordinal}`       | `int-production-use1-dev-edge-eip-primary`       |
+| Security group   | `{account}-{region}-{environment}-{name}-sg`                    | `int-production-use1-dev-eks-nodes-sg`           |
 | IAM role         | `{account}-{region}-{environment}-{name}-role`         | `int-production-use1-dev-eks-nodes-role`         |
 | Instance profile | `{account}-{region}-{environment}-{name}-profile`      | `int-production-use1-dev-eks-nodes-profile`      |
 
 When a subnet group keeps its default name, the repeated word is dropped:
 `public_subnet_name: public` gives `int-production-use1-dev-public-primary`, not
 `...-public-public-primary`.
+
+This convention applies to generated AWS names and network `Name` tags.
+Abbreviated account names are still used where AWS has short name limits.
+Explicit name/path overrides and imported resources keep their configured
+identifiers. Kubernetes names and AWS-managed identifiers (such as the VPC's
+default security group name) are not rewritten.
+
+This intentionally changes generated names where `network.name` differs from
+the environment folder and adds the missing environment to configured security
+groups. Existing deployments would require a rename/replacement migration;
+review the diff before deploying.
 
 Tags are applied once in the stack with `Tags.of(self)`, which CDK propagates to
 every taggable resource. `Name` is set per resource and overrides the inherited
@@ -1520,7 +1667,9 @@ value.
 
 ### Selecting the environment
 
-The environment is a folder name under `deployments/` — `dev` or `prod` today.
+The deployment selector is a legacy environment name or `<account>/<environment>`
+under `deployments/` - `md-preprod/dev` or `prod` today. The unique short name
+`dev` continues to work.
 It is resolved in this order, first match wins:
 
 | Priority | Source                  | Example                         |
@@ -1584,7 +1733,7 @@ cdk diff --context env=dev     # inspects dev; ENV is still prod afterwards
 **A wrong name fails immediately**, before anything reaches AWS:
 
 ```
-Unknown environment 'staging'. Known: dev, prod.
+Unknown environment 'staging'. Expected deployments/staging/env.yaml. Known environments: md-preprod/dev, prod.
 Set it with --context env=<name> or ENV=<name>.
 ```
 
@@ -1612,7 +1761,7 @@ cdk deploy --profile admin-dev    # 5. apply it
 export ENV=prod
 aws sso login --profile admin-prod
 
-cdk diff   --profile admin-prod   #    -> int-production-use1-prd-network
+cdk diff   --profile admin-prod   #    -> int-production-use1-prod-network
 cdk deploy --profile admin-prod
 ```
 
@@ -1789,9 +1938,11 @@ and restrict deployment branches to `main`. Native required reviewers for
 private repositories require GitHub Enterprise; see
 [GitHub's protection-rule availability](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments#required-reviewers).
 
-Set `ENV`, `AWS_ROLE_ARN`, `AWS_PREVIEW_ROLE_ARN` and `AWS_REGION` at the top of
-the deployment workflow. The YAML alias connects `ENV` to the apply job's
-GitHub environment. Re-run the role-setup script above to provision the preview
+Set `ENV`, `GITHUB_ENVIRONMENT`, `AWS_ROLE_ARN` and `AWS_PREVIEW_ROLE_ARN` at the top of
+the deployment workflow. `AWS_REGION` is read from the merged deployment YAML.
+The YAML alias connects `GITHUB_ENVIRONMENT` to the apply job's
+GitHub environment, independently of the qualified deployment selector.
+Re-run the role-setup script above to provision the preview
 role before using this split; the existing deployment trust remains
 environment-bound. Preview trust permits only `refs/heads/main`, so dispatches
 from other branches cannot authenticate for preview. Its AWS-managed
@@ -1892,10 +2043,12 @@ accepts an OIDC token from this repository carrying the claim
 `environment:dev`. Publishing the ARN does not weaken that.
 
 The account ID inside the ARN is likewise already in
-`deployments/dev/env.yaml`, so putting it in the workflow exposes nothing new.
+`deployments/md-preprod/base.yaml`, so putting it in the workflow exposes nothing new.
 
-`aws-region` is hardcoded for the same reason. Keep it in step with `region:` in
-that environment's `env.yaml` — they are two places that must agree.
+The workflow reads the effective `region` and `account_id` from the merged
+deployment configuration. Both credential steps use that region and check the
+assumed account against the configuration. If you override the account, update
+the deploy and preview role ARNs to match it.
 
 > If you would rather keep the ARN out of the repo, use a GitHub Environment
 > secret instead:
@@ -1910,7 +2063,7 @@ way to run against the wrong account by mistake:
 
 | Workflow file | Shows in Actions as | Deploys | Into |
 | ------------- | ------------------- | ------- | ---- |
-| `deploy-primary-mdpp-dev.yml` | Deploy primary mdpp dev | `deployments/dev/` | md-preproduction `533267408704`, us-east-1 |
+| `deploy-primary-mdpp-dev.yml` | Deploy primary mdpp dev | `deployments/md-preprod/dev/` plus account defaults | md-preproduction `533267408704`, us-east-1 |
 
 The naming pattern is `deploy-<region role>-<account>-<environment>`, so a second
 region would be `deploy-secondary-mdpp-dev.yml` and another account
@@ -1928,7 +2081,8 @@ on:
   push:
     branches: [main]
     paths:
-      - "deployments/dev/**"      # this environment's config
+      - "deployments/md-preprod/dev/**" # this environment's config
+      - "deployments/md-preprod/base.yaml" # inherited account defaults
       - "src/**"                  # shared constructs and stacks
       - "app.py"
       - "cdk.json"
@@ -1957,6 +2111,25 @@ correct — shared construct code changes them all.
 `cdk diff` runs first in all three cases, so the log always records what the run
 was about to do.
 
+To deploy everything except EKS, select **action: deploy**, **stacks: all**,
+and enter **exclude: eks**. This also skips the cluster's nested access entries,
+node groups, add-ons, Karpenter and Helm applications. All configuration and
+synthesized stacks remain available for a later run.
+
+`exclude` accepts comma- or whitespace-separated full stack names or unambiguous
+suffixes, such as `eks,certificates`. Future stacks are discovered from the
+synthesized assembly without maintaining another list. Leave it blank to preserve
+the existing `all` behavior; exclusions are only accepted with `stacks: all`.
+Unknown/ambiguous names and excluding every stack fail before AWS authentication.
+The run summary lists selected and excluded stacks, and apply uses exactly the
+targets reviewed by preview.
+
+With exclusions, CDK runs `--exclusively` so it cannot silently add excluded
+stacks. Deploy/diff rejects a selection that needs an excluded prerequisite;
+destroy rejects deleting a prerequisite of an excluded stack. Adjust the exclusion
+list to keep these dependencies together. Exclusions do not delete existing
+stacks and apply only to that workflow run, not local `cdk deploy --all` commands.
+
 > **Destroy needs explicit confirmation.** Type `dev` into the confirm box or the
 > job fails before it reaches AWS:
 >
@@ -1971,24 +2144,27 @@ To gate this further, add **Required reviewers** to the `dev` GitHub Environment
 would protect a production environment.
 
 Add the same `on:` block to each new environment's workflow, changing only the
-`deployments/<name>/**` line and the workflow's own filename.
+environment configuration path, account base path (when grouped), and the
+workflow's own filename.
 
-Each workflow hardcodes everything about its target:
+Each workflow explicitly selects its deployment and GitHub/OIDC environment:
 
 ```yaml
-environment: dev      # GitHub Environment: required reviewers live here
 env:
-  ENV: dev            # app.py reads this, so no --context flag anywhere
+  ENV: md-preprod/dev
+  GITHUB_ENVIRONMENT: &deployment_environment dev
 ...
+    environment: *deployment_environment # required reviewers live here
     role-to-assume: arn:aws:iam::533267408704:role/github-oidc-cdk-deploy-dev
-    aws-region: us-east-1
+    aws-region: ${{ env.AWS_REGION }} # read from merged deployment config
 ```
 
-> **The `environment:` value is not free-form.** It must match the folder under
-> `deployments/` *and* the GitHub Environment name, because the OIDC trust policy
+> **The job's `environment:` must match the GitHub Environment name**, because the OIDC trust policy
 > expects the claim `repo:<org>/<repo>:environment:dev` (or its immutable
 > `repo:<org>@<id>/<repo>@<id>:environment:dev` form). The *file name* and the
-> `name:` field can be anything you like.
+> `name:` field can be anything you like. It is separate from the deployment
+> selector: `ENV=md-preprod/dev` continues to use GitHub Environment `dev`,
+> preserving its approvals and OIDC trust. Destroy confirmation also remains `dev`.
 
 What runs, in order:
 
@@ -2005,23 +2181,26 @@ What runs, in order:
 
 ### On every pull request
 
-`pr.yml` runs automatically: `pytest` plus `cdk synth` for every environment in
-parallel. It needs no AWS credentials and no secrets, because the availability
+`pr.yml` discovers legacy and account-grouped environments, then runs `pytest`
+plus `cdk synth` for every discovered environment in parallel. No static matrix
+needs updating when adding an environment. It needs no AWS credentials and no secrets, because the availability
 zones come from the config rather than an AWS lookup.
 
 ### Adding an environment
 
-1. Copy `deployments/dev/` to `deployments/<name>/` and edit `account_id`,
-   `region`, `common` and `network`.
+1. Add `deployments/<account>/base.yaml` for shared defaults and
+   `deployments/<account>/<name>/env.yaml` for environment overrides and resources.
+   Alternatively, keep the legacy self-contained `deployments/<name>/env.yaml`.
 2. Bootstrap that account and region (Step 1).
 3. Run the OIDC script with `--environment <name>` (Step 2).
 4. Create the GitHub Environment with that name (Step 3).
 5. Copy `.github/workflows/deploy-primary-mdpp-dev.yml` to a new file, then
-   change `name:`, the `concurrency.group`, `environment:`, `ENV:`,
-   `role-to-assume:`, `aws-region:`, and the two environment-specific entries
-   under `on.push.paths` (`deployments/<name>/**` and the workflow's own
-   filename).
-6. Add `<name>` to the `environment:` matrix in `.github/workflows/pr.yml`.
+   change `name:`, the `concurrency.group`, `GITHUB_ENVIRONMENT`, `ENV`,
+   the preview/deploy role ARNs, and the environment-specific paths under
+   `on.push.paths`. For grouped deployments, watch both the environment folder
+   and its account `base.yaml`. Keep the workflow's own filename in the filter.
+6. Run `python scripts/sync_stack_choices.py` to refresh the stack dropdown.
+   PR discovery includes the new deployment automatically.
 
 ### Which role does what
 
@@ -2043,7 +2222,7 @@ bootstrap time matters for a HIPAA account.
 
 | Symptom | Role at fault |
 | ------- | ------------- |
-| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | GitHub Environment name does not match the folder under `deployments/` |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | GitHub Environment name does not match the OIDC trust policy |
 | `not authorized to perform: iam:PassRole on .../cfn-exec-role` | deploy role, or a bootstrap/qualifier mismatch |
 | Fails before any stack events appear | deploy or file-publishing role |
 | Stack rolls back with `AccessDenied` on `ec2:CreateVpc` | cfn-exec role — re-bootstrap with broader policies |
@@ -2054,15 +2233,26 @@ bootstrap time matters for a HIPAA account.
 
 1. **Construct** — new file in `src/cognitech_cdk/constructs/`, subclassing
    `Construct`, taking `common: Common` plus its own frozen props dataclass as
-   keyword-only arguments. Name resources with `common.name(...)` (or
-   `common.abbreviated_name(...)` where a 32-character cap applies). Do not
+   keyword-only arguments. Pass the actual environment name as a naming
+   prefix: `common.name(environment_name, ...)` (or
+   `common.abbreviated_name(environment_name, ...)` where a short name cap applies).
+   Never substitute `network.name`, `environment_abr` or the account folder for
+   the environment folder name. Do not
    re-apply the common tags — the stack already tags the whole tree.
 2. **Config** — add a `from_dict` to the props dataclass and a field on
    `Environment` in `src/cognitech_cdk/common/environment.py`, then add the key
    to every `deployments/<env>/env.yaml`.
 3. **Stack** — add the construct to an existing stack, or add a module under
-   `src/cognitech_cdk/stacks/` and register it in `app.py`.
-4. **Test** — add assertions in `tests/unit/`.
+   `src/cognitech_cdk/stacks/` and register it in `app.py`. New deployment stacks
+   must inherit `EnvironmentStack` and use `self.resource_name(...)` for
+   generated AWS names and `self.output(...)` for exports. This automatically
+   applies `{account_name}-{region_prefix}-{environment}-{resource...}` and
+   common tags. When a construct generates names itself, pass
+   `environment.name` explicitly. Preserve explicit name overrides, imported
+   resources and AWS service-specific name limits.
+4. **Test** — add focused assertions in `tests/unit/` for generated names,
+   including a case where the environment folder differs from `network.name`.
+   Verify the environment prefix is present exactly once.
 
 Nothing has to be added to the deploy workflows: they ask `cdk list` what the
 environment builds, and the `sync-stack-choices` workflow rewrites their stack

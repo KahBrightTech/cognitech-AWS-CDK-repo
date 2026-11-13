@@ -29,6 +29,7 @@ class NetworkStack(cdk.Stack):
             common=environment.common,
             props=environment.network,
             region=environment.region,
+            environment_name=environment.name,
         )
 
         self._output("VpcId", self.network.vpc.vpc_id, "vpc-id")

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import aws_cdk as cdk
 import pytest
+import yaml
 from aws_cdk.assertions import Match, Template
 
 from cognitech_cdk.common.environment import load_environment
@@ -78,17 +81,17 @@ def test_every_configured_group_is_created(write_env):
     template = _template(write_env, CLUSTER)
 
     assert set(_groups(template)) == {
-        "int-production-use1-eks-cluster-sg",
-        "int-production-use1-eks-nodes-sg",
-        "int-production-use1-alb-sg",
+        "int-production-use1-test-eks-cluster-sg",
+        "int-production-use1-test-eks-nodes-sg",
+        "int-production-use1-test-alb-sg",
     }
 
 
 def test_groups_carry_the_name_tag_and_description(write_env):
-    group = _groups(_template(write_env, CLUSTER))["int-production-use1-eks-cluster-sg"]
+    group = _groups(_template(write_env, CLUSTER))["int-production-use1-test-eks-cluster-sg"]
 
     assert group["GroupDescription"] == "EKS control plane"
-    assert {"Key": "Name", "Value": "int-production-use1-eks-cluster-sg"} in group["Tags"]
+    assert {"Key": "Name", "Value": "int-production-use1-test-eks-cluster-sg"} in group["Tags"]
 
 
 def test_group_to_group_rules_are_separate_resources(write_env):
@@ -103,18 +106,20 @@ def test_group_to_group_rules_are_separate_resources(write_env):
             "IpProtocol": "tcp",
             "FromPort": 10250,
             "ToPort": 10250,
-            "Description": "Kubelet from the control plane",
+            "Description": (
+                "Inbound traffic from eks cluster on tcp port 10250(kubelet) to eks nodes"
+            ),
         },
     )
 
 
 def test_a_cidr_rule_stays_inline_on_the_group(write_env):
-    group = _groups(_template(write_env, CLUSTER))["int-production-use1-alb-sg"]
+    group = _groups(_template(write_env, CLUSTER))["int-production-use1-test-alb-sg"]
 
     assert group["SecurityGroupIngress"] == [
         {
             "CidrIp": "0.0.0.0/0",
-            "Description": "HTTPS from anywhere",
+            "Description": "Inbound traffic from 0.0.0.0/0 on tcp port 443(HTTPS) to alb",
             "FromPort": 443,
             "ToPort": 443,
             "IpProtocol": "tcp",
@@ -127,11 +132,14 @@ def test_port_ranges_and_all_traffic_are_translated(write_env):
 
     template.has_resource_properties(
         "AWS::EC2::SecurityGroupIngress",
-        {"IpProtocol": "tcp", "FromPort": 30000, "ToPort": 32767},
+        {"IpProtocol": "tcp", "FromPort": 30000, "ToPort": 32767,
+         "Description": "Inbound traffic from alb on tcp ports 30000-32767(NodePort) to eks nodes"},
     )
     template.has_resource_properties(
         "AWS::EC2::SecurityGroupIngress",
-        {"IpProtocol": "-1", "Description": "Node to node"},
+        {"IpProtocol": "-1", "Description": (
+            "Inbound traffic from eks nodes on all protocols and ports to eks nodes"
+        )},
     )
 
 
@@ -142,7 +150,9 @@ def test_outbound_is_open_unless_egress_is_listed(write_env):
         assert group["SecurityGroupEgress"] == [
             {
                 "CidrIp": "0.0.0.0/0",
-                "Description": "Allow all outbound traffic by default",
+                "Description": (
+                    "Outbound traffic to 0.0.0.0/0 on all protocols and ports"
+                ),
                 "IpProtocol": "-1",
             }
         ]
@@ -161,16 +171,106 @@ def test_listed_egress_replaces_the_open_default(write_env):
         """,
     )
 
-    group = _groups(template)["int-production-use1-locked-down-sg"]
+    group = _groups(template)["int-production-use1-test-locked-down-sg"]
     assert group["SecurityGroupEgress"] == [
         {
             "CidrIp": "10.20.0.0/16",
-            "Description": "Proxy",
+            "Description": "Outbound traffic to 10.20.0.0/16 on tcp port 3128",
             "FromPort": 3128,
             "ToPort": 3128,
             "IpProtocol": "tcp",
         }
     ]
+
+
+def test_generated_descriptions_cover_udp_ipv6_prefix_lists_and_egress_groups(write_env):
+    template = _template(
+        write_env,
+        """
+        - name: app
+          ingress:
+          - source: "::/0"
+            protocol: udp
+            ports: 1000-1002
+          - source: pl-0123456789abcdef0
+            protocol: icmp
+          egress:
+          - destination: proxy
+            ports: 443
+            description: External API access
+        - name: proxy
+        """,
+    )
+    template.has_resource_properties("AWS::EC2::SecurityGroup", {
+        "GroupName": "int-production-use1-test-app-sg",
+        "SecurityGroupIngress": [{
+            "CidrIpv6": "::/0", "IpProtocol": "udp", "FromPort": 1000, "ToPort": 1002,
+            "Description": "Inbound traffic from ::/0 on udp ports 1000-1002 to app",
+        }],
+    })
+    template.has_resource_properties("AWS::EC2::SecurityGroupIngress", {
+        "SourcePrefixListId": "pl-0123456789abcdef0", "IpProtocol": "icmp",
+        "Description": "Inbound traffic from pl-0123456789abcdef0 on icmp for all types and codes to app",
+    })
+    template.has_resource_properties("AWS::EC2::SecurityGroupEgress", {
+        "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+        "Description": "Outbound traffic to proxy on tcp port 443(HTTPS)",
+    })
+
+
+def test_generated_rule_description_enforces_aws_length_limit(write_env):
+    prefix = "Inbound traffic from 10.0.0.0/8 on tcp port 443(HTTPS) to "
+    name = "x" * (255 - len(prefix))
+    configuration = (
+        f"- name: {name}\n  ingress:\n  - source: 10.0.0.0/8\n"
+        "    ports: 443\n"
+    )
+    template = _template(write_env, configuration)
+    rule = _groups(template)[f"int-production-use1-test-{name}-sg"]["SecurityGroupIngress"][0]
+    assert len(rule["Description"]) == 255
+    with pytest.raises(ValueError, match="generated ingress description exceeds 255 characters"):
+        _template(write_env, configuration.replace(name, name + "x"))
+
+
+def test_dev_yaml_and_aws_ingress_descriptions_match_the_requested_style(write_env):
+    path = Path(__file__).resolve().parents[2] / "deployments/md-preprod/dev/env.yaml"
+    groups = yaml.safe_load(path.read_text())["security_groups"]
+    assert groups[0]["ingress"][0]["description"] == (
+        "Inbound traffic from eks nodes on tcp port 443(HTTPS) to eks cluster"
+    )
+    template = _template(write_env, yaml.safe_dump(groups))
+    descriptions = {
+        resource["Properties"]["Description"]
+        for resource in template.find_resources("AWS::EC2::SecurityGroupIngress").values()
+    }
+    descriptions.update(
+        rule["Description"]
+        for group in _groups(template).values()
+        for rule in group.get("SecurityGroupIngress", [])
+    )
+    assert descriptions == {
+        rule["description"] for group in groups for rule in group["ingress"]
+    }
+    resources = template.find_resources("AWS::EC2::SecurityGroup")
+    ids = {
+        resource["Properties"]["GroupName"]: logical_id
+        for logical_id, resource in resources.items()
+    }
+    nlb_id = ids["int-production-use1-test-nlb-sg"]
+    nodes_id = ids["int-production-use1-test-eks-nodes-sg"]
+    nlb = resources[nlb_id]["Properties"]
+    assert {(rule["CidrIp"], rule["IpProtocol"], rule["FromPort"], rule["ToPort"])
+            for rule in nlb["SecurityGroupIngress"]} == {
+        ("0.0.0.0/0", "tcp", 80, 80), ("0.0.0.0/0", "tcp", 443, 443),
+    }
+    template.has_resource_properties("AWS::EC2::SecurityGroupIngress", {
+        "SourceSecurityGroupId": {"Fn::GetAtt": [nlb_id, "GroupId"]},
+        "GroupId": {"Fn::GetAtt": [nodes_id, "GroupId"]},
+        "IpProtocol": "tcp", "FromPort": 30000, "ToPort": 32767,
+        "Description": "Inbound traffic from nlb on tcp ports 30000-32767(NodePort) to eks nodes",
+    })
+    active = yaml.safe_load(path.read_text())
+    assert active["eks_addons"][0]["load_balancer_defaults"]["security_groups"] == ["alb"]
 
 
 def test_existing_ids_and_prefix_lists_are_used_as_given(write_env):
@@ -191,7 +291,7 @@ def test_existing_ids_and_prefix_lists_are_used_as_given(write_env):
 
     # An sg- id can be written inline; a prefix list always becomes its own
     # resource, so both places have to be looked at.
-    inline = _groups(template)["int-production-use1-mixed-sg"]["SecurityGroupIngress"]
+    inline = _groups(template)["int-production-use1-test-mixed-sg"]["SecurityGroupIngress"]
     separate = [
         resource["Properties"]
         for resource in template.find_resources("AWS::EC2::SecurityGroupIngress").values()
@@ -214,7 +314,7 @@ def test_extra_tags_are_applied(write_env):
         """,
     )
 
-    group = _groups(template)["int-production-use1-eks-nodes-sg"]
+    group = _groups(template)["int-production-use1-test-eks-nodes-sg"]
     assert {"Key": "kubernetes.io/cluster/dev", "Value": "owned"} in group["Tags"]
 
 

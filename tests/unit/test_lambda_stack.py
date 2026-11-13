@@ -46,7 +46,7 @@ def _props(text: str, base_dir=None) -> LambdaProps:
 
 
 def _environment(write_env, **kwargs):
-    return load_environment("test", root=write_env(NETWORK, **kwargs))
+    return load_environment("uat", root=write_env(NETWORK, name="uat", **kwargs))
 
 
 def _stack(write_env, text=S3_FUNCTION, *, base_dir=None, **dependencies):

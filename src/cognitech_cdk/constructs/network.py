@@ -10,11 +10,11 @@ this module has to honour exact ranges from the config.
 
 Resource names follow the following naming convention:
 
-    {account_name}-{region_prefix}-{vpc_name}-vpc
-    {account_name}-{region_prefix}-{vpc_name}-igw
-    {account_name}-{region_prefix}-{vpc_name}-{subnet_name}-{type}-{ordinal}
-    {account_name}-{region_prefix}-{vpc_name}-{subnet_name}-ngw-{ordinal}
-    {account_name}-{region_prefix}-{vpc_name}-{subnet_name}-eip-{ordinal}
+    {account_name}-{region_prefix}-{environment}-vpc
+    {account_name}-{region_prefix}-{environment}-igw
+    {account_name}-{region_prefix}-{environment}-{subnet_name}-{type}-{ordinal}
+    {account_name}-{region_prefix}-{environment}-{subnet_name}-ngw-{ordinal}
+    {account_name}-{region_prefix}-{environment}-{subnet_name}-eip-{ordinal}
 """
 
 from __future__ import annotations
@@ -156,18 +156,20 @@ class Network(Construct):
         common: Common,
         props: NetworkProps,
         region: str,
+        environment_name: str | None = None,
     ) -> None:
         super().__init__(scope, construct_id)
 
         self.common = common
         self.props = props
+        self.environment_name = environment_name if environment_name is not None else props.name
         self.availability_zones = [f"{region}{letter}" for letter in "abcd"[: props.azs]]
         public_cidrs, private_cidrs = props.subnet_cidrs()
 
         self.vpc = ec2.Vpc(
             self,
             "Vpc",
-            vpc_name=common.name(props.name, "vpc"),
+            vpc_name=common.name(self.environment_name, "vpc"),
             ip_addresses=ec2.IpAddresses.cidr(props.cidr_block),
             availability_zones=self.availability_zones,
             enable_dns_hostnames=True,
@@ -263,16 +265,16 @@ class Network(Construct):
         group = self._group(subnet_name, subnet_type)
         position = ordinal(index)
         cdk.Tags.of(subnet).add(
-            "Name", self.common.name(self.props.name, group, subnet_type, position)
+            "Name", self.common.name(self.environment_name, group, subnet_type, position)
         )
         # `RouteTable` is the child id ec2.Subnet gives its CfnRouteTable.
         cdk.Tags.of(subnet.node.find_child("RouteTable")).add(
-            "Name", self.common.name(self.props.name, group, position, subnet_type, "rt")
+            "Name", self.common.name(self.environment_name, group, position, subnet_type, "rt")
         )
 
     def _name_gateways(self) -> None:
         name = self.common.name
-        vpc_name = self.props.name
+        vpc_name = self.environment_name
 
         cdk.Tags.of(self.internet_gateway).add("Name", name(vpc_name, "igw"))
 

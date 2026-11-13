@@ -47,7 +47,7 @@ Listeners are CloudFormation-level resources, so nothing here adds security
 group rules: a load balancer only accepts what its configured groups allow.
 
 Load balancer and target group names have a 32 character AWS limit, so they
-use the abbreviated form `{account_name_abr}-{region_prefix}-{network}-{name}-{alb|nlb|tg}`.
+use the abbreviated form `{account_name_abr}-{region_prefix}-{environment}-{name}-{alb|nlb|tg}`.
 """
 
 from __future__ import annotations
@@ -835,6 +835,7 @@ class LoadBalancing(Construct):
         *,
         common: Common,
         network_name: str,
+        environment_name: str | None = None,
         account_id: str,
         props: LoadBalancingProps,
         network: Network,
@@ -845,6 +846,7 @@ class LoadBalancing(Construct):
         super().__init__(scope, construct_id_)
         self.common = common
         self.network_name = network_name
+        self.environment_name = environment_name if environment_name is not None else network_name
         self.account_id = account_id
         self.network = network
         self.security_groups = security_groups
@@ -865,7 +867,7 @@ class LoadBalancing(Construct):
             self.listener_rules[rule.name] = self._rule(rule)
 
     def physical_name(self, name: str, suffix: str, label: str) -> str:
-        value = self.common.abbreviated_name(self.network_name, name, suffix)
+        value = self.common.abbreviated_name(self.environment_name, name, suffix)
         if len(value) > MAX_NAME:
             raise ValueError(
                 f"{label} '{name}': AWS name '{value}' has {len(value)} characters; the "
@@ -1086,7 +1088,7 @@ class LoadBalancing(Construct):
             default_actions=[self._action(elbv2.CfnListener, props.action)],
         )
         cdk.Tags.of(listener).add(
-            "Name", self.common.abbreviated_name(self.network_name, props.name, "listener")
+            "Name", self.common.abbreviated_name(self.environment_name, props.name, "listener")
         )
         if props.sni_certificates:
             elbv2.CfnListenerCertificate(

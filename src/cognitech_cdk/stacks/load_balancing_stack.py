@@ -41,6 +41,7 @@ class LoadBalancingStack(EnvironmentStack):
             "LoadBalancing",
             common=environment.common,
             network_name=environment.network.name,
+            environment_name=environment.name,
             account_id=environment.account_id,
             props=props,
             network=network,

@@ -34,7 +34,7 @@ listed rules are the only way out. Set `allow_all_outbound: false` with no
 
 Resource names follow the convention used elsewhere in this repo:
 
-    {account_name}-{region_prefix}-{name}-sg
+    {account_name}-{region_prefix}-{environment}-{name}-sg
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import aws_cdk as cdk
 from aws_cdk import aws_ec2 as ec2
@@ -53,6 +53,8 @@ from cognitech_cdk.common.config import Common
 PROTOCOLS = ("tcp", "udp", "icmp", "all")
 PORTLESS = ("icmp", "all")
 MAX_PORT = 65535
+MAX_RULE_DESCRIPTION_LENGTH = 255
+TCP_SERVICES = {80: "HTTP", 443: "HTTPS", 5432: "PostgreSQL", 10250: "kubelet"}
 
 # A rule either points at a CIDR / existing id, or names a group in this config.
 CIDR = re.compile(r"^[0-9a-fA-F.:]+/\d{1,3}$")
@@ -165,7 +167,7 @@ class RuleProps:
         ports = raw.get("ports")
         return cls(
             peer=str(peer),
-            description=str(raw.get("description") or f"{peer_key} {peer}"),
+            description=str(raw.get("description") or ""),
             protocol=str(raw.get("protocol", "tcp")).lower(),
             ports=str(ports) if ports is not None else None,
         )
@@ -286,12 +288,14 @@ class SecurityGroups(Construct):
         common: Common,
         props: Sequence[SecurityGroupProps],
         vpc: ec2.IVpc,
+        environment_name: str = "",
     ) -> None:
         super().__init__(scope, construct_id)
 
         self.common = common
         self.props = tuple(props)
         self.vpc = vpc
+        self.environment_name = environment_name
         self.groups: dict[str, ec2.SecurityGroup] = {}
 
         for group in self.props:
@@ -314,7 +318,7 @@ class SecurityGroups(Construct):
     # --- resources --------------------------------------------------------
 
     def _add_group(self, props: SecurityGroupProps) -> ec2.SecurityGroup:
-        full_name = self.common.name(props.name, "sg")
+        full_name = self.common.name(self.environment_name, props.name, "sg")
         group = ec2.SecurityGroup(
             self,
             _construct_id(props.name),
@@ -326,14 +330,55 @@ class SecurityGroups(Construct):
         cdk.Tags.of(group).add("Name", full_name)
         for key, value in props.tags.items():
             cdk.Tags.of(group).add(key, value)
+        if props.allows_all_outbound:
+            resource = group.node.default_child
+            if not isinstance(resource, ec2.CfnSecurityGroup):
+                raise TypeError(f"Security group '{props.name}' must contain a CfnSecurityGroup.")
+            # Keep CDK's allow-all behavior; change only its generated rule text.
+            resource.add_property_override(
+                "SecurityGroupEgress.0.Description",
+                self._description(
+                    RuleProps(peer="0.0.0.0/0", description="", protocol="all"),
+                    props.name, "egress",
+                ),
+            )
         return group
 
     def _add_rules(self, props: SecurityGroupProps) -> None:
         group = self.groups[props.name]
         for rule in props.ingress:
-            group.add_ingress_rule(self._peer(rule), rule.port(), rule.description)
+            group.add_ingress_rule(self._peer(rule), rule.port(), self._description(rule, props.name, "ingress"))
         for rule in props.egress:
-            group.add_egress_rule(self._peer(rule), rule.port(), rule.description)
+            group.add_egress_rule(self._peer(rule), rule.port(), self._description(rule, props.name, "egress"))
+
+    @staticmethod
+    def _description(rule: RuleProps, group: str, direction: Literal["ingress", "egress"]) -> str:
+        if rule.protocol == "all":
+            traffic = "on all protocols and ports"
+        elif rule.protocol == "icmp":
+            traffic = "on icmp for all types and codes"
+        else:
+            low, high = rule.port_range()
+            ports = f"port {low}" if low == high else f"ports {low}-{high}"
+            if rule.protocol == "tcp":
+                service = TCP_SERVICES.get(low) if low == high else None
+                if (low, high) == (30000, 32767):
+                    service = "NodePort"
+                if service:
+                    ports += f"({service})"
+            traffic = f"on {rule.protocol} {ports}"
+        peer = rule.peer.replace("-", " ").replace("_", " ") if rule.references_group else rule.peer
+        if direction == "ingress":
+            destination = group.replace("-", " ").replace("_", " ")
+            description = f"Inbound traffic from {peer} {traffic} to {destination}"
+        else:
+            description = f"Outbound traffic to {peer} {traffic}"
+        if len(description) > MAX_RULE_DESCRIPTION_LENGTH:
+            raise ValueError(
+                f"Security group '{group}': generated {direction} description exceeds "
+                f"{MAX_RULE_DESCRIPTION_LENGTH} characters; shorten the configured group names."
+            )
+        return description
 
     def _peer(self, rule: RuleProps) -> ec2.IPeer:
         if rule.references_group:

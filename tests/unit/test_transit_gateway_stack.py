@@ -74,7 +74,7 @@ def _props(text: str) -> TransitGatewayProps:
 
 
 def _build(write_env, config: str, network: str = WITH_PRIVATE):
-    environment = load_environment("test", root=write_env(network))
+    environment = load_environment("uat", root=write_env(network, name="uat"))
     app = cdk.App()
     env = cdk.Environment(account=environment.account_id, region=environment.region)
     network_stack = NetworkStack(app, "network", environment=environment, env=env)

@@ -18,7 +18,7 @@ class EnvironmentStack(cdk.Stack):
             cdk.Tags.of(self).add(key, value)
 
     def resource_name(self, *parts: str) -> str:
-        return self.config.common.name(self.config.network.name, *parts)
+        return self.config.common.name(self.config.name, *parts)
 
     def output(
         self,

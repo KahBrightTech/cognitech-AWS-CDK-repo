@@ -1,7 +1,8 @@
-"""Loads `deployments/<env>/env.yaml` into typed objects.
+"""Loads legacy or account-grouped deployments into typed objects.
 
-Each stack gets its own props block in the YAML, so adding a stack means adding
-a key here and a dataclass next to its construct.
+Account-grouped environments inherit `deployments/<account>/base.yaml`.
+Environment mappings override defaults recursively; lists and scalars replace
+them. Repository-relative references keep resolving from the project root.
 """
 
 from __future__ import annotations
@@ -12,7 +13,8 @@ from typing import Any, Mapping
 
 import yaml
 
-from cognitech_cdk.common.config import Common
+from cognitech_cdk.common import schema
+from cognitech_cdk.common.config import Common, merge_config
 from cognitech_cdk.constructs.backup import BackupProps
 from cognitech_cdk.constructs.certificates import CertificatesProps
 from cognitech_cdk.constructs.cognito import CognitoProps
@@ -38,6 +40,7 @@ from cognitech_cdk.constructs.waf import WafProps
 
 DEPLOYMENTS_DIR = Path(__file__).resolve().parents[3] / "deployments"
 ENV_FILE = "env.yaml"
+BASE_FILE = "base.yaml"
 
 
 @dataclass(frozen=True)
@@ -74,15 +77,54 @@ class Environment:
         return {"account": self.account_id, "region": self.region}
 
 
-def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment:
-    path = root / env_name / ENV_FILE
-    if not path.is_file():
-        known = ", ".join(list_environments(root)) or "none"
-        raise FileNotFoundError(
-            f"No config for '{env_name}'. Expected {path}. Known environments: {known}."
+def resolve_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> str:
+    """Resolve a qualified name or an unambiguous legacy short name."""
+    parts = env_name.split("/")
+    if len(parts) not in (1, 2):
+        raise ValueError("Environment must be <environment> or <account>/<environment>.")
+    for part in parts:
+        schema.name(part, "Environment path component")
+    known = list_environments(root)
+    matches = (
+        [name for name in known if name == env_name]
+        if len(parts) == 2
+        else [name for name in known if name.split("/")[-1] == env_name]
+    )
+    if len(matches) > 1:
+        raise ValueError(
+            f"Ambiguous environment '{env_name}'. Choose an account/environment: {', '.join(matches)}."
         )
+    if not matches:
+        raise FileNotFoundError(
+            f"Unknown environment '{env_name}'. Expected {root / env_name / ENV_FILE}. "
+            f"Known environments: {', '.join(known) or 'none'}."
+        )
+    return matches[0]
 
-    raw: dict[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+def _read_config(path: Path) -> Mapping[str, Any]:
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as error:
+        raise ValueError(f"Invalid YAML in {path}: {error}") from error
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping) or any(not isinstance(key, str) for key in raw):
+        raise ValueError(f"{path} must contain a mapping with string keys.")
+    return raw
+
+
+def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment:
+    selected = resolve_environment(env_name, root)
+    path = root / selected / ENV_FILE
+    raw = _read_config(path)
+    if "/" in selected:
+        defaults = path.parent.parent / BASE_FILE
+        if defaults.is_file():
+            raw = merge_config(_read_config(defaults), raw)
+    missing = [key for key in ("account_id", "region", "network") if raw.get(key) in (None, "")]
+    if missing:
+        raise ValueError(f"{path}: missing required fields after merging: {', '.join(missing)}.")
     # Repository-relative files (policies, rule files, code) resolve from the
     # project root alongside deployments/, not the environment folder.
     base_dir = root.parent
@@ -91,10 +133,10 @@ def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment
     )
 
     return Environment(
-        name=env_name,
+        name=path.parent.name,
         account_id=str(raw["account_id"]),
         region=str(raw["region"]),
-        common=Common.from_dict(raw.get("common") or {}, env_name),
+        common=Common.from_dict(raw.get("common") or {}, path.parent.name),
         network=NetworkProps.from_dict(raw["network"]),
         security_groups=SecurityGroupProps.load_all(raw.get("security_groups")),
         iam=IamProps.from_dict(raw.get("iam"), base_dir=base_dir),
@@ -107,7 +149,9 @@ def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment
         backups=BackupProps.from_dict(raw.get("backups"), base_dir=base_dir),
         load_balancing=LoadBalancingProps.from_dict(raw.get("load_balancing"), base_dir=base_dir),
         waf=WafProps.from_dict(raw.get("waf"), base_dir=base_dir),
-        eks=EksProps.from_dict(raw.get("eks"), base_dir=base_dir),
+        eks=EksProps.from_dict(
+            raw.get("eks"), base_dir=base_dir, principal_aliases=raw.get("eks_access_principals"),
+        ),
         eks_addons=EksAddonsProps.from_dict(raw.get("eks_addons"), base_dir=base_dir),
         ecr=EcrProps.from_dict(raw.get("ecr_repositories"), base_dir=base_dir),
         ecs=EcsProps.from_dict(raw.get("ecs_clusters"), base_dir=base_dir),
@@ -121,7 +165,12 @@ def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment
 
 
 def list_environments(root: Path = DEPLOYMENTS_DIR) -> list[str]:
-    """Environment names found under `deployments/`."""
+    """Canonical legacy and account/environment names under `deployments/`."""
     if not root.is_dir():
         return []
-    return sorted(path.parent.name for path in root.glob(f"*/{ENV_FILE}"))
+    return sorted(
+        path.parent.relative_to(root).as_posix()
+        for pattern in (f"*/{ENV_FILE}", f"*/*/{ENV_FILE}")
+        for path in root.glob(pattern)
+        if path.is_file()
+    )

@@ -208,15 +208,23 @@ class AccessEntryProps:
     namespaces: tuple[str, ...] = ()
 
     @classmethod
-    def from_dict(cls, entry_name: str, raw: Any, cluster: str) -> AccessEntryProps:
+    def from_dict(
+        cls, entry_name: str, raw: Any, cluster: str, *, principal_aliases: Mapping[str, str] | None = None,
+    ) -> AccessEntryProps:
         label = f"EKS cluster '{cluster}', access entry '{entry_name}'"
         data = mapping(
             raw if raw is not None else {}, label,
             {"principal_arns", "roles", "policy_arn", "policy_arns", "kubernetes_groups", "namespaces"},
         )
         principals = strings(data.get("principal_arns"), f"{label}: principal_arns")
+        aliases = principal_aliases or {}
+        principals = tuple(aliases.get(principal, principal) for principal in principals)
         for arn in principals:
-            _matching(arn, f"{label}: principal_arns", PRINCIPAL_ARN, "IAM role or user ARNs")
+            _matching(
+                arn, f"{label}: principal_arns", PRINCIPAL_ARN,
+                "IAM role or user ARNs, or an eks_access_principals reference "
+                f"(known: {', '.join(aliases) or 'none'})",
+            )
         roles = strings(data.get("roles"), f"{label}: roles")
         for role in roles:
             name(role, f"{label}: roles")
@@ -758,7 +766,10 @@ class EksClusterProps:
         return not self.endpoint_public_access or self.public_access_cidrs != ("0.0.0.0/0",)
 
     @classmethod
-    def from_dict(cls, raw: Any, *, base_dir: Path | None = None) -> EksClusterProps:
+    def from_dict(
+        cls, raw: Any, *, base_dir: Path | None = None,
+        principal_aliases: Mapping[str, str] | None = None,
+    ) -> EksClusterProps:
         data = mapping(raw, "EKS cluster", {
             "name", "version", "role", "role_arn", "subnet_tier", "security_groups",
             "endpoint_private_access", "endpoint_public_access", "public_access_cidrs",
@@ -817,7 +828,9 @@ class EksClusterProps:
         if raw_entries is not None and not isinstance(raw_entries, Mapping):
             raise ValueError(f"{label}: access_entries must map names to entries.")
         access_entries = tuple(
-            AccessEntryProps.from_dict(entry_name, entry, cluster)
+            AccessEntryProps.from_dict(
+                entry_name, entry, cluster, principal_aliases=principal_aliases,
+            )
             for entry_name, entry in (raw_entries or {}).items()
         )
         props = cls(
@@ -940,9 +953,23 @@ class EksProps:
         return bool(self.clusters)
 
     @classmethod
-    def from_dict(cls, raw: Any, *, base_dir: Path | None = None) -> EksProps:
+    def from_dict(
+        cls, raw: Any, *, base_dir: Path | None = None, principal_aliases: Any = None,
+    ) -> EksProps:
+        aliases: dict[str, str] = {}
+        if principal_aliases is not None:
+            if not isinstance(principal_aliases, Mapping):
+                raise ValueError("eks_access_principals must map names to IAM role or user ARNs.")
+            for alias, arn in principal_aliases.items():
+                name(alias, "eks_access_principals name")
+                label = f"eks_access_principals '{alias}'"
+                principal_arn = required_string(arn, label)
+                _matching(principal_arn, label, PRINCIPAL_ARN, "an IAM role or user ARN")
+                aliases[alias] = principal_arn
         return cls(
-            clusters=items(raw, "eks", lambda item: EksClusterProps.from_dict(item, base_dir=base_dir))
+            clusters=items(raw, "eks", lambda item: EksClusterProps.from_dict(
+                item, base_dir=base_dir, principal_aliases=aliases,
+            ))
         )
 
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """CDK app entrypoint.
 
-The environment is a folder name under `deployments/`. It is resolved in this
+The environment is a legacy name or account/environment under `deployments/`.
+Short names also work for grouped deployments when unambiguous. It is resolved in this
 order, first match wins:
 
 1. `--context env=<name>` on the command line
@@ -30,8 +31,8 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 import aws_cdk as cdk  # noqa: E402
 
 from cognitech_cdk.common.environment import (  # noqa: E402
-    list_environments,
     load_environment,
+    resolve_environment,
 )
 from cognitech_cdk.stacks.backup_stack import BackupStack  # noqa: E402
 from cognitech_cdk.stacks.certificates_stack import CertificatesStack  # noqa: E402
@@ -62,22 +63,22 @@ app = cdk.App()
 
 env_name = app.node.try_get_context("env") or os.environ.get(ENV_VAR) or DEFAULT_ENV
 
-known = list_environments()
-if env_name not in known:
+try:
+    resolve_environment(env_name)
+except (FileNotFoundError, ValueError) as error:
     raise SystemExit(
-        f"Unknown environment '{env_name}'. Known: {', '.join(known) or 'none'}.\n"
-        f"Set it with --context env=<name> or {ENV_VAR}=<name>."
-    )
+        f"{error}\nSet it with --context env=<name> or {ENV_VAR}=<name>."
+    ) from error
 
 environment = load_environment(env_name)
 aws_env = cdk.Environment(account=environment.account_id, region=environment.region)
 
 def stack_name(suffix: str) -> str:
-    return environment.common.name(environment.network.name, suffix)
+    return environment.common.name(environment.name, suffix)
 
 
 def options(description: str) -> dict:
-    return {"env": aws_env, "description": f"{description} for {env_name}"}
+    return {"env": aws_env, "description": f"{description} for {environment.name}"}
 
 
 network = NetworkStack(

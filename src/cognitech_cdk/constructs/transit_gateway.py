@@ -47,9 +47,9 @@ Example:
 When a reference to an attachment or route table is left out and exactly one
 is configured, that one is used. Resource names follow the repo convention:
 
-    {account_name}-{region_prefix}-{vpc_name}-{name}-tgw
-    {account_name}-{region_prefix}-{vpc_name}-{name}-tgw-attach
-    {account_name}-{region_prefix}-{vpc_name}-{name}-tgw-rtb
+    {account_name}-{region_prefix}-{environment}-{name}-tgw
+    {account_name}-{region_prefix}-{environment}-{name}-tgw-attach
+    {account_name}-{region_prefix}-{environment}-{name}-tgw-rtb
 """
 
 from __future__ import annotations
@@ -660,12 +660,14 @@ class TransitGateway(Construct):
         *,
         common: Common,
         network_name: str,
+        environment_name: str | None = None,
         props: TransitGatewayProps,
         network: Network,
     ) -> None:
         super().__init__(scope, construct_id_)
         self.common = common
         self.network_name = network_name
+        self.environment_name = environment_name if environment_name is not None else network_name
         self.props = props
         self.network = network
 
@@ -701,7 +703,7 @@ class TransitGateway(Construct):
             self.subnet_routes[route.name] = self._add_subnet_routes(route, destinations)
 
     def _name(self, *parts: str) -> str:
-        return self.common.name(self.network_name, *parts)
+        return self.common.name(self.environment_name, *parts)
 
     def _gateway_id(self, transit_gateway_id: str | None) -> str:
         return transit_gateway_id or self.transit_gateway_id  # type: ignore[return-value]

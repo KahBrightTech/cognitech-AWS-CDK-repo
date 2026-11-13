@@ -7,11 +7,23 @@ built here follow the same naming convention as the Terraform estate.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Any, Mapping
 
 ORDINALS = ("primary", "secondary", "tertiary", "quaternary")
 MAX_AZS = len(ORDINALS)
 REQUIRED_TAGS = ("Build-method", "Environment", "ManagedBy", "Owner", "Compliance")
+
+
+def merge_config(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge mappings recursively; other override values replace defaults."""
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(value, Mapping) and isinstance(result.get(key), Mapping):
+            result[key] = merge_config(result[key], value)
+        else:
+            result[key] = value
+    return result
+
 
 def ordinal(index: int) -> str:
     """`primary`, `secondary`, `tertiary`, `quaternary` for an AZ position."""

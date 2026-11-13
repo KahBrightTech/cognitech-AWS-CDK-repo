@@ -14,13 +14,42 @@ permissions:
   contents: read
 
 jobs:
+  discover:
+    name: Discover deployments
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.discover.outputs.environments }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Discover environments
+        id: discover
+        env:
+          PYTHONPATH: src
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from cognitech_cdk.common.environment import list_environments
+
+          environments = list_environments()
+          if not environments:
+              raise SystemExit("No deployment environments found.")
+          print("environments=" + json.dumps(environments))
+          PY
+
   check:
     name: Tests and synth
+    needs: discover
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        environment: [dev, prod]
+        environment: ${{ fromJSON(needs.discover.outputs.environments) }}
     env:
       # app.py reads this, so no --context flag is needed below.
       ENV: ${{ matrix.environment }}

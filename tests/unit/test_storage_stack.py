@@ -51,7 +51,7 @@ SOFTWARE_BUCKET = "int-production-use1-uat-software-bucket"
 
 
 def _environment(write_env):
-    return load_environment("test", root=write_env(NETWORK))
+    return load_environment("uat", root=write_env(NETWORK, name="uat"))
 
 
 def _stack(write_env, raw, *, roles=None, base_dir=None) -> StorageStack:

@@ -24,7 +24,7 @@ encryption and HTTPS with TLS 1.2 are always on. Access policies that allow
 Resource names (OpenSearch caps domain names at 28 characters, so the
 abbreviated account name is used, as in the Terraform module):
 
-    {account_name_abr}-{region_prefix}-{vpc_name}-{name}
+    {account_name_abr}-{region_prefix}-{environment}-{name}
     /aws/opensearch/{domain_name}/{index-slow|search-slow|es-application|audit}-logs
 """
 
@@ -823,7 +823,7 @@ class OpenSearchDomains(Construct):
             "region": stack.region,
             # Terraform policies spell the domain as
             # `[[name_abr]]-[[region_prefix]]-[[resource_name]]`; keep that working
-            # with this repo's `{vpc_name}-{name}` suffix.
+            # with this repo's `{environment}-{name}` suffix.
             "resource_name": domain_name.removeprefix(f"{account_abr}-{common.region_prefix}-"),
             "domain_name": domain_name,
             "domain_arn": (

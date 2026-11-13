@@ -29,7 +29,7 @@ class StorageStack(EnvironmentStack):
             self,
             "Storage",
             common=environment.common,
-            network_name=environment.network.name,
+            network_name=environment.name,
             props=props,
             roles=roles,
         )

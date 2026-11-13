@@ -30,7 +30,7 @@ OPENSEARCH = [{
 
 
 def _stack(write_env, raw, *, base_dir=None) -> tuple[SecretsStack, Template]:
-    environment = load_environment("test", root=write_env(NETWORK))
+    environment = load_environment("uat", root=write_env(NETWORK, name="uat"))
     app = cdk.App()
     stack = SecretsStack(
         app, "secrets", environment=environment,

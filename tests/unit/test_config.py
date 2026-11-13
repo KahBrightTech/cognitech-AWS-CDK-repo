@@ -1,7 +1,8 @@
 import pytest
+import yaml
 
 from cognitech_cdk.common.config import Common
-from cognitech_cdk.common.environment import list_environments, load_environment
+from cognitech_cdk.common.environment import list_environments, load_environment, resolve_environment
 from cognitech_cdk.constructs.network import NetworkProps
 
 
@@ -53,7 +54,6 @@ def test_common_carries_the_terraform_fields(write_env):
 
 # --- validation -----------------------------------------------------------
 
-
 def test_name_is_rejected_as_a_common_tag(tmp_path):
     env_dir = tmp_path / "bad"
     env_dir.mkdir()
@@ -88,7 +88,178 @@ def test_unknown_environment_lists_the_known_ones(write_env):
 
 
 def test_environments_are_discovered():
-    assert list_environments() == ["dev", "prod"]
+    assert list_environments() == ["md-preprod/dev", "prod"]
+
+
+@pytest.mark.parametrize("buckets", ["[]", "null"])
+def test_grouped_defaults_and_environment_overrides(write_env, buckets):
+    root = write_env(
+        "name: base\ncidr_block: 10.0.0.0/16\nazs: 2\n"
+        "public_subnet_cidrs: [10.0.0.0/24, 10.0.1.0/24]",
+        name="prod",
+    )
+    account = root / "example"
+    (account / "dev").mkdir(parents=True)
+    (account / "base.yaml").write_text(
+        (root / "prod/env.yaml").read_text() + "s3_buckets:\n- name: inherited\n",
+        encoding="utf-8",
+    )
+    (account / "dev/env.yaml").write_text(
+        'account_id: "999900001111"\nregion: us-west-2\n'
+        "common:\n  global: true\n  environment_abr: dev\n"
+        "  region_prefix: usw2\n  tags:\n    Environment: development\n"
+        "network:\n  name: dev\n  azs: 1\n  public_subnet_cidrs: [10.0.2.0/24]\n"
+        f"s3_buckets: {buckets}\n",
+        encoding="utf-8",
+    )
+    environment = load_environment("example/dev", root=root)
+    assert environment == load_environment("dev", root=root)
+    assert environment.name == "dev"
+    assert environment.account_id == "999900001111"
+    assert environment.region == "us-west-2"
+    assert environment.common.global_ is True
+    assert environment.common.account_name == "int-production"
+    assert environment.common.region_prefix == "usw2"
+    assert environment.common.environment_abr == "dev"
+    assert environment.common.tags["Environment"] == "development"
+    assert environment.common.tags["ManagedBy"] == "aws-cdk/repo"
+    assert environment.network.name == "dev"
+    assert environment.network.cidr_block == "10.0.0.0/16"
+    assert environment.network.public_subnet_cidrs == ("10.0.2.0/24",)
+    assert not environment.storage
+    assert load_environment("prod", root=root).region == "us-east-1"
+    assert list_environments(root) == ["example/dev", "prod"]
+
+
+def test_migrated_dev_preserves_legacy_selection_and_defaults():
+    environment = load_environment("md-preprod/dev")
+    assert environment == load_environment("dev")
+    assert environment.name == "dev"
+    assert environment.account_id == "533267408704"
+    assert environment.region == "us-east-1"
+    assert environment.common.account_name == "md-preproduction"
+    assert environment.common.account_name_abr == "mdpreprod"
+    assert environment.common.environment_abr == "dev"
+    assert environment.common.tags["Compliance"] == "FedRAMP"
+
+
+@pytest.mark.parametrize("field", ["account_id", "region", "network"])
+def test_required_defaults_cannot_be_cleared_by_null(write_env, field):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="example/dev")
+    path = root / "example/dev/env.yaml"
+    (root / "example/base.yaml").write_text(path.read_text(), encoding="utf-8")
+    path.write_text(f"{field}: null\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=f"missing required fields after merging: {field}"):
+        load_environment("example/dev", root=root)
+
+
+def test_account_principal_aliases_keep_policies_and_scopes_in_the_environment(write_env):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="example/dev")
+    path = root / "example/dev/env.yaml"
+    principals = {
+        "admin": "arn:aws:iam::111122223333:role/admin",
+        "unused": "arn:aws:iam::111122223333:role/unused",
+    }
+    (root / "example/base.yaml").write_text(
+        path.read_text() + yaml.safe_dump({"eks_access_principals": principals}), encoding="utf-8",
+    )
+    path.write_text(yaml.safe_dump({"eks": [
+        {"name": "main", "access_entries": {"admin": {
+            "principal_arns": ["admin"],
+            "policy_arn": "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy",
+            "namespaces": ["infogrid", "healthpath"], "kubernetes_groups": ["app-admins"],
+        }}},
+        {"name": "isolated"},
+    ]}), encoding="utf-8")
+    environment = load_environment("example/dev", root=root)
+    entries = environment.eks.clusters[0].access_entries
+    assert len(entries) == 1
+    assert entries[0].principal_arns == ("arn:aws:iam::111122223333:role/admin",)
+    assert entries[0].policy_arns == ("arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy",)
+    assert entries[0].namespaces == ("infogrid", "healthpath")
+    assert entries[0].kubernetes_groups == ("app-admins",)
+    assert environment.eks.clusters[1].access_entries == ()
+
+
+@pytest.mark.parametrize("references", [
+    ["viewer"], ["arn:aws:iam::111122223333:role/viewer"],
+    ["viewer", "arn:aws:iam::111122223333:user/auditor"],
+])
+def test_principal_aliases_preserve_literal_arns_and_mixed_lists(write_env, references):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="example/dev")
+    path = root / "example/dev/env.yaml"
+    principals = {"viewer": "arn:aws:iam::111122223333:role/viewer"}
+    (root / "example/base.yaml").write_text(
+        path.read_text() + yaml.safe_dump({"eks_access_principals": principals}), encoding="utf-8",
+    )
+    path.write_text(yaml.safe_dump({"eks": [{"name": "main", "access_entries": {"admin": {
+        "principal_arns": references,
+        "policy_arn": "AmazonEKSViewPolicy",
+        "namespaces": ["infogrid"],
+    }}}]}), encoding="utf-8")
+    entry = load_environment("example/dev", root=root).eks.clusters[0].access_entries[0]
+    assert entry.principal_arns == tuple(principals.get(reference, reference) for reference in references)
+    assert entry.policy_arns == ("AmazonEKSViewPolicy",)
+    assert entry.namespaces == ("infogrid",)
+
+
+@pytest.mark.parametrize("principals", [[], {"admin": []}, {"admin": None}, {"admin": "not-an-arn"}])
+def test_invalid_account_principal_aliases_are_rejected(write_env, principals):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="example/dev")
+    path = root / "example/base.yaml"
+    path.write_text(yaml.safe_dump({"eks_access_principals": principals}), encoding="utf-8")
+    with pytest.raises(ValueError, match="eks_access_principals"):
+        load_environment("example/dev", root=root)
+
+
+def test_principal_alias_can_be_overridden_and_unknown_references_fail(write_env):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="example/dev")
+    path = root / "example/dev/env.yaml"
+    (root / "example/base.yaml").write_text(
+        path.read_text() + yaml.safe_dump({"eks_access_principals": {
+            "admin": "arn:aws:iam::111122223333:role/admin",
+        }}), encoding="utf-8",
+    )
+    configuration = {
+        "eks_access_principals": {"admin": "arn:aws:iam::111122223333:role/environment-admin"},
+        "eks": [{"name": "main", "access_entries": {"admin": {
+            "principal_arns": ["admin"], "policy_arn": "AmazonEKSAdminPolicy",
+        }}}],
+    }
+    path.write_text(yaml.safe_dump(configuration), encoding="utf-8")
+    entry = load_environment("example/dev", root=root).eks.clusters[0].access_entries[0]
+    assert entry.principal_arns == ("arn:aws:iam::111122223333:role/environment-admin",)
+    configuration["eks"][0]["access_entries"]["admin"]["principal_arns"] = ["missing"]
+    path.write_text(yaml.safe_dump(configuration), encoding="utf-8")
+    with pytest.raises(ValueError, match="eks_access_principals reference"):
+        load_environment("example/dev", root=root)
+
+
+@pytest.mark.parametrize("other_name", ["dev", "other/dev"])
+def test_ambiguous_short_names_require_qualified_selection(write_env, other_name):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="example/dev")
+    write_env("name: n\ncidr_block: 10.0.0.0/16", name=other_name)
+    with pytest.raises(ValueError, match="Ambiguous environment 'dev'"):
+        load_environment("dev", root=root)
+    assert resolve_environment("example/dev", root=root) == "example/dev"
+    assert load_environment("example/dev", root=root).name == "dev"
+
+
+@pytest.mark.parametrize("selector", ["../prod", "/prod", "example/../prod"])
+def test_environment_selectors_cannot_traverse_directories(write_env, selector):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="prod")
+    with pytest.raises(ValueError, match="Environment"):
+        load_environment(selector, root=root)
+
+
+@pytest.mark.parametrize("filename", ["base.yaml", "dev/env.yaml"])
+@pytest.mark.parametrize("content", ["[]", "common: [", "1: value"])
+def test_invalid_grouped_yaml_reports_its_file(write_env, filename, content):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="example/dev")
+    path = root / "example" / filename
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(ValueError, match=filename):
+        load_environment("example/dev", root=root)
 
 
 # --- network props --------------------------------------------------------

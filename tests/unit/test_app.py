@@ -67,10 +67,10 @@ STACKS = (
 def _expected_stacks(env_name: str) -> set[str]:
     """Build the stack names from the config, so edits to env.yaml do not break these."""
     environment = load_environment(env_name)
-    names = {environment.common.name(environment.network.name, "network")}
+    names = {environment.common.name(environment.name, "network")}
     for attribute, suffix in STACKS:
         if getattr(environment, attribute):
-            names.add(environment.common.name(environment.network.name, suffix))
+            names.add(environment.common.name(environment.name, suffix))
     return names
 
 
@@ -85,7 +85,7 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
     result = _run(tmp_path, context="dev")
     assert result.returncode == 0, result.stderr
     environment = load_environment("dev")
-    stack_name = environment.common.name(environment.network.name, "eks")
+    stack_name = environment.common.name(environment.name, "eks")
     resources = json.loads((tmp_path / f"{stack_name}.template.json").read_text())["Resources"]
     clusters = [resource for resource in resources.values() if resource["Type"] == "AWS::EKS::Cluster"]
     assert len(clusters) == 1
@@ -143,6 +143,7 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
     ]
     assert {chart["Chart"] for chart in charts} == {
         "aws-load-balancer-controller", "secrets-store-csi-driver-provider-aws",
+        "karpenter", "argo-cd", "nginx-ingress", "cost-analyzer", "awx-operator",
     }
     subnets = [
         resource["Properties"] for resource in all_resources
@@ -159,7 +160,7 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
     assert storage["metadata"]["name"] == "gp3"
     assert storage["metadata"]["annotations"]["storageclass.kubernetes.io/is-default-class"] == "true"
     assert storage["parameters"]["encrypted"] == "true"
-    assert not any(obj["kind"] in {"NodePool", "EC2NodeClass"} for obj in manifests)
+    assert {obj["kind"] for obj in manifests} >= {"NodePool", "EC2NodeClass"}
     account = next(
         obj for obj in manifests
         if obj["kind"] == "ServiceAccount" and obj["metadata"]["name"] == "healthpath-secrets"
@@ -331,6 +332,16 @@ def test_env_variable_selects_the_environment(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert _stacks(tmp_path) == _expected_stacks("prod")
+    assert _stacks(tmp_path) == {"int-production-use1-prod-network"}
+    template = json.loads((tmp_path / "int-production-use1-prod-network.template.json").read_text())
+    names = {
+        tag["Value"]
+        for resource in template["Resources"].values()
+        for tag in resource["Properties"].get("Tags", [])
+        if tag["Key"] == "Name"
+    }
+    assert names
+    assert all(name.startswith("int-production-use1-prod-") for name in names)
 
 
 def test_context_overrides_the_variable(tmp_path):
@@ -341,11 +352,23 @@ def test_context_overrides_the_variable(tmp_path):
     assert _stacks(tmp_path) == _expected_stacks("dev")
 
 
+def test_qualified_environment_selects_the_same_dev_stacks(tmp_path):
+    qualified = tmp_path / "qualified"
+    legacy = tmp_path / "legacy"
+    result = _run(qualified, env_var="md-preprod/dev")
+    assert result.returncode == 0, result.stderr
+    result = _run(legacy, env_var="dev")
+    assert result.returncode == 0, result.stderr
+    assert _stacks(qualified) == _stacks(legacy) == _expected_stacks("dev")
+    for path in qualified.glob("*.template.json"):
+        assert json.loads(path.read_text()) == json.loads((legacy / path.name).read_text())
+
+
 @pytest.mark.parametrize("kwargs", [{"env_var": "staging"}, {"context": "staging"}])
 def test_unknown_environment_fails_with_a_helpful_message(tmp_path, kwargs):
     result = _run(tmp_path, **kwargs)
 
     assert result.returncode != 0
     assert "Unknown environment 'staging'" in result.stderr
-    assert "dev, prod" in result.stderr
+    assert "md-preprod/dev, prod" in result.stderr
     assert "ENV" in result.stderr

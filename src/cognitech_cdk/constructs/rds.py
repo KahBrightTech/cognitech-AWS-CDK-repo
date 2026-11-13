@@ -23,11 +23,11 @@ the secret to the instance, so the secret holds `username`, `password`,
 
 Resource names:
 
-    {account_name}-{region_prefix}-{vpc_name}-{name}
-    {account_name}-{region_prefix}-{vpc_name}-{name}-replica
-    {account_name}-{region_prefix}-{vpc_name}-{name}-subnet-group
-    {account_name}-{region_prefix}-{vpc_name}-{name}-parameter-group
-    {account_name}-{region_prefix}-{vpc_name}-{name}/rds-credentials
+    {account_name}-{region_prefix}-{environment}-{name}
+    {account_name}-{region_prefix}-{environment}-{name}-replica
+    {account_name}-{region_prefix}-{environment}-{name}-subnet-group
+    {account_name}-{region_prefix}-{environment}-{name}-parameter-group
+    {account_name}-{region_prefix}-{environment}-{name}/rds-credentials
 """
 
 from __future__ import annotations

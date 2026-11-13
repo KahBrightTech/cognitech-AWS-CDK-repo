@@ -132,10 +132,10 @@ def _repo_root():
 
 
 def test_dev_system_and_optional_application_scheduling(write_env):
-    text = (_repo_root() / "deployments/dev/env.yaml").read_text()
+    text = (_repo_root() / "deployments/md-preprod/dev/env.yaml").read_text()
     active = yaml.safe_load(text)
     assert active["eks"][0]["compute"]["node_groups"][0]["desired_size"] == 2
-    assert "karpenter" not in active["eks"][0]["compute"]
+    assert active["eks"][0]["compute"]["karpenter"]["node_role"] == "eks-nodes"
     compute_text = text.split("    compute:\n", 1)[1].split("\neks_addons:\n", 1)[0]
     compute = yaml.safe_load(
         "compute:\n" + "\n".join(
@@ -220,6 +220,32 @@ def test_dev_system_and_optional_application_scheduling(write_env):
     assert_system(awx["operator-controller"]["spec"]["template"]["spec"])
     for key in ("node_selector", "postgres_selector"):
         assert yaml.safe_load(awx["AWX"]["spec"][key]) == {"karpenter.sh/nodepool": "default"}
+
+
+def test_dev_enabled_applications_and_compute(write_env):
+    active = yaml.safe_load((_repo_root() / "deployments/md-preprod/dev/env.yaml").read_text())
+    eks = yaml.safe_load(EKS)
+    del eks[0]["node_groups"]
+    eks[0]["compute"] = active["eks"][0]["compute"]
+    stack, template = _stacks(write_env, yaml.safe_dump(active["eks_addons"]), yaml.safe_dump(eks))
+    charts = _charts(template)
+    assert set(charts) == {
+        "karpenter", "aws-load-balancer-controller", "secrets-store-csi-driver-provider-aws",
+        "argocd", "nginx-ingress-public", "kubecost", "awx-operator",
+    }
+    argocd = json.loads(_values(charts["argocd"]))
+    assert argocd["global"]["domain"] == "argocd.dev.titancoretech.net"
+    assert argocd["server"]["ingress"]["annotations"]["alb.ingress.kubernetes.io/group.name"] == "dev-shared"
+    awx = json.loads(_values(charts["awx-operator"]))["AWX"]
+    assert awx["enabled"] is True
+    assert awx["spec"]["ingress_type"] == "ingress"
+    assert awx["spec"]["hostname"] == "awx.dev.titancoretech.net"
+    assert yaml.safe_load(awx["spec"]["node_selector"]) == {"karpenter.sh/nodepool": "default"}
+    assert "ingress" not in _values(charts["kubecost"])
+    manifests = json.dumps(template.find_resources("Custom::AWSCDK-EKS-KubernetesResource"))
+    assert "NodePool" in manifests
+    assert "SecretProviderClass" not in manifests
+    assert _nested_order(stack)["Apps"] >= {"Karpenter", "Addons"}
 
 
 def test_every_requested_native_addon_is_separate(write_env):

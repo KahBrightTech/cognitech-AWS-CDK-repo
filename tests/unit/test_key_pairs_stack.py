@@ -21,7 +21,7 @@ private_subnets: false
 
 
 def _stack(write_env, raw, *, base_dir=None) -> tuple[KeyPairsStack, Template]:
-    environment = load_environment("test", root=write_env(NETWORK))
+    environment = load_environment("uat", root=write_env(NETWORK, name="uat"))
     app = cdk.App()
     stack = KeyPairsStack(
         app, "keys", environment=environment,
