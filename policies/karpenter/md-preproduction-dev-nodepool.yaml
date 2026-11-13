@@ -1,14 +1,14 @@
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
-  name: "[[node_pool_name]]"
+  name: "[[account_name]]-[[environment]]-nodepool"
 spec:
   template:
     spec:
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
-        name: "[[node_class_name]]"
+        name: "[[account_name]]-[[environment]]-nodeclass"
       requirements:
       - key: karpenter.k8s.aws/instance-category
         operator: In

@@ -162,6 +162,12 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
     assert storage["parameters"]["encrypted"] == "true"
     assert {obj["kind"] for obj in manifests} >= {"NodePool", "EC2NodeClass"}
     node_class = next(obj for obj in manifests if obj["kind"] == "EC2NodeClass")
+    node_pool = next(obj for obj in manifests if obj["kind"] == "NodePool")
+    expected_nodeclass_name = "md-preproduction-dev-nodeclass"
+    expected_nodepool_name = "md-preproduction-dev-nodepool"
+    assert node_class["metadata"]["name"] == expected_nodeclass_name
+    assert node_pool["metadata"]["name"] == expected_nodepool_name
+    assert node_pool["spec"]["template"]["spec"]["nodeClassRef"]["name"] == expected_nodeclass_name
     assert node_class["spec"]["subnetSelectorTerms"] == [
         {"tags": {"Name": "md-preproduction-use1-dev-public-*"}},
     ]

@@ -890,11 +890,9 @@ YAML files, referenced under `eks[].compute.karpenter`:
 node_role: eks-nodes
 subnet_tier: public
 security_groups: [eks-nodes]
-node_class_manifest: policies/karpenter/nodeclass.yaml
-node_pool_manifest: policies/karpenter/nodepool.yaml
+node_class_manifest: policies/karpenter/md-preproduction-dev-nodeclass.yaml
+node_pool_manifest: policies/karpenter/md-preproduction-dev-nodepool.yaml
 variables:
-  node_class_name: default
-  node_pool_name: default
   instance_categories: [t, m, c]
   capacity_types: [on-demand]
   architectures: [amd64]
@@ -903,8 +901,12 @@ variables:
 
 Paths remain repository-root relative. Both files must be provided together;
 each contains one document: an `EC2NodeClass` (`karpenter.k8s.aws/v1`) or
-`NodePool` (`karpenter.sh/v1`). The NodePool's `spec.template.spec.nodeClassRef`
-must reference the NodeClass's name, group and kind. They stay in the existing
+`NodePool` (`karpenter.sh/v1`). The manifest filenames and resources both use
+the `{account_name}-{environment}` naming prefix. The checked-in templates name the resources
+`[[account_name]]-[[environment]]-nodeclass` and
+`[[account_name]]-[[environment]]-nodepool` (for dev,
+`md-preproduction-dev-nodeclass` and `md-preproduction-dev-nodepool`). The
+NodePool references the matching NodeClass name. They stay in the existing
 Karpenter nested stack and are applied after its Helm chart installs the CRDs.
 
 Templates use the shared `[[variable]]` syntax. Quote whole-value placeholders:

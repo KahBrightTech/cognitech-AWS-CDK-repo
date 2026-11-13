@@ -475,10 +475,9 @@ def _native_karpenter():
     folder = "policies/karpenter"
     return {
         "node_role": "eks-nodes", "replicas": 1, "security_groups": ["alb"],
-        "node_class_manifest": f"{folder}/nodeclass.yaml",
-        "node_pool_manifest": f"{folder}/nodepool.yaml",
+        "node_class_manifest": f"{folder}/md-preproduction-dev-nodeclass.yaml",
+        "node_pool_manifest": f"{folder}/md-preproduction-dev-nodepool.yaml",
         "variables": {
-            "node_class_name": "default", "node_pool_name": "default",
             "instance_categories": ["t", "m"], "capacity_types": ["on-demand"],
             "architectures": ["amd64"], "cpu_limit": "8",
         },
@@ -503,9 +502,14 @@ def test_native_karpenter_files_change_only_subnet_selection_and_preserve_order(
     addons[0]["karpenter"] = _native_karpenter()
     native_stack, native = _stacks(write_env, yaml.safe_dump(addons))
     expected = _karpenter_objects(legacy)
+    expected[0]["metadata"]["name"] = "int-production-test-nodeclass"
     expected[0]["spec"]["subnetSelectorTerms"] = [
         {"tags": {"Name": "int-production-use1-test-public-*"}},
     ]
+    expected[1]["metadata"]["name"] = "int-production-test-nodepool"
+    expected[1]["spec"]["template"]["spec"]["nodeClassRef"]["name"] = (
+        "int-production-test-nodeclass"
+    )
     assert _karpenter_objects(native) == expected
     assert _nested_order(native_stack) == _nested_order(legacy_stack)
 
@@ -533,7 +537,6 @@ def test_native_selectors_variables_profile_and_extra_options(write_env):
         "subnet_tier": "private", "security_groups": ["not-a-local-group"],
     })
     config["variables"].update({
-        "node_class_name": "apps", "node_pool_name": "apps",
         "profile_name": "existing-node-profile",
         "subnet_terms": [{"tags": {"karpenter.sh/discovery": "[[cluster_name]]"}}, {"id": "subnet-12345678"}],
         "group_terms": [{"name": "apps-*"}, {"tags": {"Environment": "[[environment]]"}}],
@@ -542,7 +545,8 @@ def test_native_selectors_variables_profile_and_extra_options(write_env):
     addons[0]["karpenter"] = config
     _, template = _stacks(write_env, yaml.safe_dump(addons))
     node_class, node_pool = _karpenter_objects(template)
-    assert node_class["metadata"]["name"] == node_pool["metadata"]["name"] == "apps"
+    assert node_class["metadata"]["name"] == "int-production-test-nodeclass"
+    assert node_pool["metadata"]["name"] == "int-production-test-nodepool"
     assert node_class["spec"]["instanceProfile"] == "existing-node-profile"
     assert "role" not in node_class["spec"]
     assert node_class["spec"]["subnetSelectorTerms"] == [
@@ -552,7 +556,7 @@ def test_native_selectors_variables_profile_and_extra_options(write_env):
         {"name": "apps-*"}, {"tags": {"Environment": "test"}},
     ]
     assert node_class["spec"]["blockDeviceMappings"] == spec["blockDeviceMappings"]
-    assert node_pool["spec"]["template"]["spec"]["nodeClassRef"]["name"] == "apps"
+    assert node_pool["spec"]["template"]["spec"]["nodeClassRef"]["name"] == "int-production-test-nodeclass"
     assert node_pool["spec"]["weight"] == 20
     assert node_pool["spec"]["limits"] == {"cpu": "8", "memory": "32Gi"}
     assert node_pool["spec"]["template"]["spec"]["taints"][0]["effect"] == "NoSchedule"

@@ -1,7 +1,7 @@
 apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata:
-  name: "[[node_class_name]]"
+  name: "[[account_name]]-[[environment]]-nodeclass"
 spec:
   role: "[[node_role_name]]"
   amiSelectorTerms:
