@@ -134,6 +134,24 @@ def test_private_key_is_copied_inside_aws_with_account_only_access(write_env):
             assert statement["Principal"] != "*" and statement["Principal"].get("AWS") != "*"
 
 
+def test_key_can_be_deleted_while_its_secret_is_retained(write_env):
+    _, template = _stack(write_env, [{
+        "name": "bastion", "removal_policy": "destroy",
+        "create_secret": True, "secret_removal_policy": "retain",
+    }])
+    template.has_resource("AWS::EC2::KeyPair", {
+        "DeletionPolicy": "Delete", "UpdateReplacePolicy": "Delete",
+    })
+    template.has_resource("AWS::SecretsManager::Secret", {
+        "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain",
+    })
+
+
+def test_secret_removal_override_requires_a_secret():
+    with pytest.raises(ValueError, match="secret_removal_policy require create_secret"):
+        KeyPairsProps.from_dict([{"name": "bastion", "secret_removal_policy": "retain"}])
+
+
 def test_copy_function_never_returns_or_logs_the_key(write_env):
     _, template = _stack(write_env, [{"name": "a", "create_secret": True}, {"name": "b", "create_secret": True}])
     functions = template.find_resources("AWS::Lambda::Function")

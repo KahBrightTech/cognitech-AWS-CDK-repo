@@ -827,6 +827,39 @@ Review the diff before deploying permission changes.
 See AWS's [cluster IAM role](https://docs.aws.amazon.com/eks/latest/userguide/cluster-iam-role.html)
 and [node IAM role](https://docs.aws.amazon.com/eks/latest/userguide/create-node-role.html) guidance.
 
+### Creating and deleting key pairs
+
+Manage key pairs directly in the deployment file; no separate files are needed.
+Dev uses the following removal settings:
+
+```yaml
+key_pairs:
+- name: md-preproduction-dev-key-pair
+  removal_policy: destroy
+  create_secret: true
+  secret_removal_policy: destroy
+  secret_name: md-preproduction-dev-key-pair
+```
+
+Add an entry and deploy to create a key. Deploy the removal-policy settings
+before attempting deletion of an existing key. Remove launch-template references
+and deploy the consuming stacks first, then remove the key entry and deploy the
+key-pairs stack. If removing the **last** key, explicitly destroy the key-pairs
+stack while its configuration still exists; the app omits empty stacks and
+`deploy --all` does not delete an omitted stack.
+
+`removal_policy: destroy` allows CloudFormation to delete the key; dev also uses
+`secret_removal_policy: destroy` to delete its private-key secret. Use `retain`
+instead if manual secret cleanup is preferred. Without the
+override, the secret follows `removal_policy`, preserving existing behavior.
+Both default to retention when no settings are supplied.
+
+Before recreating the same entry, delete the retained secret or choose an unused
+`secret_name`. Secrets pending deletion can reserve their names during the
+recovery window. Existing instances keep the original SSH public key; creating
+a new key does not update them. Manual deletion in AWS creates CloudFormation
+drift and unchanged YAML does not automatically recreate the deleted resource.
+
 ### EKS compute configuration
 
 Group worker capacity under `eks[].compute`. This is a YAML configuration block,

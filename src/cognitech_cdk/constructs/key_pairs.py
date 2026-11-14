@@ -82,12 +82,13 @@ class KeyPairProps:
     key_type: str = "rsa"
     format: str = "pem"
     removal_policy: cdk.RemovalPolicy = cdk.RemovalPolicy.RETAIN
+    secret_removal_policy: cdk.RemovalPolicy | None = None
 
     @classmethod
     def from_dict(cls, raw: Any, *, base_dir: Path | None = None) -> "KeyPairProps":
         raw = schema.mapping(raw, "key_pairs item", {
             "name", "name_prefix", "secret_name", "secret_description", "policy",
-            "create_secret", "key_type", "format", "removal_policy",
+            "create_secret", "key_type", "format", "removal_policy", "secret_removal_policy",
         }, required=("name",))
         name = schema.name(raw["name"], "key_pairs item name")
         label = f"key_pairs '{name}'"
@@ -95,7 +96,10 @@ class KeyPairProps:
             raise ValueError(f"{label}: name_prefix is not supported (Terraform ignores it); use name.")
         create_secret = schema.boolean(raw.get("create_secret"), f"{label}.create_secret")
         if not create_secret:
-            extra = [key for key in ("secret_name", "secret_description", "policy") if key in raw]
+            extra = [
+                key for key in ("secret_name", "secret_description", "policy", "secret_removal_policy")
+                if key in raw
+            ]
             if extra:
                 raise ValueError(f"{label}: {', '.join(extra)} require create_secret: true.")
         key_type = raw.get("key_type", "rsa")
@@ -114,6 +118,10 @@ class KeyPairProps:
             key_type=key_type,
             format=key_format,
             removal_policy=removal_policy(raw.get("removal_policy"), f"{label}.removal_policy"),
+            secret_removal_policy=(
+                removal_policy(raw["secret_removal_policy"], f"{label}.secret_removal_policy")
+                if "secret_removal_policy" in raw else None
+            ),
         )
 
 
@@ -169,7 +177,10 @@ class KeyPairs(Construct):
                 f"{item.name}Secret",
                 secret_name=secret_name,
                 description=item.secret_description or f"Private key for EC2 key pair {full_name}",
-                removal_policy=item.removal_policy,
+                removal_policy=(
+                    item.secret_removal_policy
+                    if item.secret_removal_policy is not None else item.removal_policy
+                ),
             )
             apply_resource_policy(secret, item.policy)
             cdk.Tags.of(secret).add("Name", secret_name)

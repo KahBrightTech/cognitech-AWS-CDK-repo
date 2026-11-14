@@ -81,7 +81,7 @@ TYPED = """
 """
 
 
-def _stacks(write_env, addons=ADDONS, eks=EKS):
+def _stacks(write_env, addons=ADDONS, eks=EKS, *, key_pair_name="key-pair"):
     environment = load_environment("test", root=write_env(NETWORK))
     env = cdk.Environment(account=environment.account_id, region=environment.region)
     app = cdk.App()
@@ -99,7 +99,7 @@ def _stacks(write_env, addons=ADDONS, eks=EKS):
         app, "test-eks", environment=environment, env=env,
         props=EksProps.from_dict(yaml.safe_load(eks), base_dir=_repo_root()), network=network.network,
         security_groups=groups, roles=roles,
-        key_pairs={"key-pair": ec2.KeyPair.from_key_pair_name(deps, "KeyPair", "test-key-pair")},
+        key_pairs={key_pair_name: ec2.KeyPair.from_key_pair_name(deps, "KeyPair", "test-key-pair")},
         addons=EksAddonsProps.from_dict(yaml.safe_load(addons), base_dir=_repo_root()),
         certificates={"dev": certificate},
     )
@@ -154,7 +154,10 @@ def test_dev_system_and_optional_application_scheduling(write_env):
     eks = yaml.safe_load(EKS)
     del eks[0]["node_groups"]
     eks[0]["compute"] = compute
-    stack, template = _stacks(write_env, yaml.safe_dump(addons), yaml.safe_dump(eks))
+    stack, template = _stacks(
+        write_env, yaml.safe_dump(addons), yaml.safe_dump(eks),
+        key_pair_name=active["key_pairs"][0]["name"],
+    )
     system_selector = {"workload-type": "system"}
     system_toleration = {
         "key": "workload-type", "operator": "Equal", "value": "system", "effect": "NoSchedule",
@@ -227,7 +230,10 @@ def test_dev_enabled_applications_and_compute(write_env):
     eks = yaml.safe_load(EKS)
     del eks[0]["node_groups"]
     eks[0]["compute"] = active["eks"][0]["compute"]
-    stack, template = _stacks(write_env, yaml.safe_dump(active["eks_addons"]), yaml.safe_dump(eks))
+    stack, template = _stacks(
+        write_env, yaml.safe_dump(active["eks_addons"]), yaml.safe_dump(eks),
+        key_pair_name=active["key_pairs"][0]["name"],
+    )
     charts = _charts(template)
     assert set(charts) == {
         "karpenter", "aws-load-balancer-controller", "secrets-store-csi-driver-provider-aws",
