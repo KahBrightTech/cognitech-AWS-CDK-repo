@@ -138,6 +138,7 @@ def test_dev_system_and_optional_application_scheduling(write_env):
     assert active["eks"][0]["compute"]["karpenter"]["node_role"] == "eks-nodes"
     compute_text = text.split("    compute:\n", 1)[1].split("\neks_addons:\n", 1)[0]
     compute = yaml.safe_load(
+        f"key_pair_name: &eks_node_key_pair {active['key_pairs'][0]['name']}\n"
         "compute:\n" + "\n".join(
             line.removeprefix("    # ") if line.startswith("    # ") else line.removeprefix("    ")
             for line in compute_text.splitlines()
@@ -483,10 +484,7 @@ def _native_karpenter():
         "node_role": "eks-nodes", "replicas": 1, "security_groups": ["alb"],
         "node_class_manifest": f"{folder}/md-preproduction-dev-nodeclass.yaml",
         "node_pool_manifest": f"{folder}/md-preproduction-dev-nodepool.yaml",
-        "variables": {
-            "instance_categories": ["t", "m"], "capacity_types": ["on-demand"],
-            "architectures": ["amd64"], "cpu_limit": "8",
-        },
+        "variables": {},
     }
 
 
@@ -520,6 +518,7 @@ def test_native_karpenter_files_apply_named_selectors_and_preserve_order(write_e
     expected[1]["spec"]["template"]["spec"]["nodeClassRef"]["name"] = (
         "int-production-test-nodeclass"
     )
+    expected[1]["spec"]["template"]["spec"]["requirements"][0]["values"] = ["t", "m", "c"]
     assert _karpenter_objects(native) == expected
     assert _nested_order(native_stack) == _nested_order(legacy_stack)
 

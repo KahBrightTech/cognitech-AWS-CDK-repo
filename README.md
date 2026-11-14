@@ -834,12 +834,19 @@ Dev uses the following removal settings:
 
 ```yaml
 key_pairs:
-- name: md-preproduction-dev-key-pair
+- name: &eks_node_key_pair keys
   removal_policy: destroy
   create_secret: true
   secret_removal_policy: destroy
-  secret_name: md-preproduction-dev-key-pair
+  secret_name: keys
 ```
+
+Dev's launch template uses `key_pair: *eks_node_key_pair`. This YAML alias
+reuses the value marked by `&eks_node_key_pair`, so renaming `keys` updates
+the launch-template reference automatically. Keep the anchor label unchanged;
+only edit its value. Anchors are local to one YAML file and cannot reference
+values in an account base file. The secret name is independently configured.
+Other key references must likewise use the alias or be updated explicitly.
 
 Add an entry and deploy to create a key. Deploy the removal-policy settings
 before attempting deletion of an existing key. Remove launch-template references
@@ -925,12 +932,12 @@ subnet_tier: public
 security_groups: [eks-nodes]
 node_class_manifest: policies/karpenter/md-preproduction-dev-nodeclass.yaml
 node_pool_manifest: policies/karpenter/md-preproduction-dev-nodepool.yaml
-variables:
-  instance_categories: [t, m, c]
-  capacity_types: [on-demand]
-  architectures: [amd64]
-  cpu_limit: "8"
 ```
+
+Instance categories (`t`, `m`, `c`), on-demand capacity, `amd64` architecture
+and the aggregate CPU limit (`"8"`) are configured directly in the NodePool YAML,
+under `spec.template.spec.requirements` and `spec.limits`. Custom `variables`
+remain optional for templates that need additional substitutions.
 
 Paths remain repository-root relative. Both files must be provided together;
 each contains one document: an `EC2NodeClass` (`karpenter.k8s.aws/v1`) or
