@@ -859,18 +859,21 @@ Dev uses the following removal settings:
 
 ```yaml
 key_pairs:
-- name: &eks_node_key_pair keys
+- name: &eks_node_key_pair eks
   removal_policy: destroy
   create_secret: true
   secret_removal_policy: destroy
-  secret_name: keys
+  secret_name: *eks_node_key_pair
 ```
 
 Dev's launch template uses `key_pair: *eks_node_key_pair`. This YAML alias
-reuses the value marked by `&eks_node_key_pair`, so renaming `keys` updates
-the launch-template reference automatically. Keep the anchor label unchanged;
+reuses the value marked by `&eks_node_key_pair`, so renaming `eks` updates
+the secret name and launch-template reference automatically. Keep the anchor label unchanged;
 only edit its value. Anchors are local to one YAML file and cannot reference
-values in an account base file. The secret name is independently configured.
+values in an account base file. The secret name can instead be independently configured,
+but a key rename must use an unused secret name: its CloudFormation identity also
+changes, and CloudFormation creates the replacement before deleting the old secret.
+The `destroy` policy does not pre-delete resources to free their names.
 Other key references must likewise use the alias or be updated explicitly.
 
 Add an entry and deploy to create a key. Deploy the removal-policy settings
@@ -1683,7 +1686,7 @@ kubectl get daemonsets -n kube-system
 kubectl get secretproviderclasses -A
 kubectl get serviceaccount healthpath-secrets -n healthpath -o yaml
 aws eks list-pod-identity-associations \
-  --cluster-name md-preproduction-use1-dev-main-eks-cluster \
+  --cluster-name md-preproduction-use1-dev-main-cluster \
   --profile admin-mdpp --region us-east-1
 ```
 

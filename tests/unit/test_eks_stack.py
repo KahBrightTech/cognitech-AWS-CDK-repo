@@ -58,7 +58,7 @@ def _stack(write_env, text=EKS, *, principal_aliases=None):
 def test_cluster_uses_configured_role_subnets_and_version(write_env):
     template = Template.from_stack(_stack(write_env))
     template.has_resource_properties("AWS::EKS::Cluster", Match.object_like({
-        "Name": "int-production-use1-test-main-eks-cluster",
+        "Name": "int-production-use1-test-main-cluster",
         "Version": "1.36",
         "RoleArn": {"Fn::ImportValue": Match.any_value()},
         "ResourcesVpcConfig": Match.object_like({

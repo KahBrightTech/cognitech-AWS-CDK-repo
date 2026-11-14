@@ -113,7 +113,7 @@ class EksStack(EnvironmentStack):
                 self,
                 construct_id(name),
                 props=cluster_props,
-                cluster_name=self.resource_name(name, "eks-cluster"),
+                cluster_name=self.resource_name(name, "cluster"),
                 names=self.resource_name,
                 network=network,
                 security_groups=security_groups,
