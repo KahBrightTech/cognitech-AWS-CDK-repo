@@ -502,7 +502,7 @@ def _karpenter_objects(template):
     return json.loads(value)
 
 
-def test_native_karpenter_files_change_only_subnet_selection_and_preserve_order(write_env):
+def test_native_karpenter_files_apply_named_selectors_and_preserve_order(write_env):
     legacy_stack, legacy = _stacks(write_env, TYPED)
     addons = yaml.safe_load(TYPED)
     addons[0]["karpenter"] = _native_karpenter()
@@ -511,6 +511,10 @@ def test_native_karpenter_files_change_only_subnet_selection_and_preserve_order(
     expected[0]["metadata"]["name"] = "int-production-test-nodeclass"
     expected[0]["spec"]["subnetSelectorTerms"] = [
         {"tags": {"Name": "int-production-use1-test-public-*"}},
+    ]
+    expected[0]["spec"]["securityGroupSelectorTerms"] = [
+        {"id": "<token>"},
+        {"name": "int-production-use1-test-eks-nodes-sg"},
     ]
     expected[1]["metadata"]["name"] = "int-production-test-nodepool"
     expected[1]["spec"]["template"]["spec"]["nodeClassRef"]["name"] = (
@@ -611,7 +615,8 @@ def test_invalid_rendered_nodeclass_and_nodepool_are_rejected(change, message):
     with pytest.raises(ValueError, match=message):
         props.render_manifests({
             "account_name": "int-production", "region_prefix": "use1", "environment": "test",
-            "node_role_name": "existing-role",
+            "cluster_security_group_id": "sg-12345678",
+            "node_role_name": "int-production-use1-test-eks-nodes-role",
             "subnet_selector_terms": [{"id": "subnet-12345678"}],
             "security_group_selector_terms": [{"id": "sg-12345678"}],
             "tags": {"Environment": "test"},

@@ -993,12 +993,23 @@ This matches primary, secondary, tertiary and any future subnets with the same
 public-subnet Name pattern. Account name, region prefix and environment resolve
 from the selected deployment, so copying the template does not retain dev's
 subnet names. Matching Name tags must still exist in the destination deployment.
-Security groups still use generated ID selectors.
+Security groups retain the cluster SG by ID and select the worker SG by name:
+
+```yaml
+securityGroupSelectorTerms:
+- id: "[[cluster_security_group_id]]"
+- name: "[[account_name]]-[[region_prefix]]-[[environment]]-eks-nodes-sg"
+```
+
+For dev, the worker selector resolves to `md-preproduction-use1-dev-eks-nodes-sg`.
 To select generated subnet IDs instead, replace that YAML field with
 `subnetSelectorTerms: "[[subnet_selector_terms]]"`.
 
 IAM has no selector terms: set exactly one of `spec.role` or
-`spec.instanceProfile`. Dev uses `role: "[[node_role_name]]"`. To use an existing
+`spec.instanceProfile`. Dev uses `role: "[[node_role_name]]"`, which resolves
+the actual role selected by `node_role: eks-nodes`
+(`md-preproduction-use1-dev-eks-nodes-role`), preserving cross-stack references.
+To use an existing
 profile, replace `role` with `instanceProfile: "[[profile_name]]"` and add
 `profile_name` to `variables`. Keep `node_role` pointing to that profile's role
 for controller IAM permissions and EKS node access; the profile must already

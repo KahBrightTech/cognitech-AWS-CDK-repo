@@ -9,7 +9,9 @@ spec:
   subnetSelectorTerms:
   - tags:
       Name: "[[account_name]]-[[region_prefix]]-[[environment]]-public-*"
-  securityGroupSelectorTerms: "[[security_group_selector_terms]]"
+  securityGroupSelectorTerms:
+  - id: "[[cluster_security_group_id]]"
+  - name: "[[account_name]]-[[region_prefix]]-[[environment]]-eks-nodes-sg"
   metadataOptions:
     httpTokens: required
     httpPutResponseHopLimit: 2

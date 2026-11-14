@@ -171,6 +171,10 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
     assert node_class["spec"]["subnetSelectorTerms"] == [
         {"tags": {"Name": "md-preproduction-use1-dev-public-*"}},
     ]
+    group_terms = node_class["spec"]["securityGroupSelectorTerms"]
+    assert len(group_terms) == 2
+    assert set(group_terms[0]) == {"id"}
+    assert group_terms[1] == {"name": "md-preproduction-use1-dev-eks-nodes-sg"}
     account = next(
         obj for obj in manifests
         if obj["kind"] == "ServiceAccount" and obj["metadata"]["name"] == "healthpath-secrets"
