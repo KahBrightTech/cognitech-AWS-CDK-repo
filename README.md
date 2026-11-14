@@ -251,9 +251,34 @@ The account folder itself is not included in resource names. Generated AWS
 names use `common.account_name`, `common.region_prefix` and the actual environment
 folder name (`dev`, `qa`, `prod`), not `network.name` or `environment_abr`. Relative
 references to policies, manifests and application code remain **repository
-root relative**, not base-file or environment-file relative. Overrides do
-not interpolate variables into literal ARNs or names; update those literals
-when changing their account or region.
+root relative**, not base-file or environment-file relative.
+
+Descriptions and resource naming fields can explicitly use deployment placeholders:
+
+```yaml
+secret_description: "Private key for the [[account_name]] [[environment]] VPC"
+```
+
+Supported values are `account_id`, `account_name`, `account_name_abr` (falls back
+to `account_name`), `region`, `region_prefix` and `environment`. They resolve
+after merging account defaults and environment overrides; `environment` is the
+selected folder name. Existing literal values are unchanged.
+
+These built-ins are replaced throughout deployment YAML string values, including
+ARNs, domains, file paths and embedded values. Other placeholders remain for
+dedicated policy/chart/manifest renderers. Unknown placeholders in resource naming
+and description fields fail explicitly. References must resolve to the same
+configured names as their resource definitions. Generated physical names still
+receive the standard prefix: do not repeat it in configuration names unnecessarily.
+Define common naming values literally in the base file, not through recursive
+placeholders.
+
+Dev's IAM role ARNs, hosts and Karpenter manifest paths use these variables.
+When copying to another account/environment, create the matching manifest files
+and DNS/IAM resources; substitution does not create external dependencies.
+The `Environment: development` tag remains an explicit human-readable label,
+separate from the folder name `dev`. The domain `titancoretech.net` is also
+explicit and must be changed if the destination uses a different domain.
 
 ### `common`
 

@@ -15,6 +15,7 @@ import yaml
 
 from cognitech_cdk.common import schema
 from cognitech_cdk.common.config import Common, merge_config
+from cognitech_cdk.common.documents import placeholders, render
 from cognitech_cdk.constructs.backup import BackupProps
 from cognitech_cdk.constructs.certificates import CertificatesProps
 from cognitech_cdk.constructs.cognito import CognitoProps
@@ -41,6 +42,37 @@ from cognitech_cdk.constructs.waf import WafProps
 DEPLOYMENTS_DIR = Path(__file__).resolve().parents[3] / "deployments"
 ENV_FILE = "env.yaml"
 BASE_FILE = "base.yaml"
+RESOURCE_TEXT_FIELDS = frozenset({
+    "name", "description", "secret_name", "secret_description", "role_name",
+    "bucket_name", "function_name", "cluster_name", "group_name", "key_pair", "role",
+})
+DOCUMENT_FIELDS = frozenset({
+    "common", "tags", "values", "variables", "policy", "policy_variables",
+    "configuration_values", "node_class_manifest", "node_pool_manifest",
+})
+
+
+def _render_resource_fields(
+    raw: Mapping[str, Any], values: Mapping[str, str], label: str,
+) -> dict[str, Any]:
+    result = {}
+    for key, value in raw.items():
+        where = f"{label}.{key}"
+        if key in DOCUMENT_FIELDS:
+            result[key] = value
+        elif isinstance(value, Mapping):
+            result[key] = _render_resource_fields(value, values, where)
+        elif isinstance(value, list):
+            result[key] = [
+                _render_resource_fields(item, values, f"{where}[{index}]")
+                if isinstance(item, Mapping) else item
+                for index, item in enumerate(value)
+            ]
+        elif key in RESOURCE_TEXT_FIELDS and isinstance(value, str) and placeholders(value):
+            result[key] = render(value, values, where)
+        else:
+            result[key] = value
+    return result
 
 
 @dataclass(frozen=True)
@@ -114,7 +146,8 @@ def _read_config(path: Path) -> Mapping[str, Any]:
     return raw
 
 
-def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment:
+def load_environment_config(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Mapping[str, Any]:
+    """Load merged deployment YAML and resolve its built-in placeholders."""
     selected = resolve_environment(env_name, root)
     path = root / selected / ENV_FILE
     raw = _read_config(path)
@@ -125,6 +158,27 @@ def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment
     missing = [key for key in ("account_id", "region", "network") if raw.get(key) in (None, "")]
     if missing:
         raise ValueError(f"{path}: missing required fields after merging: {', '.join(missing)}.")
+    common = Common.from_dict(raw.get("common") or {}, path.parent.name)
+    values = {
+        "account_id": str(raw["account_id"]),
+        "account_name": common.account_name,
+        "account_name_abr": common.account_name_abr or common.account_name,
+        "region": str(raw["region"]),
+        "region_prefix": common.region_prefix,
+        "environment": path.parent.name,
+    }
+    # Preserve placeholders belonging to policy, Helm and manifest renderers.
+    raw = render(raw, {
+        **{key: f"[[{key}]]" for key in placeholders(raw) - values.keys()},
+        **values,
+    }, str(path))
+    raw = _render_resource_fields(raw, values, str(path))
+    return raw
+
+
+def load_environment(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Environment:
+    raw = load_environment_config(env_name, root)
+    path = root / resolve_environment(env_name, root) / ENV_FILE
     # Repository-relative files (policies, rule files, code) resolve from the
     # project root alongside deployments/, not the environment folder.
     base_dir = root.parent

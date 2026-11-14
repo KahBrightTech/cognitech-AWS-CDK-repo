@@ -10,7 +10,7 @@ from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_iam as iam
 from aws_cdk.assertions import Match, Template
 
-from cognitech_cdk.common.environment import load_environment
+from cognitech_cdk.common.environment import load_environment, load_environment_config
 from cognitech_cdk.constructs.eks import EksProps
 from cognitech_cdk.constructs.eks_addons import NATIVE_ADDONS, EksAddonsProps, KarpenterProps
 from cognitech_cdk.stacks.eks_stack import EksStack
@@ -133,25 +133,26 @@ def _repo_root():
 
 def test_dev_system_and_optional_application_scheduling(write_env):
     text = (_repo_root() / "deployments/md-preprod/dev/env.yaml").read_text()
-    active = yaml.safe_load(text)
+    active = load_environment_config("md-preprod/dev")
     assert active["eks"][0]["compute"]["node_groups"][0]["desired_size"] == 2
     assert active["eks"][0]["compute"]["karpenter"]["node_role"] == "eks-nodes"
-    compute_text = text.split("    compute:\n", 1)[1].split("\neks_addons:\n", 1)[0]
-    compute = yaml.safe_load(
-        f"key_pair_name: &eks_node_key_pair {active['key_pairs'][0]['name']}\n"
-        "compute:\n" + "\n".join(
-            line.removeprefix("    # ") if line.startswith("    # ") else line.removeprefix("    ")
-            for line in compute_text.splitlines()
-        )
-    )["compute"]
+    compute = active["eks"][0]["compute"]
     addons_text = text.split("\neks_addons:\n", 1)[1]
     assert "CriticalAddonsOnly" not in addons_text
-    addons = yaml.safe_load("\n".join(line.removeprefix("# ") for line in addons_text.splitlines()))
-    # The native Secrets Store add-on is an alternative to the enabled Helm bundle.
-    addons[0]["addons"] = [
-        item for item in addons[0]["addons"]
+    addons = active["eks_addons"]
+    optional_addons = yaml.safe_load("\n".join(
+        line.removeprefix("      #   ")
+        for line in addons_text.splitlines() if line.startswith("      #   ")
+    ))
+    addons[0]["addons"].extend(
+        item for item in optional_addons
         if item["name"] != "aws-secrets-store-csi-driver-provider"
-    ]
+    )
+    optional_settings = yaml.safe_load("\n".join(
+        line.removeprefix("    #   ")
+        for line in addons_text.splitlines() if line.startswith("    #   ")
+    ))
+    addons[0]["gateway_api"] = optional_settings["gateway_api"]
     eks = yaml.safe_load(EKS)
     del eks[0]["node_groups"]
     eks[0]["compute"] = compute
@@ -227,7 +228,7 @@ def test_dev_system_and_optional_application_scheduling(write_env):
 
 
 def test_dev_enabled_applications_and_compute(write_env):
-    active = yaml.safe_load((_repo_root() / "deployments/md-preprod/dev/env.yaml").read_text())
+    active = load_environment_config("md-preprod/dev")
     eks = yaml.safe_load(EKS)
     del eks[0]["node_groups"]
     eks[0]["compute"] = active["eks"][0]["compute"]

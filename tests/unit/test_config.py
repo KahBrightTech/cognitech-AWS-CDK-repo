@@ -2,7 +2,9 @@ import pytest
 import yaml
 
 from cognitech_cdk.common.config import Common
-from cognitech_cdk.common.environment import list_environments, load_environment, resolve_environment
+from cognitech_cdk.common.environment import (
+    list_environments, load_environment, load_environment_config, resolve_environment,
+)
 from cognitech_cdk.constructs.network import NetworkProps
 
 
@@ -141,6 +143,82 @@ def test_migrated_dev_preserves_legacy_selection_and_defaults():
     assert environment.common.account_name_abr == "mdpreprod"
     assert environment.common.environment_abr == "dev"
     assert environment.common.tags["Compliance"] == "FedRAMP"
+
+
+@pytest.mark.parametrize("selected", ["test", "example/qa"])
+def test_resource_placeholders_use_effective_account_and_environment(write_env, selected):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name=selected)
+    path = root / selected / "env.yaml"
+    original = path.read_text()
+    if "/" in selected:
+        (root / "example/base.yaml").write_text(original, encoding="utf-8")
+        original = (
+            'account_id: "999900001111"\nregion: us-west-2\n'
+            "common:\n  account_name: other-account\n  region_prefix: usw2\n"
+        )
+    path.write_text(original + """
+key_pairs:
+- name: &node_key "[[environment]]-ssh"
+  create_secret: true
+  secret_name: "[[account_name_abr]]-[[environment]]-private-key"
+  secret_description: "Key for [[account_name]] [[environment]] in [[region_prefix]] ([[region]] / [[account_id]])"
+eks:
+- name: main
+  compute:
+    launch_templates:
+    - name: general
+      key_pair: *node_key
+""", encoding="utf-8")
+    environment = load_environment(selected, root=root)
+    key = environment.key_pairs.key_pairs[0]
+    assert key.name == f"{environment.name}-ssh"
+    assert key.secret_name == f"intprod-{environment.name}-private-key"
+    assert key.secret_description == (
+        f"Key for {environment.common.account_name} {environment.name} in "
+        f"{environment.common.region_prefix} ({environment.region} / {environment.account_id})"
+    )
+    assert environment.eks.clusters[0].launch_templates[0].key_pair == key.name
+
+
+def test_unknown_resource_placeholder_fails_with_field_context(write_env):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16")
+    path = root / "test/env.yaml"
+    path.write_text(path.read_text() + """
+key_pairs:
+- name: ssh
+  create_secret: true
+  secret_description: "Key for [[acount_name]]"
+""", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"key_pairs\[0\].secret_description: unresolved placeholders: acount_name"):
+        load_environment("test", root=root)
+
+
+def test_deployment_placeholders_render_arns_lists_and_embedded_templates(write_env):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16")
+    path = root / "test/env.yaml"
+    path.write_text(path.read_text() + """
+examples:
+  role_arn: "arn:aws:iam::[[account_id]]:role/deploy-[[environment]]"
+  hosts: ["argocd.[[environment]].example.com"]
+  node_class_manifest: "policies/[[account_name]]-[[environment]].yaml"
+  policy:
+    Resource: ["arn:aws:s3:::[[account_name]]", "[[bucket_arn]]"]
+  values:
+    description: "[[account_name]] [[chart_variable]]"
+  node_pool_manifest:
+    metadata:
+      name: "[[account_name]]-[[custom_pool]]"
+""", encoding="utf-8")
+    raw = load_environment_config("test", root=root)
+    examples = raw["examples"]
+    assert examples["role_arn"] == f"arn:aws:iam::{raw['account_id']}:role/deploy-test"
+    assert examples["hosts"] == ["argocd.test.example.com"]
+    assert examples["node_class_manifest"] == "policies/int-production-test.yaml"
+    assert examples["policy"]["Resource"] == [
+        "arn:aws:s3:::int-production", "[[bucket_arn]]",
+    ]
+    assert examples["values"]["description"] == "int-production [[chart_variable]]"
+    assert examples["node_pool_manifest"]["metadata"]["name"] == "int-production-[[custom_pool]]"
 
 
 @pytest.mark.parametrize("field", ["account_id", "region", "network"])
