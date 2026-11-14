@@ -167,6 +167,10 @@ def load_environment_config(env_name: str, root: Path = DEPLOYMENTS_DIR) -> Mapp
         "region_prefix": common.region_prefix,
         "environment": path.parent.name,
     }
+    if common.domain_name is not None:
+        values["domain_name"] = common.domain_name
+    elif "domain_name" in placeholders(raw):
+        raise ValueError(f"{path}: common.domain_name is required when using [[domain_name]].")
     # Preserve placeholders belonging to policy, Helm and manifest renderers.
     raw = render(raw, {
         **{key: f"[[{key}]]" for key in placeholders(raw) - values.keys()},

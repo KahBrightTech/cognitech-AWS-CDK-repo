@@ -260,7 +260,8 @@ secret_description: "Private key for the [[account_name]] [[environment]] VPC"
 ```
 
 Supported values are `account_id`, `account_name`, `account_name_abr` (falls back
-to `account_name`), `region`, `region_prefix` and `environment`. They resolve
+to `account_name`), `region`, `region_prefix`, `environment` and `domain_name`
+(from optional `common.domain_name`, required when referenced). They resolve
 after merging account defaults and environment overrides; `environment` is the
 selected folder name. Existing literal values are unchanged.
 
@@ -277,8 +278,10 @@ Dev's IAM role ARNs, hosts and Karpenter manifest paths use these variables.
 When copying to another account/environment, create the matching manifest files
 and DNS/IAM resources; substitution does not create external dependencies.
 The `Environment: development` tag remains an explicit human-readable label,
-separate from the folder name `dev`. The domain `titancoretech.net` is also
-explicit and must be changed if the destination uses a different domain.
+separate from the folder name `dev`. The domain is defined once in the account's
+`base.yaml` as `common.domain_name: titancoretech.net`. Certificates, the Route 53
+issuer and application hosts reference `[[domain_name]]`; set that base value
+for each account (or override it per environment).
 
 ### `common`
 
@@ -292,6 +295,7 @@ Mirrors the `common` variable in the Terraform modules:
 | `global`           | no       | Marks global (non-regional) resources; default`false` |
 | `account_name_abr` | no       | Short account name for length-capped resources          |
 | `environment_abr`  | no       | Short environment name, available to future constructs  |
+| `domain_name`      | no       | Account DNS domain exposed as `[[domain_name]]` |
 
 `tags` must include `Build-method`, `Environment`, `ManagedBy`, `Owner` and
 `Compliance`. `Name` is rejected there — it is built per resource.
@@ -1077,15 +1081,18 @@ Fargate profiles are not implemented yet; unsupported compute keys fail validati
 The dev configuration enables two `t3.large` managed system nodes (minimum two,
 maximum three) in public subnets, with the `workload-type=system:NoSchedule`
 taint. Core add-ons are enabled: VPC CNI, CoreDNS, kube-proxy, Pod Identity Agent,
-EBS CSI, metrics-server, external-dns, cert-manager, CloudWatch observability,
+EBS CSI, EFS CSI, FSx for Lustre CSI, metrics-server, external-dns, cert-manager, CloudWatch observability,
 and the AWS Load Balancer Controller, plus the default encrypted gp3 storage
-class. Secrets Store CSI and its AWS provider are enabled through Helm.
+class. Secrets Store CSI and its AWS provider are enabled through the native
+`aws-secrets-store-csi-driver-provider` EKS add-on; the duplicate Helm bundle
+is disabled.
 Controllers select and tolerate the system nodes; node-wide agents retain
 placement on all worker pools. Karpenter provisions application nodes, including
 AWX and its managed Postgres database. Argo CD, F5 NGINX Ingress Controller,
 Kubecost and the AWX operator are enabled on system nodes; Gateway Fabric
 remains commented. Argo CD and AWX use the shared public ALB and the
-`*.dev.titancoretech.net` certificate. Kubecost remains private.
+`*.dev.titancoretech.net` certificate. Kubecost also joins that ALB at
+`kubecost.dev.titancoretech.net`, without authentication by explicit choice.
 The maximum size is a scaling bound, not automatic demand-based scaling;
 Karpenter scales its separate application NodePool; Cluster Autoscaler is not enabled.
 Resource settings and policy paths
@@ -1479,6 +1486,69 @@ kubectl get daemonset ebs-csi-node -n kube-system
 kubectl get pods -n kube-system -l app=ebs-csi-node -o wide
 ```
 
+#### cert-manager and Route 53 certificates
+
+Dev keeps the native EKS cert-manager add-on and configures a Let's Encrypt
+production `ClusterIssuer`, equivalent to the Terraform Route 53 issuer:
+
+```yaml
+- name: cert-manager
+  pod_identity: true
+  cluster_issuer:
+    name: "[[environment]]"
+    dns_zone: "[[domain_name]]"
+    staging: false
+```
+
+The issuer name resolves to the environment folder (`dev` here); quote
+`"[[environment]]"` so YAML treats it as a string, not a nested list.
+The ACME email defaults to `common.tags.Owner`, which must be an email address,
+or can be overridden with `cluster_issuer.email`. The solver uses the deployment
+region. A deploy-time lookup finds the single matching **public** Route 53 zone
+in the deployment account, so synthesis still needs no AWS credentials.
+The created Pod Identity role permits TXT changes in that zone and checking
+Route 53 changes. No static AWS credentials are stored in YAML. If supplying an
+existing add-on `role`, that role must already grant the needed permissions.
+`cluster_issuer` requires cert-manager, `pod_identity: true`, the Pod Identity
+agent and the cluster's kubectl provider. It cannot be combined with
+`hosted_zone_ids`; its zone is resolved from `dns_zone`.
+
+The managed add-on installs the controllers and CRDs; the issuer manifest waits
+for it. This does not install a second Helm cert-manager or pin the old Terraform
+chart version. Set `staging: true` and use a staging issuer name while testing
+to avoid Let's Encrypt production rate limits.
+
+Workloads request their own certificates, for example:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: nova-tls
+  namespace: nova
+spec:
+  secretName: nova-tls
+  dnsNames: [nova.dev.titancoretech.net]
+  issuerRef:
+    name: dev
+    kind: ClusterIssuer
+    group: cert-manager.io
+```
+
+cert-manager creates/renews the TLS Secret in that namespace. The workload or
+Ingress must explicitly consume it. These Secrets do not replace the ACM
+certificates used by the existing ALB or NGINX NLB TLS listeners.
+Only trusted workloads should be allowed to request certificates from this
+shared issuer. Verify after deployment with
+`kubectl get clusterissuer dev` and
+`kubectl get certificates -A`.
+
+Kubecost is explicitly exposed without authentication on the shared public ALB.
+A Kubernetes Secret alone does not enable UI authentication, and Grafana
+credentials or billing credentials do not protect the Kubecost UI. Anyone who
+can reach its hostname can access it. Add authentication or restrict exposure
+before using it with sensitive cost data.
+
 #### Secrets Store CSI, AWS provider and SecretProviderClass
 
 `SecretProviderClass` is a namespaced Kubernetes custom resource, not a Helm
@@ -1486,7 +1556,15 @@ chart. The Secrets Store CSI driver mounts external secrets into pods, and the
 AWS provider retrieves them from Secrets Manager or SSM Parameter Store using
 the consuming pod's service-account identity.
 
-Dev installs the AWS provider chart **3.1.4**, including its CSI driver dependency:
+Dev enables the native `aws-secrets-store-csi-driver-provider` EKS add-on and
+disables `secrets_store_csi`. Do not enable both installations. If the Helm
+installation is already deployed, migrate in reviewed stages: remove that release
+before enabling the native add-on, and account for the temporary interruption
+to new secret mounts. A single update does not guarantee Helm deletion precedes
+native add-on creation.
+
+Alternatively, the AWS provider Helm chart **3.1.4** includes its CSI driver
+dependency (disable the native add-on before using this example):
 
 ```yaml
 eks_addons:
@@ -1753,9 +1831,18 @@ Helm-based add-ons have typed settings in `eks_addons`:
 | `helm_charts` | any | none (generic escape hatch) |
 
 `load_balancer_defaults` sets the scheme, subnets, certificate, security groups
-and ALB group shared by those ingresses/NLBs; dev puts ArgoCD and AWX on one
+and ALB group shared by those ingresses/NLBs; dev puts ArgoCD, AWX and Kubecost on one
 ALB. The community `ingress-nginx` project was retired in March 2026, so the
 maintained F5 NGINX Ingress Controller replaces it.
+
+Dev's public NGINX entry overrides `service` with public subnets,
+`scheme: internet-facing`, `security_groups: [nginx-nlb]` and the environment
+certificate. Its Kubernetes LoadBalancer Service provisions a dedicated NLB,
+separate from the Argo CD/AWX/Kubecost ALB. The dedicated `nginx-nlb` security group
+allows inbound TCP 80/443; the Load Balancer Controller manages backend
+security-group rules for the IP targets. TLS terminates at the NLB and forwards
+to NGINX's HTTP port. Additional NGINX entries need unique names and ingress
+classes and can set their own `service` configuration.
 
 Install order matters on a small node group: the core add-ons go first, then
 Karpenter and its NodePool, then every other add-on (Karpenter adds nodes for
@@ -1798,8 +1885,9 @@ stack remains available for load balancers outside the cluster.
 - ArgoCD SSO is off until you create an Identity Center SAML application for
   `argocd.dev.titancoretech.net` and fill in `sso_url` and `ca_pem_file`. Until
   then, use the `argocd-initial-admin-secret` in the cluster.
-- Kubecost has no login, so dev does not expose it; use
-  `kubectl -n kubecost port-forward svc/kubecost-cost-analyzer 9090`.
+- Kubecost is public without login at `kubecost.dev.titancoretech.net` by explicit
+  choice. Remove `kubecost.host` to keep it private and use
+  `kubectl -n kubecost port-forward svc/kubecost-cost-analyzer 9090` instead.
 - Public ALBs/NLBs, Karpenter nodes, EKS, CloudWatch observability and Pod
   Identity have hourly costs. Nothing is created until you deploy a stack.
 

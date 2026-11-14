@@ -221,6 +221,66 @@ examples:
     assert examples["node_pool_manifest"]["metadata"]["name"] == "int-production-[[custom_pool]]"
 
 
+@pytest.mark.parametrize("override", [None, "other.example.org"])
+def test_account_domain_renders_certificates_issuer_and_hosts(write_env, override):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="example/dev")
+    path = root / "example/dev/env.yaml"
+    base = yaml.safe_load(path.read_text())
+    base["common"]["domain_name"] = "example.com"
+    (root / "example/base.yaml").write_text(yaml.safe_dump(base), encoding="utf-8")
+    path.write_text(yaml.safe_dump({
+        **({"common": {"domain_name": override}} if override is not None else {}),
+        "certificates": [{
+            "name": "wildcard", "domain_name": "*.[[environment]].[[domain_name]]",
+            "zone_name": "[[domain_name]]",
+        }],
+        "eks_addons": [{
+            "cluster": "main",
+            "addons": [
+                {"name": "eks-pod-identity-agent"},
+                {"name": "cert-manager", "pod_identity": True, "cluster_issuer": {
+                    "name": "[[environment]]", "dns_zone": "[[domain_name]]",
+                }},
+            ],
+            "aws_load_balancer_controller": {
+                "enabled": True,
+                "policy": {"Statement": [{
+                    "Effect": "Allow", "Action": "elasticloadbalancing:DescribeLoadBalancers", "Resource": "*",
+                }]},
+            },
+            **{
+                app: {"host": f"{host}.[[environment]].[[domain_name]]"}
+                for app, host in (("argocd", "argocd"), ("kubecost", "kubecost"), ("awx_operator", "awx"))
+            },
+        }],
+    }), encoding="utf-8")
+    environment = load_environment("example/dev", root=root)
+    domain = override or "example.com"
+    assert environment.common.domain_name == domain
+    certificate = environment.certificates.certificates[0]
+    assert certificate.domain_name == f"*.dev.{domain}"
+    assert certificate.zone_name == domain
+    addons = environment.eks_addons.clusters[0]
+    cert_manager = next(item for item in addons.addons if item.name == "cert-manager")
+    assert cert_manager.cluster_issuer.dns_zone == domain
+    assert addons.argocd.host == f"argocd.dev.{domain}"
+    assert addons.kubecost.host == f"kubecost.dev.{domain}"
+    assert addons.awx_operator.host == f"awx.dev.{domain}"
+
+
+def test_domain_placeholder_requires_an_account_domain(write_env):
+    root = write_env("name: n\ncidr_block: 10.0.0.0/16")
+    path = root / "test/env.yaml"
+    path.write_text(path.read_text() + """
+certificates:
+- name: wildcard
+  domain_name: "*.[[environment]].[[domain_name]]"
+  zone_name: "[[domain_name]]"
+""", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"common.domain_name is required when using \[\[domain_name\]\]"):
+        load_environment("test", root=root)
+
+
 @pytest.mark.parametrize("field", ["account_id", "region", "network"])
 def test_required_defaults_cannot_be_cleared_by_null(write_env, field):
     root = write_env("name: n\ncidr_block: 10.0.0.0/16", name="example/dev")

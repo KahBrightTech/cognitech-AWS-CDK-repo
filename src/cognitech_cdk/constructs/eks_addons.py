@@ -145,6 +145,35 @@ def _k8s_name(value: Any, label: str, default: str | None = None) -> str:
 
 
 @dataclass(frozen=True)
+class CertManagerIssuerProps:
+    name: str
+    dns_zone: str
+    email: str | None = None
+    staging: bool = False
+
+    @classmethod
+    def from_dict(cls, raw: Any, label: str) -> CertManagerIssuerProps | None:
+        if raw is None:
+            return None
+        data = schema.mapping(
+            raw, label, {"name", "dns_zone", "email", "staging"},
+            required=("name", "dns_zone"),
+        )
+        return cls(
+            name=_k8s_name(data["name"], f"{label}: name"),
+            dns_zone=_host(data["dns_zone"], f"{label}: dns_zone"),
+            email=schema.string(data.get("email"), f"{label}: email"),
+            staging=schema.boolean(data.get("staging"), f"{label}: staging"),
+        )
+
+    def account_email(self, default: str) -> str:
+        email = self.email if self.email is not None else default
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise ValueError(f"cert-manager issuer '{self.name}': email or common.tags.Owner must be an email address.")
+        return email
+
+
+@dataclass(frozen=True)
 class NativeAddonProps:
     name: str
     version: str | None = None
@@ -154,6 +183,7 @@ class NativeAddonProps:
     pod_identity: bool = False
     role: str | None = None
     hosted_zone_ids: tuple[str, ...] = ()
+    cluster_issuer: CertManagerIssuerProps | None = None
 
     @property
     def spec(self) -> AddonSpec:
@@ -163,7 +193,7 @@ class NativeAddonProps:
     def from_dict(cls, raw: Any, cluster: str, *, base_dir: Path | None) -> NativeAddonProps:
         data = schema.mapping(raw, f"EKS add-ons '{cluster}' addon", {
             "name", "version", "configuration_values", "resolve_conflicts",
-            "preserve_on_delete", "pod_identity", "role", "hosted_zone_ids",
+            "preserve_on_delete", "pod_identity", "role", "hosted_zone_ids", "cluster_issuer",
         }, required=("name",))
         name = data["name"]
         if name not in NATIVE_ADDONS:
@@ -180,6 +210,16 @@ class NativeAddonProps:
             data.get("pod_identity"), f"{label}: pod_identity",
             default=spec.pod_identity_default or role is not None,
         )
+        issuer = CertManagerIssuerProps.from_dict(
+            data.get("cluster_issuer"), f"{label}: cluster_issuer",
+        )
+        if issuer is not None:
+            if name != "cert-manager":
+                raise ValueError(f"{label}: cluster_issuer is only supported for cert-manager.")
+            if not pod_identity:
+                raise ValueError(f"{label}: cluster_issuer requires pod_identity: true.")
+            if data.get("hosted_zone_ids"):
+                raise ValueError(f"{label}: cluster_issuer resolves its DNS zone; remove hosted_zone_ids.")
         if (pod_identity or role is not None) and not spec.supports_pod_identity:
             raise ValueError(f"{label}: this add-on does not use AWS credentials.")
         if role is not None and not pod_identity:
@@ -206,6 +246,7 @@ class NativeAddonProps:
             pod_identity=pod_identity,
             role=role,
             hosted_zone_ids=zones,
+            cluster_issuer=issuer,
         )
 
 

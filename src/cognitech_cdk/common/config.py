@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from cognitech_cdk.common import schema
+
 ORDINALS = ("primary", "secondary", "tertiary", "quaternary")
 MAX_AZS = len(ORDINALS)
 REQUIRED_TAGS = ("Build-method", "Environment", "ManagedBy", "Owner", "Compliance")
@@ -40,6 +42,7 @@ class Common:
       region_prefix    = string
       account_name_abr = optional(string, "")
       environment_abr  = optional(string, "")
+      domain_name      = optional(string)
     })
     ```
     """
@@ -49,6 +52,7 @@ class Common:
     global_: bool = False
     account_name_abr: str = ""
     environment_abr: str = ""
+    domain_name: str | None = None
 
     def name(self, *parts: str) -> str:
         """`{account_name}-{region_prefix}-{parts...}`, skipping empty parts.
@@ -85,4 +89,5 @@ class Common:
             global_=bool(raw.get("global", False)),
             account_name_abr=str(raw.get("account_name_abr", "") or ""),
             environment_abr=str(raw.get("environment_abr", "") or ""),
+            domain_name=schema.string(raw.get("domain_name"), f"{env_name}: common.domain_name"),
         )

@@ -95,6 +95,7 @@ def _stacks(write_env, addons=ADDONS, eks=EKS, *, key_pair_name="key-pair"):
     certificate = acm.Certificate(deps, "Cert", domain_name="*.dev.example.com")
     groups["x"] = ec2.SecurityGroup(deps, "Sg", vpc=network.network.vpc)
     groups["eks-nodes"] = ec2.SecurityGroup(deps, "NodesSg", vpc=network.network.vpc)
+    groups["nginx-nlb"] = ec2.SecurityGroup(deps, "NginxNlbSg", vpc=network.network.vpc)
     eks_stack = EksStack(
         app, "test-eks", environment=environment, env=env,
         props=EksProps.from_dict(yaml.safe_load(eks), base_dir=_repo_root()), network=network.network,
@@ -140,14 +141,6 @@ def test_dev_system_and_optional_application_scheduling(write_env):
     addons_text = text.split("\neks_addons:\n", 1)[1]
     assert "CriticalAddonsOnly" not in addons_text
     addons = active["eks_addons"]
-    optional_addons = yaml.safe_load("\n".join(
-        line.removeprefix("      #   ")
-        for line in addons_text.splitlines() if line.startswith("      #   ")
-    ))
-    addons[0]["addons"].extend(
-        item for item in optional_addons
-        if item["name"] != "aws-secrets-store-csi-driver-provider"
-    )
     optional_settings = yaml.safe_load("\n".join(
         line.removeprefix("    #   ")
         for line in addons_text.splitlines() if line.startswith("    #   ")
@@ -200,7 +193,8 @@ def test_dev_system_and_optional_application_scheduling(write_env):
         name: json.loads(_values(chart)) for name, chart in _charts(template).items()
         if "Values" in chart["Properties"]
     }
-    secrets = charts["secrets-store-csi-driver-provider-aws"]
+    assert "secrets-store-csi-driver-provider-aws" not in charts
+    secrets = native["aws-secrets-store-csi-driver-provider"]
     assert secrets["tolerations"] == [{"operator": "Exists"}]
     assert secrets["secrets-store-csi-driver"]["linux"]["tolerations"] == [{"operator": "Exists"}]
     assert "nodeSelector" not in secrets
@@ -238,7 +232,7 @@ def test_dev_enabled_applications_and_compute(write_env):
     )
     charts = _charts(template)
     assert set(charts) == {
-        "karpenter", "aws-load-balancer-controller", "secrets-store-csi-driver-provider-aws",
+        "karpenter", "aws-load-balancer-controller",
         "argocd", "nginx-ingress-public", "kubecost", "awx-operator",
     }
     argocd = json.loads(_values(charts["argocd"]))
@@ -249,7 +243,16 @@ def test_dev_enabled_applications_and_compute(write_env):
     assert awx["spec"]["ingress_type"] == "ingress"
     assert awx["spec"]["hostname"] == "awx.dev.titancoretech.net"
     assert yaml.safe_load(awx["spec"]["node_selector"]) == {"karpenter.sh/nodepool": "default"}
-    assert "ingress" not in _values(charts["kubecost"])
+    kubecost_ingress = json.loads(_values(charts["kubecost"]))["ingress"]
+    assert kubecost_ingress["enabled"] is True
+    assert kubecost_ingress["className"] == "alb"
+    assert kubecost_ingress["hosts"] == ["kubecost.dev.titancoretech.net"]
+    assert kubecost_ingress["annotations"]["alb.ingress.kubernetes.io/group.name"] == "dev-shared"
+    assert kubecost_ingress["annotations"]["alb.ingress.kubernetes.io/scheme"] == "internet-facing"
+    awx_annotations = yaml.safe_load(awx["spec"]["ingress_annotations"])
+    assert awx_annotations["alb.ingress.kubernetes.io/group.name"] == (
+        kubecost_ingress["annotations"]["alb.ingress.kubernetes.io/group.name"]
+    )
     manifests = json.dumps(template.find_resources("Custom::AWSCDK-EKS-KubernetesResource"))
     assert "NodePool" in manifests
     assert "SecretProviderClass" not in manifests
@@ -386,6 +389,84 @@ def test_aws_addons_use_pod_identity_roles(write_env):
     assert "hostedzone/Z0123456789ABC" in policies
     # Pod Identity add-ons wait for the agent, which is in the CoreAddons stack.
     assert "CoreAddons" in _nested_order(eks_stack)["Addons"]
+
+
+@pytest.mark.parametrize("staging, email", [(False, None), (True, "acme@example.com")])
+def test_cert_manager_route53_cluster_issuer(write_env, staging, email):
+    raw = yaml.safe_load(ADDONS)
+    cert_manager = next(item for item in raw[0]["addons"] if item["name"] == "cert-manager")
+    cert_manager.update({
+        "pod_identity": True,
+        "cluster_issuer": {
+            "name": "letsencrypt-route53", "dns_zone": "example.com", "staging": staging,
+            **({"email": email} if email is not None else {}),
+        },
+    })
+    _, template = _stacks(write_env, addons=yaml.safe_dump(raw))
+    template.has_resource_properties("AWS::EKS::Addon", {
+        "AddonName": "cert-manager",
+        "PodIdentityAssociations": [{
+            "RoleArn": Match.any_value(), "ServiceAccount": "cert-manager",
+        }],
+    })
+    lookups = template.find_resources("Custom::DeployTimeLookup")
+    zone_id, lookup = next(
+        (key, resource) for key, resource in lookups.items()
+        if resource["Properties"].get("Kind") == "HostedZone"
+    )
+    assert lookup["Properties"]["ZoneName"] == "example.com"
+    assert lookup["Properties"]["Private"] == "false"
+    manifests = template.find_resources("Custom::AWSCDK-EKS-KubernetesResource")
+    issuer = next(resource for key, resource in manifests.items() if "CertManagerClusterIssuer" in key)
+    manifest_json = issuer["Properties"]["Manifest"]
+    objects = json.loads("".join(
+        part if isinstance(part, str) else "<token>"
+        for part in manifest_json["Fn::Join"][1]
+    ))
+    acme = objects[0]["spec"]["acme"]
+    assert objects[0]["kind"] == "ClusterIssuer"
+    assert objects[0]["metadata"]["name"] == "letsencrypt-route53"
+    assert acme["email"] == (email or "someone@example.com")
+    assert acme["server"] == (
+        "https://acme-staging-v02.api.letsencrypt.org/directory"
+        if staging else "https://acme-v02.api.letsencrypt.org/directory"
+    )
+    assert acme["privateKeySecretRef"] == {"name": "letsencrypt-route53"}
+    assert acme["solvers"] == [{
+        "selector": {"dnsZones": ["example.com"]},
+        "dns01": {"route53": {"region": "us-east-1", "hostedZoneID": "<token>"}},
+    }]
+    assert any("CertManagerAddon" in dependency for dependency in issuer["DependsOn"])
+    policies = template.find_resources("AWS::IAM::Policy")
+    policy = next(resource for key, resource in policies.items() if "CertManagerRoleDefaultPolicy" in key)
+    changes = next(
+        statement for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+        if "route53:ChangeResourceRecordSets" in statement["Action"]
+    )
+    assert zone_id in json.dumps(changes["Resource"])
+    assert "hostedzone/*" not in json.dumps(changes["Resource"])
+    assert changes["Condition"] == {
+        "ForAllValues:StringEquals": {"route53:ChangeResourceRecordSetsRecordTypes": ["TXT"]},
+    }
+
+
+@pytest.mark.parametrize("addon, settings, message", [
+    ("cert-manager", {}, "requires pod_identity"),
+    ("external-dns", {"pod_identity": True}, "only supported for cert-manager"),
+    ("cert-manager", {"pod_identity": True, "hosted_zone_ids": ["Z0123456789ABC"]},
+     "remove hosted_zone_ids"),
+])
+def test_invalid_cert_manager_issuer_configuration(addon, settings, message):
+    with pytest.raises(ValueError, match=message):
+        EksAddonsProps.from_dict([{
+            "cluster": "main",
+            "addons": [
+                {"name": "eks-pod-identity-agent"},
+                {"name": addon, "cluster_issuer": {
+                    "name": "letsencrypt", "dns_zone": "example.com",
+                }, **settings},
+            ],
+        }])
 
 
 def test_load_balancer_controller_uses_helm_and_pod_identity(write_env):

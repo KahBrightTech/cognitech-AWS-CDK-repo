@@ -142,9 +142,36 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
         if resource["Type"] == "Custom::AWSCDK-EKS-HelmChart"
     ]
     assert {chart["Chart"] for chart in charts} == {
-        "aws-load-balancer-controller", "secrets-store-csi-driver-provider-aws",
+        "aws-load-balancer-controller",
         "karpenter", "argo-cd", "nginx-ingress", "cost-analyzer", "awx-operator",
     }
+    security_name = environment.common.name(environment.name, "security")
+    security = json.loads((tmp_path / f"{security_name}.template.json").read_text())
+    nginx_group_id = next(
+        logical_id for logical_id, resource in security["Resources"].items()
+        if resource["Type"] == "AWS::EC2::SecurityGroup"
+        and resource["Properties"]["GroupName"] == "md-preproduction-use1-dev-nginx-nlb-sg"
+    )
+    nginx_group_exports = {
+        output["Export"]["Name"] for output in security["Outputs"].values()
+        if output["Value"] == {"Fn::GetAtt": [nginx_group_id, "GroupId"]}
+    }
+    nginx_chart = next(chart for chart in charts if chart["Chart"] == "nginx-ingress")
+    nginx_parts = nginx_chart["Values"]["Fn::Join"][1]
+    nginx_values = json.loads("".join(
+        part if isinstance(part, str) else (
+            "<nginx-group>" if part.get("Fn::ImportValue") in nginx_group_exports else "<token>"
+        ) for part in nginx_parts
+    ))
+    service = nginx_values["controller"]["service"]
+    assert service["type"] == "LoadBalancer"
+    annotations = service["annotations"]
+    prefix = "service.beta.kubernetes.io/aws-load-balancer"
+    assert annotations[f"{prefix}-scheme"] == "internet-facing"
+    assert annotations[f"{prefix}-security-groups"] == "<nginx-group>"
+    assert annotations[f"{prefix}-nlb-target-type"] == "ip"
+    assert annotations[f"{prefix}-manage-backend-security-group-rules"] == "true"
+    assert service["httpsPort"] == {"enable": True, "port": 443, "targetPort": 80}
     subnets = [
         resource["Properties"] for resource in all_resources
         if resource["Type"] == "AWS::EC2::Subnet"
@@ -160,6 +187,11 @@ def test_dev_system_nodes_core_addons_and_public_provider_networking(tmp_path):
     assert storage["metadata"]["name"] == "gp3"
     assert storage["metadata"]["annotations"]["storageclass.kubernetes.io/is-default-class"] == "true"
     assert storage["parameters"]["encrypted"] == "true"
+    issuer = next(obj for obj in manifests if obj["kind"] == "ClusterIssuer")
+    assert issuer["metadata"]["name"] == environment.name
+    assert issuer["spec"]["acme"]["email"] == environment.common.tags["Owner"]
+    assert issuer["spec"]["acme"]["solvers"][0]["selector"] == {"dnsZones": ["titancoretech.net"]}
+    assert addons["cert-manager"]["PodIdentityAssociations"][0]["ServiceAccount"] == "cert-manager"
     assert {obj["kind"] for obj in manifests} >= {"NodePool", "EC2NodeClass"}
     node_class = next(obj for obj in manifests if obj["kind"] == "EC2NodeClass")
     node_pool = next(obj for obj in manifests if obj["kind"] == "NodePool")
@@ -324,6 +356,7 @@ def test_dev_eks_access_namespaces_and_healthpath_quota(tmp_path):
         "movienight": {"app": "movienight"},
         "healthpath": {"app": "healthpath"},
         "pulsehub": {"app": "pulsehub"},
+        "nova": {"app": "nova"},
     }
     assert namespaces.keys() == expected_namespaces.keys()
     for namespace, labels in expected_namespaces.items():

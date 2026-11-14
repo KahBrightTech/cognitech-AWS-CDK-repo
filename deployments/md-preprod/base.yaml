@@ -3,6 +3,7 @@ region: us-east-1
 common:
   account_name: md-preproduction
   region_prefix: use1
+  domain_name: titancoretech.net
   global: false
   account_name_abr: mdpreprod
   environment_abr: dev

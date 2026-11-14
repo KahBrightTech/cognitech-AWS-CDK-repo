@@ -42,6 +42,7 @@ from cognitech_cdk.constructs.eks_addons import (
     NginxIngressProps,
     configuration_json,
 )
+from cognitech_cdk.constructs.lookups import hosted_zone_id
 from cognitech_cdk.constructs.network import Network
 from cognitech_cdk.stacks.base import EnvironmentStack
 
@@ -177,7 +178,9 @@ class EksAddons:
 
     # --- native add-ons -----------------------------------------------------
 
-    def _addon_role(self, scope: Construct, cluster: str, addon: NativeAddonProps) -> iam.IRole:
+    def _addon_role(
+        self, scope: Construct, cluster: str, addon: NativeAddonProps, *, issuer_zone_id: str | None = None,
+    ) -> iam.IRole:
         if addon.role is not None:
             return schema.lookup(self._roles, addon.role, f"EKS add-ons '{cluster}', {addon.name} role")
         spec = addon.spec
@@ -189,11 +192,14 @@ class EksAddons:
         if spec.route53 is not None:
             zones = [
                 f"arn:{cdk.Aws.PARTITION}:route53:::hostedzone/{zone}"
-                for zone in addon.hosted_zone_ids or ("*",)
+                for zone in ((issuer_zone_id,) if issuer_zone_id is not None else addon.hosted_zone_ids or ("*",))
             ]
             role.add_to_policy(iam.PolicyStatement(
                 actions=["route53:ChangeResourceRecordSets", "route53:ListResourceRecordSets"],
                 resources=zones,
+                conditions={
+                    "ForAllValues:StringEquals": {"route53:ChangeResourceRecordSetsRecordTypes": ["TXT"]},
+                } if issuer_zone_id is not None else None,
             ))
             if spec.route53 == "external-dns":
                 role.add_to_policy(iam.PolicyStatement(
@@ -205,9 +211,10 @@ class EksAddons:
                     actions=["route53:GetChange"],
                     resources=[f"arn:{cdk.Aws.PARTITION}:route53:::change/*"],
                 ))
-                role.add_to_policy(iam.PolicyStatement(
-                    actions=["route53:ListHostedZonesByName"], resources=["*"]
-                ))
+                if issuer_zone_id is None:
+                    role.add_to_policy(iam.PolicyStatement(
+                        actions=["route53:ListHostedZonesByName"], resources=["*"]
+                    ))
         return role
 
     def _native_addon(
@@ -215,8 +222,13 @@ class EksAddons:
         roles: dict[str, iam.IRole],
     ) -> eks.CfnAddon:
         associations = None
+        issuer = addon.cluster_issuer
+        zone_id = (
+            hosted_zone_id(scope, "CertManagerIssuerZone", issuer.dns_zone)
+            if issuer is not None else None
+        )
         if addon.pod_identity:
-            role = self._addon_role(scope, name, addon)
+            role = self._addon_role(scope, name, addon, issuer_zone_id=zone_id)
             roles[addon.name] = role
             associations = [eks.CfnAddon.PodIdentityAssociationProperty(
                 role_arn=role.role_arn, service_account=addon.spec.service_account
@@ -242,6 +254,31 @@ class EksAddons:
                 f"{prefix}{construct_id(addon.name)}RoleArn", roles[addon.name].role_arn,
                 f"{name}-{addon.name}-role-arn",
             )
+        if issuer is not None:
+            manifest = eks.KubernetesManifest(
+                scope, "CertManagerClusterIssuer", cluster=cluster, overwrite=True,
+                manifest=[{
+                    "apiVersion": "cert-manager.io/v1",
+                    "kind": "ClusterIssuer",
+                    "metadata": {"name": issuer.name},
+                    "spec": {"acme": {
+                        "email": issuer.account_email(self._stack.config.common.tags["Owner"]),
+                        "server": (
+                            "https://acme-staging-v02.api.letsencrypt.org/directory"
+                            if issuer.staging else "https://acme-v02.api.letsencrypt.org/directory"
+                        ),
+                        "privateKeySecretRef": {"name": issuer.name},
+                        "solvers": [{
+                            "selector": {"dnsZones": [issuer.dns_zone]},
+                            "dns01": {"route53": {
+                                "region": self._stack.config.region,
+                                "hostedZoneID": zone_id,
+                            }},
+                        }],
+                    }},
+                }],
+            )
+            manifest.node.add_dependency(resource)
         return resource
 
     # --- per cluster --------------------------------------------------------
@@ -255,7 +292,8 @@ class EksAddons:
         charts: dict[str, eks.HelmChart] = {}
 
         if (props.load_balancer_controller.enabled or props.helm_charts or props.charts
-                or props.storage_class or props.secret_provider_classes) and getattr(cluster, "kubectl_provider", None) is None:
+                or props.storage_class or props.secret_provider_classes
+                or any(addon.cluster_issuer for addon in props.addons)) and getattr(cluster, "kubectl_provider", None) is None:
             raise ValueError(
                 f"{label}: Helm charts and manifests need the cluster's kubectl provider "
                 "(set kubectl: true on the cluster)."
