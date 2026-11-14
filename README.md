@@ -1882,9 +1882,19 @@ stack remains available for load balancers outside the cluster.
   certificate for the same domain; deleting the CDK stack can remove them.
 - EKS grants cluster-admin only to the deploying role. Add `access_entries` for
   people who need `kubectl`.
-- ArgoCD SSO is off until you create an Identity Center SAML application for
-  `argocd.dev.titancoretech.net` and fill in `sso_url` and `ca_pem_file`. Until
-  then, use the `argocd-initial-admin-secret` in the cluster.
+- Dev ArgoCD SSO is enabled using the configured Identity Center SAML application
+  and `policies/argocd-identity-center-signing-cert.pem` public signing certificate.
+  Configure both the application's ACS URL and audience as
+  `https://argocd.dev.titancoretech.net/api/dex/callback`, map Subject and `email`
+  to `${user:email}` (Subject format: emailAddress), and assign the intended users.
+  Dex maps its username, email and groups claims from that email attribute;
+  `policies/argocd-rbac-policy.csv` grants roles by exact login email. Other
+  assigned users default to read-only. The Identity Center region is independent
+  of the deployment region, so use the application's actual sign-in/issuer URLs.
+  Replace these application-specific settings and certificate when copying to
+  another account. Rotate the public signing certificate before its November
+  2031 expiry (or when Identity Center rotates it). Keep the initial admin
+  credentials available until SSO has been verified.
 - Kubecost is public without login at `kubecost.dev.titancoretech.net` by explicit
   choice. Remove `kubecost.host` to keep it private and use
   `kubectl -n kubecost port-forward svc/kubecost-cost-analyzer 9090` instead.

@@ -1,5 +1,6 @@
 """EKS add-ons, Karpenter and Helm apps, built as nested stacks of the EKS stack."""
 
+import base64
 import json
 
 import aws_cdk as cdk
@@ -238,6 +239,17 @@ def test_dev_enabled_applications_and_compute(write_env):
     argocd = json.loads(_values(charts["argocd"]))
     assert argocd["global"]["domain"] == "argocd.dev.titancoretech.net"
     assert argocd["server"]["ingress"]["annotations"]["alb.ingress.kubernetes.io/group.name"] == "dev-shared"
+    connector = yaml.safe_load(argocd["configs"]["cm"]["dex.config"])["connectors"][0]
+    assert connector["type"] == "saml"
+    saml = connector["config"]
+    assert saml["redirectURI"] == "https://argocd.dev.titancoretech.net/api/dex/callback"
+    assert saml["entityIssuer"] == saml["redirectURI"]
+    assert saml["ssoURL"] == active["eks_addons"][0]["argocd"]["sso"]["sso_url"]
+    assert saml["ssoIssuer"] == saml["ssoURL"]
+    assert saml["emailAttr"] == saml["usernameAttr"] == saml["groupsAttr"] == "email"
+    assert base64.b64decode(saml["caData"]).decode() == (
+        _repo_root() / "policies/argocd-identity-center-signing-cert.pem"
+    ).read_text().strip()
     awx = json.loads(_values(charts["awx-operator"]))["AWX"]
     assert awx["enabled"] is True
     assert awx["spec"]["ingress_type"] == "ingress"
